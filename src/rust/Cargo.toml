@@ -112,6 +112,8 @@ call_sim = ["call_protobuf/call_sim", "native", "injectable_network", "bitvec", 
 direct = ["native", "simnet", "chrono"]
 ringrtc_adm = []
 
+system_ssl = ["native"]
+
 [[test]]
 name = "incoming"
 path = "tests/incoming.rs"

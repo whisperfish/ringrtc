@@ -69,6 +69,10 @@ fn main() {
         println!("cargo:rerun-if-changed={}", config_dir());
         println!("cargo:rustc-link-search=native={}", webrtc_dir);
         println!("cargo:rustc-link-lib=webrtc");
+        if cfg!(feature = "system_ssl") {
+            println!("cargo:rustc-link-lib=ssl");
+            println!("cargo:rustc-link-lib=crypto");
+        }
 
         if cfg!(target_os = "macos") {
             println!("cargo:rustc-link-lib=dylib=c++");
