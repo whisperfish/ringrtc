@@ -103,15 +103,9 @@ if [ -n "$WEBRTC_PLATFORM" ] ; then
     fi
 fi
 
-print_webrtc_tag_warning() {
-  echo "====================================================================="
-  echo "WARNING: Your webrtc checkout is missing ${WEBRTC_VERSION}."
-  echo "         This may cause problems if the FFI version is now mismatched"
-  echo "====================================================================="
-}
-if [ -z "${ENV_SH_SKIP_WEBRTC_VERSION_CHECK}" ] && [ -d "${WEBRTC_SRC_DIR}" ]; then
-  if ! git -C "${WEBRTC_SRC_DIR}" merge-base --is-ancestor "refs/tags/${WEBRTC_VERSION}" HEAD; then
-    print_webrtc_tag_warning
-    trap print_webrtc_tag_warning EXIT
-  fi
+if [ -d "${WEBRTC_SRC_DIR}" ]; then
+  # On Windows, rather than copying the webrtc_include directory, symlink it.
+  # Requires developer mode, admin privileges, or SeCreateSymbolicLinkPrivilege.
+  export MSYS="winsymlinks:nativestrict"
+  ln -sf "$(realpath "${RINGRTC_SRC_DIR}/rust/src/webrtc_include")" "${RINGRTC_WEBRTC_SRC_DIR}/rffi/api"
 fi

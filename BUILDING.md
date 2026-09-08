@@ -135,6 +135,7 @@ Here are some other things that might help with the builds:
 - Download and install [Python 3](https://www.python.org/downloads/)
     - Install it to a location without spaces (e.g. c:\python3)
 - Turn off "Real-time protection" in Windows Security settings during the initial build (WebRTC clones several gigabytes of Google tools)
+- Turn on "Developer mode" in Windows settings, or enable SeCreateSymbolicLinkPrivilege for your account
 
 ##### Linux
 
