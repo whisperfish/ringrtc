@@ -287,9 +287,9 @@ impl Platform for SimPlatform {
         } else {
             let _ = self.stats.offers_sent.fetch_add(1, Ordering::AcqRel);
             if self.force_signaling_failure.load(Ordering::Acquire) {
-                self.message_send_failure(call_id).unwrap();
+                self.message_send_failure(call_id);
             } else {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -314,9 +314,9 @@ impl Platform for SimPlatform {
         } else {
             let _ = self.stats.answers_sent.fetch_add(1, Ordering::AcqRel);
             if self.force_signaling_failure.load(Ordering::Acquire) {
-                self.message_send_failure(call_id).unwrap();
+                self.message_send_failure(call_id);
             } else {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -350,10 +350,10 @@ impl Platform for SimPlatform {
                 .fetch_add(send.ice.candidates.len(), Ordering::AcqRel);
             if self.force_signaling_failure.load(Ordering::Acquire) {
                 if !self.no_auto_message_sent_for_ice.load(Ordering::Acquire) {
-                    self.message_send_failure(call_id).unwrap();
+                    self.message_send_failure(call_id);
                 }
             } else if !self.no_auto_message_sent_for_ice.load(Ordering::Acquire) {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -403,9 +403,9 @@ impl Platform for SimPlatform {
                 }
             }
             if self.force_signaling_failure.load(Ordering::Acquire) {
-                self.message_send_failure(call_id).unwrap();
+                self.message_send_failure(call_id);
             } else {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -422,9 +422,9 @@ impl Platform for SimPlatform {
         } else {
             let _ = self.stats.busys_sent.fetch_add(1, Ordering::AcqRel);
             if self.force_signaling_failure.load(Ordering::Acquire) {
-                self.message_send_failure(call_id).unwrap();
+                self.message_send_failure(call_id);
             } else {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -718,16 +718,14 @@ impl SimPlatform {
         *cm = Some(call_manager);
     }
 
-    fn message_sent(&self, call_id: CallId) -> Result<()> {
+    fn message_sent(&self, call_id: CallId) {
         let mut cm = self.call_manager.lock().unwrap();
-        cm.as_mut().unwrap().message_sent(call_id).unwrap();
-        Ok(())
+        cm.as_mut().unwrap().message_sent(call_id);
     }
 
-    fn message_send_failure(&self, call_id: CallId) -> Result<()> {
+    fn message_send_failure(&self, call_id: CallId) {
         let mut cm = self.call_manager.lock().unwrap();
-        cm.as_mut().unwrap().message_send_failure(call_id).unwrap();
-        Ok(())
+        cm.as_mut().unwrap().message_send_failure(call_id);
     }
 
     pub fn force_internal_fault(&mut self, enable: bool) {

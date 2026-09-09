@@ -396,7 +396,8 @@ where
         // side needs to be informed.
         match event {
             CallEvent::SendHangupViaRtpDataToAll(hangup) => {
-                return self.handle_send_hangup_via_rtp_data_to_all(call, state, hangup);
+                self.handle_send_hangup_via_rtp_data_to_all(call, state, hangup);
+                return Ok(());
             }
             CallEvent::Terminate => return self.handle_terminate(call),
             #[cfg(feature = "sim")]
@@ -422,9 +423,13 @@ where
             CallEvent::SendingOffer => Ok(()),
             CallEvent::SendingAnswer => Ok(()),
             CallEvent::ReceivedAnswer(received) => {
-                self.handle_received_answer(call, state, received)
+                self.handle_received_answer(call, state, received);
+                Ok(())
             }
-            CallEvent::ReceivedIce(received) => self.handle_received_ice(call, state, received),
+            CallEvent::ReceivedIce(received) => {
+                self.handle_received_ice(call, state, received);
+                Ok(())
+            }
             CallEvent::ReceivedHangup(received) => {
                 self.handle_received_hangup(call, state, received)
             }
@@ -432,10 +437,17 @@ where
                 self.handle_connection_observer_event(call, state, event, remote_device_id)
             }
             CallEvent::ConnectionObserverError(error, remote_device) => {
-                self.handle_connection_observer_error(call, error, remote_device)
+                self.handle_connection_observer_error(call, error, remote_device);
+                Ok(())
             }
-            CallEvent::InternalError(error) => self.handle_internal_error(call, error),
-            CallEvent::CallTimeout => self.handle_call_timeout(call, state),
+            CallEvent::InternalError(error) => {
+                self.handle_internal_error(call, error);
+                Ok(())
+            }
+            CallEvent::CallTimeout => {
+                self.handle_call_timeout(call, state);
+                Ok(())
+            }
             // Handled above
             CallEvent::SendHangupViaRtpDataToAll(_) => Ok(()),
             #[cfg(feature = "sim")]
@@ -550,7 +562,7 @@ where
         call: Call<T>,
         state: CallState,
         received: signaling::ReceivedAnswer,
-    ) -> Result<()> {
+    ) {
         // Accept answers when we are ringing so we can get answers for more than one connection.
         if matches!(
             state,
@@ -564,7 +576,6 @@ where
         } else {
             self.unexpected_state(state, "HandleReceivedAnswer");
         }
-        Ok(())
     }
 
     fn handle_received_ice(
@@ -572,7 +583,7 @@ where
         call: Call<T>,
         state: CallState,
         received: signaling::ReceivedIce,
-    ) -> Result<()> {
+    ) {
         if state.can_receive_ice_candidates() {
             self.schedule_work_until_terminating(call, "Handle Received Ice failed", move |call| {
                 call.received_ice(received)
@@ -580,7 +591,6 @@ where
         } else {
             self.unexpected_state(state, "HandleReceivedIceCandidates");
         }
-        Ok(())
     }
 
     fn handle_received_hangup(
@@ -725,7 +735,7 @@ where
         call: Call<T>,
         state: CallState,
         hangup: signaling::Hangup,
-    ) -> Result<()> {
+    ) {
         info!("handle_send_hangup_via_rtp_data_to_all():");
         if state.can_send_hangup_via_rtp() {
             self.schedule_work_even_when_terminating(
@@ -736,7 +746,6 @@ where
         } else {
             self.unexpected_state(state, "LocalHangup")
         }
-        Ok(())
     }
 
     fn handle_connection_observer_event(
@@ -1043,14 +1052,13 @@ where
         }
     }
 
-    fn handle_internal_error(&mut self, call: Call<T>, error: anyhow::Error) -> Result<()> {
+    fn handle_internal_error(&mut self, call: Call<T>, error: anyhow::Error) {
         info!("handle_internal_error():");
         self.worker_spawn(move || {
             if let Err(err) = call.internal_error(error) {
                 error!("Processing internal error failed: {}", err);
             }
         });
-        Ok(())
     }
 
     fn handle_connection_observer_error(
@@ -1058,7 +1066,7 @@ where
         call: Call<T>,
         error: anyhow::Error,
         remote_device_id: DeviceId,
-    ) -> Result<()> {
+    ) {
         info!(
             "handle_connection_observer_error(): call_id: {} remote_device_id: {}",
             call.call_id(),
@@ -1067,10 +1075,10 @@ where
 
         // Treat a connection internal error as a call internal error,
         // i.e. ignore the remote_device ID.
-        self.handle_internal_error(call, error)
+        self.handle_internal_error(call, error);
     }
 
-    fn handle_call_timeout(&mut self, call: Call<T>, state: CallState) -> Result<()> {
+    fn handle_call_timeout(&mut self, call: Call<T>, state: CallState) {
         info!("handle_call_timeout():");
 
         if !state.active() {
@@ -1080,7 +1088,6 @@ where
                 move |call| call.call_manager()?.timeout(call.call_id()),
             );
         }
-        Ok(())
     }
 
     #[cfg(feature = "sim")]

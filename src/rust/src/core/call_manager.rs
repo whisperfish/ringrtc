@@ -99,7 +99,7 @@ macro_rules! handle_active_call_api {
                 error!("{} failed: {}", stringify!($f), err);
                 let _ = call_manager.internal_api_error(err);
             }
-        })
+        });
     }};
 }
 
@@ -139,7 +139,7 @@ macro_rules! handle_api {
             if let Err(err) = $f(&mut call_manager $( , $a)*) {
                 error!("{} failed: {}", stringify!($f), err);
             }
-        })
+        });
     }};
 }
 
@@ -721,10 +721,10 @@ where
         remote_peer: <T as Platform>::AppRemotePeer,
         call_media_type: CallMediaType,
         local_device_id: DeviceId,
-    ) -> Result<()> {
+    ) {
         info!("API:call():");
         let call_id = CallId::random();
-        self.create_outgoing_call(remote_peer, call_id, call_media_type, local_device_id)
+        self.create_outgoing_call(remote_peer, call_id, call_media_type, local_device_id);
     }
 
     /// Create an outgoing call with specified CallId.
@@ -734,7 +734,7 @@ where
         call_id: CallId,
         call_media_type: CallMediaType,
         local_device_id: DeviceId,
-    ) -> Result<()> {
+    ) {
         info!("API:create_outgoing_call({}):", call_id);
 
         let mut call_manager = self.clone();
@@ -746,17 +746,17 @@ where
                 error!("Handle call failed: {}", err);
                 call_manager.internal_create_api_error(&remote_peer_error, call_id, err);
             }
-        })
+        });
     }
 
     /// Accept an incoming call.
-    pub fn accept_call(&mut self, call_id: CallId) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_accept_call, call_id)
+    pub fn accept_call(&mut self, call_id: CallId) {
+        handle_active_call_api!(self, CallManager::handle_accept_call, call_id);
     }
 
     /// Drop the active call.
-    pub fn drop_call(&mut self, call_id: CallId) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_drop_call, call_id)
+    pub fn drop_call(&mut self, call_id: CallId) {
+        handle_active_call_api!(self, CallManager::handle_drop_call, call_id);
     }
 
     /// Proceed with the outgoing call.
@@ -766,7 +766,7 @@ where
         app_call_context: <T as Platform>::AppCallContext,
         call_config: CallConfig,
         audio_levels_interval: Option<Duration>,
-    ) -> Result<()> {
+    ) {
         handle_active_call_api!(
             self,
             CallManager::handle_proceed,
@@ -774,22 +774,22 @@ where
             app_call_context,
             call_config,
             audio_levels_interval
-        )
+        );
     }
 
     /// OK for the library to continue to send signaling messages.
-    pub fn message_sent(&mut self, call_id: CallId) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_message_sent, call_id)
+    pub fn message_sent(&mut self, call_id: CallId) {
+        handle_active_call_api!(self, CallManager::handle_message_sent, call_id);
     }
 
     /// The previous message send failed. Handle, but continue to send signaling messages.
-    pub fn message_send_failure(&mut self, call_id: CallId) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_message_send_failure, call_id)
+    pub fn message_send_failure(&mut self, call_id: CallId) {
+        handle_active_call_api!(self, CallManager::handle_message_send_failure, call_id);
     }
 
     /// Local hangup of the active call.
-    pub fn hangup(&mut self) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_hangup)
+    pub fn hangup(&mut self) {
+        handle_active_call_api!(self, CallManager::handle_hangup);
     }
 
     /// removes outstanding group ring. If expected user ID is specified, verifies the pending
@@ -862,7 +862,7 @@ where
         remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedOffer,
-    ) -> Result<()> {
+    ) {
         info!("API:received_offer():");
 
         let mut call_manager = self.clone();
@@ -872,7 +872,7 @@ where
                 error!("Handle received offer failed: {}", err);
                 call_manager.internal_create_api_error(&remote_peer_error, call_id, err);
             }
-        })
+        });
     }
 
     /// Received answer from application.
@@ -881,14 +881,14 @@ where
         remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedAnswer,
-    ) -> Result<()> {
+    ) {
         handle_active_call_api!(
             self,
             CallManager::handle_received_answer,
             remote_peer,
             call_id,
             received
-        )
+        );
     }
 
     /// Received ICE candidates from application.
@@ -897,14 +897,14 @@ where
         remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedIce,
-    ) -> Result<()> {
+    ) {
         handle_active_call_api!(
             self,
             CallManager::handle_received_ice,
             remote_peer,
             call_id,
             received
-        )
+        );
     }
 
     /// Received hangup message from application.
@@ -913,14 +913,14 @@ where
         remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedHangup,
-    ) -> Result<()> {
+    ) {
         handle_active_call_api!(
             self,
             CallManager::handle_received_hangup,
             remote_peer,
             call_id,
             received
-        )
+        );
     }
 
     /// Received busy message from application.
@@ -929,14 +929,14 @@ where
         remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedBusy,
-    ) -> Result<()> {
+    ) {
         handle_active_call_api!(
             self,
             CallManager::handle_received_busy,
             remote_peer,
             call_id,
             received
-        )
+        );
     }
 
     /// Received a call message from the application.
@@ -947,7 +947,7 @@ where
         local_device_id: DeviceId,
         message: Vec<u8>,
         message_age: Duration,
-    ) -> Result<()> {
+    ) {
         handle_api!(
             self,
             CallManager::handle_received_call_message,
@@ -956,12 +956,12 @@ where
             local_device_id,
             message,
             message_age
-        )
+        );
     }
 
     /// Received a HTTP response from the application.
     pub fn received_http_response(&mut self, request_id: u32, response: Option<http::Response>) {
-        let _ = handle_api!(
+        handle_api!(
             self,
             CallManager::handle_received_http_response,
             request_id,
@@ -973,8 +973,8 @@ where
     ///
     /// Conclude all calls and clear active callId.  Do not notify the
     /// application at the conclusion.
-    pub fn reset(&mut self) -> Result<()> {
-        handle_api!(self, CallManager::handle_reset)
+    pub fn reset(&mut self) {
+        handle_api!(self, CallManager::handle_reset);
     }
 
     /// Close down the Call Manager.
@@ -987,7 +987,7 @@ where
 
         if !self.worker.stopper().has_been_stopped() {
             // Clear out any outstanding calls
-            let _ = self.reset();
+            self.reset();
 
             self.worker.stopper().stop_all_and_join();
 
@@ -1094,7 +1094,7 @@ where
     }
 
     /// Spawn a task on the worker thread, unless we are shutting down.
-    fn worker_spawn<F>(&mut self, f: F) -> Result<()>
+    fn worker_spawn<F>(&mut self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
@@ -1103,14 +1103,13 @@ where
         } else {
             warn!("worker_spawn(): worker unavailable");
         }
-        Ok(())
     }
 
     #[cfg(feature = "sim")]
-    fn worker_start_sync(&mut self, sync_condvar: Arc<(Mutex<bool>, Condvar)>) -> Result<()> {
+    fn worker_start_sync(&mut self, sync_condvar: Arc<(Mutex<bool>, Condvar)>) {
         self.worker_spawn(move || {
             // signal the condvar
-            info!("sync_worker_thread(): syncing");
+            info!("worker_start_sync(): syncing");
             let (mutex, condvar) = &*sync_condvar;
             if let Ok(mut terminate_complete) = mutex.lock() {
                 *terminate_complete = true;
@@ -1119,7 +1118,7 @@ where
                 // Not much else to do here.
                 error!("Close call manager mutex poisoned");
             }
-        })
+        });
     }
 
     #[cfg(feature = "sim")]
@@ -1149,7 +1148,7 @@ where
     pub fn sync_worker_thread(&mut self) -> Result<()> {
         // cycle a condvar through the worker thread
         let condvar = Arc::new((Mutex::new(false), Condvar::new()));
-        self.worker_start_sync(condvar.clone())?;
+        self.worker_start_sync(condvar.clone());
 
         // This blocks while the thread synchronizes.
         self.wait_worker_sync(condvar)
@@ -1232,7 +1231,7 @@ where
         mut call: Call<T>,
         hangup: Option<signaling::Hangup>,
         reason: Option<CallEndReason>,
-    ) -> Result<()> {
+    ) {
         let call_id = call.call_id();
 
         info!("terminate_call(): call_id: {}", call_id);
@@ -1290,7 +1289,7 @@ where
                     CallSummary::default(),
                 );
             }
-        })
+        });
     }
 
     /// Terminates the active call.
@@ -1312,7 +1311,8 @@ where
             None
         };
 
-        self.terminate_call(call, hangup, Some(reason))
+        self.terminate_call(call, hangup, Some(reason));
+        Ok(())
     }
 
     /// Handle call() API from application.
@@ -1390,7 +1390,8 @@ where
     ) -> Result<()> {
         self.clear_active_call()?;
         self.release_busy()?;
-        self.terminate_call(active_call, hangup, Some(reason))
+        self.terminate_call(active_call, hangup, Some(reason));
+        Ok(())
     }
 
     /// Handle drop_call() API from application.
@@ -1496,7 +1497,7 @@ where
                     .should_send_hangup_on_failure()
                     .then_some(signaling::Hangup::Normal);
 
-                self.terminate_call(call, hangup, Some(CallEndReason::SignalingFailure))?;
+                self.terminate_call(call, hangup, Some(CallEndReason::SignalingFailure));
             }
         } else {
             info!("handle_message_send_failure(): no matching call found");
@@ -1649,12 +1650,12 @@ where
                     active_call.unwrap(),
                     Some(signaling::Hangup::Normal),
                     Some(reason),
-                )?;
+                );
             }
             ActiveCallAction::TerminateWithoutSendingHangup(reason) => {
                 self.clear_active_call()?;
                 *busy = false;
-                self.terminate_call(active_call.unwrap(), None, Some(reason))?;
+                self.terminate_call(active_call.unwrap(), None, Some(reason));
             }
         }
 
@@ -2141,6 +2142,9 @@ where
     }
 
     /// Handle receiving an HTTP response from the application.
+    // Infallible, but `handle_api!` matches on the handler's error, and this handler must
+    // return a Result.
+    #[allow(clippy::unnecessary_wraps)]
     fn handle_received_http_response(
         &mut self,
         request_id: u32,
@@ -2171,7 +2175,7 @@ where
         // foreach call, terminate without notifying application
         for call in calls {
             info!("reset(): terminating call_id: {}", call.call_id());
-            let _ = self.terminate_call(call, Some(signaling::Hangup::Normal), None);
+            self.terminate_call(call, Some(signaling::Hangup::Normal), None);
         }
 
         self.clear_active_call()?;

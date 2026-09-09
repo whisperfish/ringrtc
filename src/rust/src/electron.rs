@@ -878,12 +878,9 @@ fn createOutgoingCall(mut cx: FunctionContext) -> JsResult<JsValue> {
 
     let call_id = CallId::random();
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.create_outgoing_call(
-            peer_id,
-            call_id,
-            media_type,
-            local_device_id,
-        )?;
+        endpoint
+            .call_manager
+            .create_outgoing_call(peer_id, call_id, media_type, local_device_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1012,7 +1009,7 @@ fn proceed(mut cx: FunctionContext) -> JsResult<JsValue> {
         }
         endpoint
             .call_manager
-            .proceed(call_id, call_context, call_config, audio_levels_interval)?;
+            .proceed(call_id, call_context, call_config, audio_levels_interval);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1025,7 +1022,7 @@ fn accept(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.accept({})", call_id);
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.accept_call(call_id)?;
+        endpoint.call_manager.accept_call(call_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1038,7 +1035,7 @@ fn ignore(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.ignore({})", call_id);
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.drop_call(call_id)?;
+        endpoint.call_manager.drop_call(call_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1050,7 +1047,7 @@ fn hangup(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.hangup()");
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.hangup()?;
+        endpoint.call_manager.hangup();
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1063,7 +1060,7 @@ fn signalingMessageSent(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.signalingMessageSent({})", call_id);
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.message_sent(call_id)?;
+        endpoint.call_manager.message_sent(call_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1076,7 +1073,7 @@ fn signalingMessageSendFailed(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.signalingMessageSendFailed({})", call_id);
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.message_send_failure(call_id)?;
+        endpoint.call_manager.message_send_failure(call_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1129,7 +1126,7 @@ fn receivedOffer(mut cx: FunctionContext) -> JsResult<JsValue> {
                 sender_identity_key,
                 receiver_identity_key,
             },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1156,7 +1153,7 @@ fn receivedAnswer(mut cx: FunctionContext) -> JsResult<JsValue> {
                 sender_identity_key,
                 receiver_identity_key,
             },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1194,7 +1191,7 @@ fn receivedIceCandidates(mut cx: FunctionContext) -> JsResult<JsValue> {
                 ice: signaling::Ice { candidates },
                 sender_device_id,
             },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1238,7 +1235,7 @@ fn receivedHangup(mut cx: FunctionContext) -> JsResult<JsValue> {
                 hangup,
                 sender_device_id,
             },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1260,7 +1257,7 @@ fn receivedBusy(mut cx: FunctionContext) -> JsResult<JsValue> {
             peer_id,
             call_id,
             signaling::ReceivedBusy { sender_device_id },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1282,7 +1279,7 @@ fn receivedCallMessage(mut cx: FunctionContext) -> JsResult<JsValue> {
             local_device_id,
             data,
             Duration::from_secs(message_age_sec),
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;

@@ -1675,7 +1675,7 @@ impl DockerStats {
         Ok(DockerStats { docker })
     }
 
-    pub fn start(&self, name: &str, path: &str) -> Result<()> {
+    pub fn start(&self, name: &str, path: &str) {
         let docker = self.docker.clone();
         let name = name.to_string();
         let path = path.to_string();
@@ -1824,7 +1824,5 @@ impl DockerStats {
                 }
             }
         });
-
-        Ok(())
     }
 }

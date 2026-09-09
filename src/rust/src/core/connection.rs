@@ -640,7 +640,7 @@ where
             let offer = observer.get_result()?;
 
             // We have to do this before we pass ownership of offer_sdi into set_local_description.
-            let (local_secret, local_public_key) = generate_local_secret_and_public_key()?;
+            let (local_secret, local_public_key) = generate_local_secret_and_public_key();
             let v4_offer = offer.to_v4(
                 local_public_key.as_bytes().to_vec(),
                 &self.call_config,
@@ -864,7 +864,7 @@ where
                 return Err(RingRtcError::UnknownSignaledProtocolVersion.into());
             };
 
-            let (local_secret, local_public_key) = generate_local_secret_and_public_key()?;
+            let (local_secret, local_public_key) = generate_local_secret_and_public_key();
             let answer_key = match remote_public_key {
                 None => None,
                 Some(remote_public_key) => {
@@ -949,7 +949,7 @@ where
             );
 
             let peer_connection = webrtc.peer_connection()?;
-            self.add_and_remove_remote_ice_candidates(peer_connection, &remote_ice_candidates)?;
+            self.add_and_remove_remote_ice_candidates(peer_connection, &remote_ice_candidates);
 
             self.set_state(ConnectionState::ConnectingBeforeAccepted)?;
             Ok(answer_to_send)
@@ -1385,7 +1385,8 @@ where
         let webrtc = self.webrtc.lock()?;
         let pc = webrtc.peer_connection()?;
 
-        self.add_and_remove_remote_ice_candidates(pc, &ice.candidates)
+        self.add_and_remove_remote_ice_candidates(pc, &ice.candidates);
+        Ok(())
     }
 
     // This is where we differentiate between received candidate additions and removals.
@@ -1393,7 +1394,7 @@ where
         &self,
         pc: &PeerConnection,
         remote_ice_candidates: &[signaling::IceCandidate],
-    ) -> Result<()> {
+    ) {
         let mut added_sdps = vec![];
         let mut removed_addresses = vec![];
         let mut removed_ports = vec![];
@@ -1431,7 +1432,6 @@ where
         if !removed_addresses.is_empty() {
             pc.remove_ice_candidates(removed_addresses.into_iter());
         }
-        Ok(())
     }
 
     /// Send a hangup message to the remote peer via RTP data.
@@ -2379,10 +2379,10 @@ where
     }
 }
 
-fn generate_local_secret_and_public_key() -> Result<(StaticSecret, PublicKey)> {
+fn generate_local_secret_and_public_key() -> (StaticSecret, PublicKey) {
     let secret = StaticSecret::random_from_rng(&mut UnwrapErr(SysRng));
     let public = PublicKey::from(&secret);
-    Ok((secret, public))
+    (secret, public)
 }
 
 struct NegotiatedSrtpKeys {

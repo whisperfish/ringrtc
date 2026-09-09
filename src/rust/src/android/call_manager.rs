@@ -205,7 +205,8 @@ pub fn call(
 ) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let app_remote_peer = Arc::new(env.new_global_ref(jni_remote)?);
-    call_manager.call(app_remote_peer, call_media_type, local_device_id)
+    call_manager.call(app_remote_peer, call_media_type, local_device_id);
+    Ok(())
 }
 
 /// Application notification to proceed with a new call
@@ -228,27 +229,31 @@ pub fn proceed(
         android_call_context,
         call_config,
         audio_levels_interval,
-    )
+    );
+    Ok(())
 }
 
 /// Application notification that signal message was sent successfully
 pub fn message_sent(call_manager: *mut AndroidCallManager, call_id: jlong) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
-    call_manager.message_sent(call_id)
+    call_manager.message_sent(call_id);
+    Ok(())
 }
 
 /// Application notification that signal message was not sent successfully
 pub fn message_send_failure(call_manager: *mut AndroidCallManager, call_id: jlong) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
-    call_manager.message_send_failure(call_id)
+    call_manager.message_send_failure(call_id);
+    Ok(())
 }
 
 /// Application notification of local hangup
 pub fn hangup(call_manager: *mut AndroidCallManager) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.hangup()
+    call_manager.hangup();
+    Ok(())
 }
 
 /// Application notification cancelling a group call ring
@@ -310,7 +315,8 @@ pub fn received_answer(
             sender_identity_key,
             receiver_identity_key,
         },
-    )
+    );
+    Ok(())
 }
 
 /// Application notification of received offer message
@@ -355,7 +361,8 @@ pub fn received_offer(
             sender_identity_key,
             receiver_identity_key,
         },
-    )
+    );
+    Ok(())
 }
 
 /// Application notification to add ICE candidates to a Connection
@@ -391,7 +398,8 @@ pub fn received_ice(
             },
             sender_device_id,
         },
-    )
+    );
+    Ok(())
 }
 
 /// Application notification of received Hangup message
@@ -415,7 +423,8 @@ pub fn received_hangup(
             sender_device_id,
             hangup: signaling::Hangup::from_type_and_device_id(hangup_type, hangup_device_id),
         },
-    )
+    );
+    Ok(())
 }
 
 /// Application notification of received Busy message
@@ -434,7 +443,8 @@ pub fn received_busy(
         remote_peer,
         call_id,
         signaling::ReceivedBusy { sender_device_id },
-    )
+    );
+    Ok(())
 }
 
 /// Application notification of received call message.
@@ -469,7 +479,8 @@ pub fn received_call_message(
         local_device_id,
         message,
         Duration::from_secs(message_age_sec),
-    )
+    );
+    Ok(())
 }
 
 /// Application notification of received HTTP response.
@@ -509,7 +520,8 @@ pub fn http_request_failed(call_manager: *mut AndroidCallManager, request_id: jl
 pub fn accept_call(call_manager: *mut AndroidCallManager, call_id: jlong) -> Result<()> {
     let call_id = CallId::from(call_id);
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.accept_call(call_id)
+    call_manager.accept_call(call_id);
+    Ok(())
 }
 
 /// CMI request to get the active Connection object (a raw jobject pointing to the Global ref)
@@ -583,13 +595,15 @@ pub fn update_data_mode(call_manager: *mut AndroidCallManager, data_mode: DataMo
 pub fn drop_call(call_manager: *mut AndroidCallManager, call_id: jlong) -> Result<()> {
     let call_id = CallId::from(call_id);
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.drop_call(call_id)
+    call_manager.drop_call(call_id);
+    Ok(())
 }
 
 /// CMI request to reset the Call Manager
 pub fn reset(call_manager: *mut AndroidCallManager) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.reset()
+    call_manager.reset();
+    Ok(())
 }
 
 /// CMI request to close down the Call Manager.

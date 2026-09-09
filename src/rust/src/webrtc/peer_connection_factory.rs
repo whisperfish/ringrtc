@@ -189,9 +189,12 @@ pub trait AudioDeviceObserver: Send + std::fmt::Debug {
 impl AudioConfig {
     // Return both the RffiAudioConfig as well as the name of the cubeb backend
     // in use, if any.
+    // Fallible only with `native`, where registering the ADM callback can fail.
+    #[cfg_attr(not(feature = "native"), allow(clippy::unnecessary_wraps))]
     fn rffi(
         &self,
-        #[allow(unused_mut, unused_variables)] // iOS and Android won't use this; that's fine.
+        // iOS and Android won't use this; that's fine.
+        #[cfg_attr(not(feature = "native"), allow(unused_mut, unused_variables))]
         mut audio_device_observer: Option<Box<dyn AudioDeviceObserver>>,
     ) -> Result<RffiAudioConfigWrapper> {
         #[cfg(feature = "native")]

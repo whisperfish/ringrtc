@@ -155,7 +155,7 @@ where
         packet: ReceiveData,
     ) -> std::result::Result<Vec<ReceiveData>, MrpReceiveError> {
         if let Some(ack_num) = header.ack_num {
-            self.update_send_window(ack_num)?;
+            self.update_send_window(ack_num);
             Ok(vec![])
         } else if header.seqnum.is_some() {
             let ready = self.update_receiver_window(header, packet)?;
@@ -461,7 +461,7 @@ impl<SendData, ReceiveData> MrpStream<SendData, ReceiveData> {
         packet: ReceiveData,
     ) -> std::result::Result<Vec<ReceiveData>, MrpReceiveError> {
         if let Some(ack_num) = header.ack_num {
-            self.update_send_window(ack_num)?;
+            self.update_send_window(ack_num);
             Ok(vec![])
         } else if header.seqnum.is_some() {
             let ready = self.update_receiver_window(header, packet)?;
@@ -480,10 +480,7 @@ impl<SendData, ReceiveData> MrpStream<SendData, ReceiveData> {
         self.receive_buffer.len()
     }
 
-    fn update_send_window(
-        &mut self,
-        received_ack_num: u64,
-    ) -> std::result::Result<(), MrpReceiveError> {
+    fn update_send_window(&mut self, received_ack_num: u64) {
         // Peer sent impossible ACK, which in TCP would cause a reset
         // Currently we do not support resets, so we ignore this case
         if received_ack_num > self.next_seqnum() {
@@ -492,19 +489,17 @@ impl<SendData, ReceiveData> MrpStream<SendData, ReceiveData> {
                 received_ack_num,
                 self.send_buffer.left_bounds()
             );
-            return Ok(());
+            return;
         }
         // Assuming no wrapping, this must be an old ACK since we only ever increase
         // seqnums. So we ignore
         if received_ack_num < self.send_buffer.left_bounds() {
-            return Ok(());
+            return;
         }
         if received_ack_num >= self.send_buffer.left_bounds() {
             let old = received_ack_num - self.send_buffer.left_bounds();
             self.send_buffer.drop_front(old as usize);
         }
-
-        Ok(())
     }
 
     fn update_receiver_window(

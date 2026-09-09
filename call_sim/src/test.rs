@@ -372,8 +372,8 @@ impl Test {
 
                             // Start monitoring docker stats. They will end when the associated container stops.
                             let docker_stats = DockerStats::new().await?;
-                            docker_stats.start(test_case.client_a.name, &test_case.test_path)?;
-                            docker_stats.start(test_case.client_b.name, &test_case.test_path)?;
+                            docker_stats.start(test_case.client_a.name, &test_case.test_path);
+                            docker_stats.start(test_case.client_b.name, &test_case.test_path);
 
                             // Tell client_b to start as a callee.
                             let request = tonic::Request::new(CommandMessage {

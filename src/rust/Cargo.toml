@@ -31,6 +31,9 @@ required-features = ["uuid", "sim", "sim_http", "rand/chacha"]
 name = "call_sim-cli"
 required-features = ["call_sim", "injectable_network"]
 
+[lints]
+workspace = true
+
 [dependencies]
 regex-aot = { path = "regex-aot" }
 

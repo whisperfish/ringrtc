@@ -407,12 +407,14 @@ fn parse_uuid(id: &str) -> Result<UserId, String> {
 /// parses base64 encoded, then formatted as `{base 64 userId}:{base64 memberId}`
 fn parse_group_member_info(s: &str) -> Result<GroupMember, String> {
     let splits = s.split(':').collect::<Vec<_>>();
-    assert_eq!(splits.len(), 2);
+    if splits.len() != 2 {
+        return Err(format!("expected `<userId>:<memberId>`, got `{s}`"));
+    }
     let user_id = BASE64_STANDARD
         .decode(splits[0])
-        .expect("could not base64 decode user_id");
+        .map_err(|e| format!("could not base64 decode user_id: {e}"))?;
     let member_id = BASE64_STANDARD
         .decode(splits[1])
-        .expect("could not base64 decode user_id");
+        .map_err(|e| format!("could not base64 decode member_id: {e}"))?;
     Ok(GroupMember { user_id, member_id })
 }
