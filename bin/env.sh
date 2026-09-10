@@ -107,5 +107,5 @@ if [ -d "${WEBRTC_SRC_DIR}" ]; then
   # On Windows, rather than copying the webrtc_include directory, symlink it.
   # Requires developer mode, admin privileges, or SeCreateSymbolicLinkPrivilege.
   export MSYS="winsymlinks:nativestrict"
-  ln -sf "$(realpath "${RINGRTC_SRC_DIR}/rust/src/webrtc_include")" "${RINGRTC_WEBRTC_SRC_DIR}/rffi/api"
+  ln -sfn "$(realpath "${RINGRTC_SRC_DIR}/rust/src/webrtc_include")" "${RINGRTC_WEBRTC_SRC_DIR}/rffi/api"
 fi
