@@ -1041,10 +1041,10 @@ pub async fn start_cli(
         args.push(format!("--decoder-complexity={}", complexity));
     }
 
-    if !call_config.audio.dnn_weights_path.is_empty() {
+    if !call_config.audio.dnn_weights_name.is_empty() {
         args.push(format!(
-            "--dnn-weights-path={}",
-            call_config.audio.dnn_weights_path
+            "--dnn-weights-path=/data/{}",
+            call_config.audio.dnn_weights_name
         ));
     }
 

@@ -927,8 +927,6 @@ async fn run_plc_tests(test: &mut Test) -> Result<()> {
                 input_name: "normal_phrasing".to_string(),
                 generate_spectrogram: false,
                 decoder_complexity,
-                // Only used for Deep PLC (decoder complexity 5) tests.
-                dnn_weights_path: "/data/deep_plc-dred-weights.bin".to_string(),
                 ..Default::default()
             },
             ..Default::default()
@@ -941,8 +939,6 @@ async fn run_plc_tests(test: &mut Test) -> Result<()> {
                 pesq_speech_analysis: true,
                 plc_speech_analysis: true,
                 decoder_complexity,
-                // Only used for Deep PLC (decoder complexity 5) tests.
-                dnn_weights_path: "/data/deep_plc-dred-weights.bin".to_string(),
                 ..Default::default()
             },
             ..Default::default()
@@ -1089,6 +1085,7 @@ pub fn format_log_line(
 async fn main() -> Result<()> {
     unsafe {
         std::env::set_var("RUST_BACKTRACE", "full");
+        std::env::set_var("RUST_LIB_BACKTRACE", "0");
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(format_log_line)

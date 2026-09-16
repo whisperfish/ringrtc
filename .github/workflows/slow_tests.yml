@@ -92,7 +92,10 @@ jobs:
       - name: Build call sim
         run: USE_PREBUILD=1 TYPE=release make call_sim-cli
       - name: Get media files
-        run: mkdir media && gcloud storage cp gs://calling-ci-resources.signal.org/* media
+        run: mkdir media && gcloud storage cp gs://calling-ci-resources.signal.org/media/* media
+        working-directory: call_sim/
+      - name: Get data files
+        run: mkdir data && gcloud storage cp gs://calling-ci-resources.signal.org/data/* data
         working-directory: call_sim/
       - name: Run call sim
         run: cargo run --release -- profiling_suite -b -c --profile --skip-visqol-mos-build

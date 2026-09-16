@@ -10,12 +10,12 @@ pub mod calling {
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use calling::{
     CommandMessage, Empty, command_message::Command, test_management_client::TestManagementClient,
 };
@@ -28,8 +28,8 @@ use tower::timeout::Timeout;
 use crate::{
     audio::{AudioFiles, chop_audio_and_analyze, get_audio_and_analyze},
     common::{
-        AudioAnalysisMode, ClientProfile, GroupConfig, NetworkConfigWithOffset, NetworkProfile,
-        TestCaseConfig,
+        AudioAnalysisMode, CallConfig, ClientProfile, GroupConfig, NetworkConfigWithOffset,
+        NetworkProfile, TestCaseConfig,
     },
     docker::{
         DockerStats, analyze_video, analyze_visqol_mos, clean_network, clean_up,
@@ -41,6 +41,9 @@ use crate::{
     },
     report::{AnalysisReport, AnalysisReportMos, Report},
 };
+
+/// How long to wait for a notification from the signaling server about the clients.
+const CLIENT_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Client<'a> {
     pub name: &'a str,
@@ -100,6 +103,15 @@ pub struct Sound {
 }
 
 impl Sound {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            reference_mos: None,
+            reference_mos_16khz_mono: None,
+            duration: 0.0,
+        }
+    }
+
     fn raw(&self) -> String {
         format!("{}.raw", self.name)
     }
@@ -122,6 +134,12 @@ pub struct Video {
 }
 
 impl Video {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+        }
+    }
+
     fn raw(&self) -> String {
         format!("{}.yuv", self.name)
     }
@@ -233,6 +251,35 @@ impl Test {
         )))
     }
 
+    /// Check that a file exists.
+    fn check_file(dir: &str, name: &str) -> Result<()> {
+        let path = Path::new(dir).join(name);
+        if !path.exists() {
+            return Err(anyhow!("Missing file `{}`", path.display()));
+        }
+
+        Ok(())
+    }
+
+    /// Check that all the files a client needs are available before running any tests.
+    fn check_client_files(&self, call_config: &CallConfig) -> Result<()> {
+        Self::check_file(
+            &self.media_path,
+            &Sound::new(&call_config.audio.input_name).raw(),
+        )?;
+
+        if let Some(name) = &call_config.video.input_name {
+            // Only the mp4 is a reference file, the raw video is generated from it.
+            Self::check_file(&self.media_path, &Video::new(name).mp4())?;
+        }
+
+        if !call_config.audio.dnn_weights_name.is_empty() {
+            Self::check_file(&self.data_path, &call_config.audio.dnn_weights_name)?;
+        }
+
+        Ok(())
+    }
+
     /// The fundamental test block that orchestrates various docker functions in order
     /// to achieve test execution of the RingRTC clients.
     async fn run_test(
@@ -341,7 +388,16 @@ impl Test {
 
             let mut done = false;
             loop {
-                match stream.message().await {
+                let message = tokio::time::timeout(CLIENT_NOTIFICATION_TIMEOUT, stream.message())
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "Timed out after {} seconds waiting for the clients",
+                            CLIENT_NOTIFICATION_TIMEOUT.as_secs(),
+                        )
+                    })?;
+
+                match message {
                     Ok(Some(event)) => {
                         // We wait for both clients to indicate that they are ready and already
                         // registered with the relay server.
@@ -708,18 +764,14 @@ impl Test {
         // Only process each sound once. So if we already have it, don't do anything.
         // Note: This means that mos analysis can only happen when sounds are pre-processed.
         if !self.sounds.contains_key(name) {
-            let mut sound = Sound {
-                name: name.to_string(),
-                reference_mos: None,
-                reference_mos_16khz_mono: None,
-                duration: 0.0,
-            };
+            let mut sound = Sound::new(name);
 
             let raw_name = sound.raw();
             let wav_name = sound.wav(false);
             let wav_name_speech = sound.wav(true);
 
             // Copy the reference file to our test directory.
+            Self::check_file(&self.media_path, &raw_name)?;
             fs::copy(
                 format!("{}/{}", self.media_path, raw_name),
                 format!("{}/{}", self.set_path, raw_name),
@@ -797,15 +849,14 @@ impl Test {
     async fn process_video(&mut self, name: &str) -> Result<()> {
         // Only process each video once. So if we already have it, don't do anything.
         if !self.videos.contains_key(name) {
-            let video = Video {
-                name: name.to_string(),
-            };
+            let video = Video::new(name);
 
             let raw_name = video.raw();
             let mp4_name = video.mp4();
 
             // Copy the *MP4* reference file to our test directory.
             // This is different from sounds, but raw video is much bigger.
+            Self::check_file(&self.media_path, &mp4_name)?;
             fs::copy(
                 format!("{}/{}", self.media_path, mp4_name),
                 format!("{}/{}", self.set_path, mp4_name),
@@ -934,6 +985,11 @@ impl Test {
         network_profiles: Vec<NetworkProfile>,
     ) -> Result<()> {
         let mut reports: Vec<Result<Report>> = vec![];
+
+        for test in &tests {
+            self.check_client_files(&test.client_a_config)?;
+            self.check_client_files(&test.client_b_config)?;
+        }
 
         for test in tests {
             let a_to_b_sound = test.client_a_config.audio.input_name.as_str();
