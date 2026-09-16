@@ -837,6 +837,7 @@ async fn run_perf_test(test: &mut Test) -> Result<()> {
                 test_case_name: "audio".to_string(),
                 length_seconds: 60,
                 save_media_files: false,
+                analysis_concurrency: 1,
                 client_a_config: CallConfig {
                     audio: AudioConfig {
                         input_name: "speaker_b".to_string(),
@@ -870,6 +871,7 @@ async fn run_perf_test(test: &mut Test) -> Result<()> {
                 test_case_name: "video".to_string(),
                 length_seconds: 60,
                 save_media_files: false,
+                analysis_concurrency: 1,
                 client_a_config: CallConfig {
                     audio: AudioConfig {
                         input_name: "speaker_b".to_string(),

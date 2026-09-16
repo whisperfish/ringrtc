@@ -1437,8 +1437,7 @@ pub async fn analyze_visqol_mos(
 
     let mut args = [
         "run",
-        "--name",
-        "visqol_mos",
+        "--rm",
         "-v",
         &format!("{}:/degraded", degraded_path),
         "-v",
@@ -1456,20 +1455,7 @@ pub async fn analyze_visqol_mos(
         args.push("--use_speech_mode".to_string());
     }
 
-    let _ = Command::new("docker").args(&args).spawn()?.wait().await?;
-
-    // Get the logs.
-    let output = Command::new("docker")
-        .args(["logs", "visqol_mos"])
-        .output()
-        .await?;
-
-    // Remove the container.
-    let _ = Command::new("docker")
-        .args(["rm", "visqol_mos"])
-        .spawn()?
-        .wait()
-        .await?;
+    let output = Command::new("docker").args(&args).output().await?;
 
     // Save the logs.
     let mut file = OpenOptions::new()
@@ -1495,8 +1481,7 @@ pub async fn analyze_pesq_mos(
 
     let args = [
         "run",
-        "--name",
-        "pesq_mos",
+        "--rm",
         "-v",
         &format!("{}:/degraded", degraded_path),
         "-v",
@@ -1508,20 +1493,7 @@ pub async fn analyze_pesq_mos(
     .map(String::from)
     .to_vec();
 
-    let _ = Command::new("docker").args(&args).spawn()?.wait().await?;
-
-    // Get the logs.
-    let output = Command::new("docker")
-        .args(["logs", "pesq_mos"])
-        .output()
-        .await?;
-
-    // Remove the container.
-    let _ = Command::new("docker")
-        .args(["rm", "pesq_mos"])
-        .spawn()?
-        .wait()
-        .await?;
+    let output = Command::new("docker").args(&args).output().await?;
 
     // Save the logs.
     let mut file = OpenOptions::new()
@@ -1545,8 +1517,7 @@ pub async fn analyze_plc_mos(
 
     let args = [
         "run",
-        "--name",
-        "plc_mos",
+        "--rm",
         "-v",
         &format!("{}:/degraded", degraded_path),
         "plc_mos",
@@ -1556,20 +1527,7 @@ pub async fn analyze_plc_mos(
     .map(String::from)
     .to_vec();
 
-    let _ = Command::new("docker").args(&args).spawn()?.wait().await?;
-
-    // Get the logs.
-    let output = Command::new("docker")
-        .args(["logs", "plc_mos"])
-        .output()
-        .await?;
-
-    // Remove the container.
-    let _ = Command::new("docker")
-        .args(["rm", "plc_mos"])
-        .spawn()?
-        .wait()
-        .await?;
+    let output = Command::new("docker").args(&args).output().await?;
 
     // Save the logs.
     let mut file = OpenOptions::new()

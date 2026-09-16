@@ -251,6 +251,8 @@ pub struct TestCaseConfig {
     /// Whether to save media files in the output. This takes time and disk space and is sometimes
     /// not needed.
     pub save_media_files: bool,
+    /// The number of analysis operations to run at once. Use 1 to keep analysis serial.
+    pub analysis_concurrency: u16,
 }
 
 impl Default for TestCaseConfig {
@@ -263,6 +265,7 @@ impl Default for TestCaseConfig {
             iterations: 1,
             create_charts: true,
             save_media_files: true,
+            analysis_concurrency: 16,
         }
     }
 }

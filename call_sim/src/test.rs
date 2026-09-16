@@ -650,6 +650,7 @@ impl Test {
                     &speech_files,
                     test_case.client_b.name,
                     &test_case_config.client_b_config.audio,
+                    test_case_config.analysis_concurrency,
                     &mut audio_test_results,
                 )
                 .await?;
@@ -660,6 +661,7 @@ impl Test {
                     &speech_files,
                     test_case.client_b.name,
                     &test_case_config.client_b_config.audio,
+                    test_case_config.analysis_concurrency,
                     &mut audio_test_results,
                 )
                 .await?;
