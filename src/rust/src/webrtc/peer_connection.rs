@@ -79,6 +79,7 @@ pub struct RffiReceivedAudioLevel {
 pub type AudioLevel = RffiAudioLevel;
 pub type ReceivedAudioLevel = RffiReceivedAudioLevel;
 
+#[derive(Debug)]
 pub enum Protocol<'a> {
     Udp,
     Tcp,
@@ -247,12 +248,12 @@ impl PeerConnection {
         &self,
         ip: std::net::IpAddr,
         port: u16,
-        protocol: Protocol,
+        protocol: &Protocol,
     ) -> Result<()> {
         let (tcp, hostname_c) = match protocol {
             Protocol::Udp => (false, None),
             Protocol::Tcp => (true, None),
-            Protocol::Tls(hostname) => (true, Some(CString::new(hostname)?)),
+            Protocol::Tls(hostname) => (true, Some(CString::new(*hostname)?)),
         };
 
         let add_ok = unsafe {
@@ -279,17 +280,37 @@ impl PeerConnection {
     }
 
     /// Rust wrapper around C++ PeerConnection::RemoveIceCandidates.
-    pub fn remove_ice_candidates(&self, removed_addresses: impl Iterator<Item = SocketAddr>) {
+    pub fn remove_ice_candidates<'a>(
+        &self,
+        removed_addresses: impl Iterator<Item = &'a SocketAddr>,
+        group: bool,
+        protocol: &Protocol,
+    ) -> Result<()> {
+        let (tcp, hostname_c) = match protocol {
+            Protocol::Udp => (false, None),
+            Protocol::Tcp => (true, None),
+            Protocol::Tls(hostname) => (true, Some(CString::new(*hostname)?)),
+        };
         let removed_addresses: Vec<RffiIpPort> =
-            removed_addresses.map(|address| address.into()).collect();
+            removed_addresses.map(|address| (*address).into()).collect();
 
         unsafe {
+            let hostname_ptr = hostname_c
+                .as_ref()
+                .map_or(webrtc::ptr::Borrowed::null(), |h| {
+                    webrtc::ptr::Borrowed::from_ptr(h.as_ptr())
+                });
+
             pc::Rust_removeIceCandidates(
                 self.rffi.as_borrowed(),
                 webrtc::ptr::Borrowed::from_ptr(removed_addresses.as_ptr()),
                 removed_addresses.len(),
+                group,
+                tcp,
+                hostname_ptr,
             )
         };
+        Ok(())
     }
 
     // Rust wrapper around C++ PeerConnection::CreateSharedIceGatherer().

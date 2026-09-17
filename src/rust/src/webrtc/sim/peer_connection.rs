@@ -300,6 +300,9 @@ pub unsafe fn Rust_removeIceCandidates(
     peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
     removed_addresses_data: webrtc::ptr::Borrowed<RffiIpPort>,
     removed_addresses_len: usize,
+    _group: bool,
+    _tcp: bool,
+    _hostname_ptr: webrtc::ptr::Borrowed<i8>,
 ) -> bool {
     info!("Rust_removeIceCandidates():");
     unsafe {

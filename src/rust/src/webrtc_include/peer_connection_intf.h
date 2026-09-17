@@ -217,7 +217,10 @@ RUSTEXPORT bool Rust_removeIceCandidates(
     ptr::BorrowedRc<webrtc::PeerConnectionInterface>
         peer_connection_borrowed_rc,
     ptr::Borrowed<webrtc::rffi::IpPort> removed_addresses_borrowed,
-    size_t length);
+    size_t length,
+    bool group,
+    bool tcp,
+    ptr::Borrowed<const char> hostname);
 
 RUSTEXPORT ptr::OwnedRc<webrtc::IceGathererInterface>
 Rust_createSharedIceGatherer(ptr::BorrowedRc<webrtc::PeerConnectionInterface>

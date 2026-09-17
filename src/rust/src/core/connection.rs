@@ -47,7 +47,7 @@ use crate::{
         self,
         ice_gatherer::IceGatherer,
         media::{MediaStream, VideoFrame, VideoFrameMetadata, VideoSink},
-        peer_connection::{AudioLevel, PeerConnection, SendRates},
+        peer_connection::{AudioLevel, PeerConnection, Protocol, SendRates},
         peer_connection_observer::{
             IceConnectionState, NetworkAdapterType, NetworkRoute, PeerConnectionObserverTrait,
             TransportProtocol,
@@ -1429,8 +1429,11 @@ where
                 warn!("Failed to add ICE candidate: {:?}", e);
             }
         }
-        if !removed_addresses.is_empty() {
-            pc.remove_ice_candidates(removed_addresses.into_iter());
+        if !removed_addresses.is_empty()
+            && let Err(e) =
+                pc.remove_ice_candidates(removed_addresses.iter(), false, &Protocol::Udp)
+        {
+            warn!("Failed to remove ICE candidate: {:?}", e);
         }
     }
 

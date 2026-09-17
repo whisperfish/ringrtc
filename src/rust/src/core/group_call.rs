@@ -58,7 +58,7 @@ use crate::{
         self,
         group_call::{
             DeviceToSfu, SfuToDevice,
-            sfu_to_device::{DeviceJoinedOrLeft, SendEndorsementsResponse},
+            sfu_to_device::{DeviceJoinedOrLeft, SendEndorsementsResponse, ServerAddress},
         },
     },
     webrtc::{
@@ -531,12 +531,16 @@ impl DheState {
 // The info about SFU needed in order to connect to it.
 #[derive(Clone, Debug)]
 pub struct SfuInfo {
+    pub ice_ufrag: String,
+    pub ice_pwd: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SfuAddress {
     pub udp_addresses: Vec<SocketAddr>,
     pub tcp_addresses: Vec<SocketAddr>,
     pub tls_addresses: Vec<SocketAddr>,
     pub hostname: Option<String>,
-    pub ice_ufrag: String,
-    pub ice_pwd: String,
 }
 
 const ADMIN_LOG_TAG: &str = "AdminAction";
@@ -568,6 +572,7 @@ pub trait SfuClient {
 
 pub struct Joined {
     pub sfu_info: SfuInfo,
+    pub sfu_address: SfuAddress,
     pub local_demux_id: DemuxId,
     pub server_dhe_pub_key: [u8; 32],
     pub hkdf_extra_info: Vec<u8>,
@@ -652,12 +657,14 @@ impl HttpSfuClient {
                 let join_result: Result<Joined> = match join_response {
                     Ok(join_response) => Ok(Joined {
                         sfu_info: SfuInfo {
+                            ice_ufrag: join_response.server_ice_ufrag,
+                            ice_pwd: join_response.server_ice_pwd,
+                        },
+                        sfu_address: SfuAddress {
                             udp_addresses: join_response.server_udp_addresses,
                             tcp_addresses: join_response.server_tcp_addresses,
                             tls_addresses: join_response.server_tls_addresses,
                             hostname: join_response.server_hostname,
-                            ice_ufrag: join_response.server_ice_ufrag,
-                            ice_pwd: join_response.server_ice_pwd,
                         },
                         local_demux_id: join_response.client_demux_id,
                         server_dhe_pub_key: join_response.server_dhe_pub_key,
@@ -1097,6 +1104,7 @@ struct State {
     local_ice_ufrag: String,
     local_ice_pwd: String,
     sfu_info: Option<SfuInfo>,
+    sfu_address: SfuAddress,
     peer_connection: PeerConnection,
     peer_connection_observer_impl: Box<PeerConnectionObserverImpl>,
     rtp_observer_impl: Option<Box<RtpObserverImpl>>,
@@ -1433,6 +1441,7 @@ impl Client {
                     outgoing_heartbeat_state: Default::default(),
 
                     sfu_info: None,
+                    sfu_address: Default::default(),
                     peer_connection_observer_impl,
                     rtp_observer_impl: None,
                     rtp_observer_ptr: None,
@@ -2832,6 +2841,7 @@ impl Client {
                 if Self::start_peer_connection(
                     state,
                     &joined.sfu_info,
+                    &joined.sfu_address,
                     joined.local_demux_id,
                     srtp_keys,
                 )
@@ -2851,6 +2861,7 @@ impl Client {
                 );
 
                 state.sfu_info = Some(joined.sfu_info);
+                state.sfu_address = joined.sfu_address;
             }
             ConnectionState::Connected | ConnectionState::Reconnecting => {
                 warn!("The SFU completed joining after already being connected.");
@@ -3071,6 +3082,7 @@ impl Client {
     fn start_peer_connection(
         state: &State,
         sfu_info: &SfuInfo,
+        sfu_address: &SfuAddress,
         local_demux_id: DemuxId,
         srtp_keys: &SrtpKeys,
     ) -> Result<()> {
@@ -3089,58 +3101,22 @@ impl Client {
                 .set_scalability_mode(&svc_config.mode, svc_config.max_bitrate_bps)?
         }
 
-        for addr in &sfu_info.udp_addresses {
-            // We use the octets instead of to_string() to bypass the IP address logging filter.
-            info!(
-                "Connecting to group call SFU via UDP with ip={:?} port={}",
-                match addr.ip() {
-                    std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
-                    std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
-                },
-                addr.port()
+        Self::add_ice_candidates(
+            &state.peer_connection,
+            sfu_address.udp_addresses.iter(),
+            &Protocol::Udp,
+        );
+        Self::add_ice_candidates(
+            &state.peer_connection,
+            sfu_address.tcp_addresses.iter(),
+            &Protocol::Tcp,
+        );
+        if let Some(hostname) = &sfu_address.hostname {
+            Self::add_ice_candidates(
+                &state.peer_connection,
+                sfu_address.tls_addresses.iter(),
+                &Protocol::Tls(hostname),
             );
-            state.peer_connection.add_ice_candidate_from_server(
-                addr.ip(),
-                addr.port(),
-                Protocol::Udp,
-            )?;
-        }
-
-        for addr in &sfu_info.tcp_addresses {
-            // We use the octets instead of to_string() to bypass the IP address logging filter.
-            info!(
-                "Connecting to group call SFU via TCP with ip={:?} port={}",
-                match addr.ip() {
-                    std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
-                    std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
-                },
-                addr.port()
-            );
-            state.peer_connection.add_ice_candidate_from_server(
-                addr.ip(),
-                addr.port(),
-                Protocol::Tcp,
-            )?;
-        }
-
-        for addr in &sfu_info.tls_addresses {
-            if let Some(hostname) = &sfu_info.hostname {
-                // We use the octets instead of to_string() to bypass the IP address logging filter.
-                info!(
-                    "Connecting to group call SFU via TLS with ip={:?} port={} hostname={}",
-                    match addr.ip() {
-                        std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
-                        std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
-                    },
-                    addr.port(),
-                    hostname
-                );
-                state.peer_connection.add_ice_candidate_from_server(
-                    addr.ip(),
-                    addr.port(),
-                    Protocol::Tls(hostname),
-                )?;
-            }
         }
 
         if state
@@ -3152,6 +3128,30 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    fn add_ice_candidates<'a>(
+        peer_connection: &PeerConnection,
+        addresses: impl Iterator<Item = &'a SocketAddr>,
+        protocol: &Protocol,
+    ) {
+        for addr in addresses {
+            // We use the octets instead of to_string() to bypass the IP address logging filter.
+            info!(
+                "Connecting to group call SFU with ip={:?} port={} via {:?}",
+                match addr.ip() {
+                    std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                    std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+                },
+                addr.port(),
+                protocol
+            );
+            if let Err(e) =
+                peer_connection.add_ice_candidate_from_server(addr.ip(), addr.port(), protocol)
+            {
+                warn!("Failed to add ICE candidate: {:?}", e);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -4575,6 +4575,7 @@ impl Client {
             mrp_header: _,
             content: _,
             endorsements,
+            server_address,
         } = msg;
 
         if let Some(Speaker {
@@ -4645,6 +4646,10 @@ impl Client {
         }) = raised_hands
         {
             Self::handle_raised_hands(actor, demux_ids, target_seqnum);
+        }
+
+        if let Some(server_address) = server_address {
+            Self::handle_new_server_address(actor, server_address);
         }
     }
 
@@ -5103,6 +5108,120 @@ impl Client {
                     }
                 }
             });
+    }
+
+    fn handle_new_server_address(actor: &Actor<State>, server_address: ServerAddress) {
+        let new = match Self::parse_server_address(&server_address) {
+            Ok(info) => info,
+            Err(e) => {
+                error!(
+                    "could not parse new server address: {:?}, data: {:?}",
+                    e, server_address
+                );
+                return;
+            }
+        };
+
+        actor.send(move |state| {
+            Self::remove_then_add_socketaddrs(
+                &state.peer_connection,
+                &state.sfu_address.udp_addresses,
+                &new.udp_addresses,
+                &Protocol::Udp,
+            );
+            state.sfu_address.udp_addresses = new.udp_addresses;
+
+            Self::remove_then_add_socketaddrs(
+                &state.peer_connection,
+                &state.sfu_address.tcp_addresses,
+                &new.tcp_addresses,
+                &Protocol::Tcp,
+            );
+            state.sfu_address.tcp_addresses = new.tcp_addresses;
+
+            match (&state.sfu_address.hostname, &new.hostname) {
+                (Some(old_hostname), Some(new_hostname)) if old_hostname == new_hostname => {
+                    // Same hostname, diff addresses
+                    Self::remove_then_add_socketaddrs(
+                        &state.peer_connection,
+                        &state.sfu_address.tls_addresses,
+                        &new.tls_addresses,
+                        &Protocol::Tls(new_hostname),
+                    );
+                }
+                (old_hostname, new_hostname) => {
+                    if let Some(old_hostname) = old_hostname
+                        && !state.sfu_address.tls_addresses.is_empty()
+                        && let Err(e) = state.peer_connection.remove_ice_candidates(
+                            state.sfu_address.tls_addresses.iter(),
+                            true,
+                            &Protocol::Tls(old_hostname),
+                        )
+                    {
+                        warn!("Failed to remove ICE candidates: {:?}", e);
+                    }
+
+                    if let Some(new_hostname) = new_hostname {
+                        Self::add_ice_candidates(
+                            &state.peer_connection,
+                            new.tls_addresses.iter(),
+                            &Protocol::Tls(new_hostname),
+                        );
+                    }
+                }
+            }
+            state.sfu_address.tls_addresses = new.tls_addresses;
+            state.sfu_address.hostname = new.hostname;
+        });
+    }
+
+    fn parse_server_address(address: &ServerAddress) -> Result<SfuAddress> {
+        Ok(SfuAddress {
+            udp_addresses: Self::parse_socketaddrs(&address.udp_addresses)?,
+            tcp_addresses: Self::parse_socketaddrs(&address.tcp_addresses)?,
+            tls_addresses: Self::parse_socketaddrs(&address.tls_addresses)?,
+            hostname: address.tls_hostname.clone(),
+        })
+    }
+
+    fn parse_socketaddrs(addrs: &[String]) -> Result<Vec<SocketAddr>> {
+        let mut out = Vec::with_capacity(addrs.len());
+        for a in addrs {
+            out.push(a.parse()?)
+        }
+        Ok(out)
+    }
+
+    /// Remove old before adding new; removing marks candidates for removal,
+    /// but does not actually remove them. If new candidates are added first,
+    /// then old removed, the new candidates would be pruned immediately.
+    fn remove_then_add_socketaddrs(
+        peer_connection: &PeerConnection,
+        old: &[SocketAddr],
+        new: &[SocketAddr],
+        protocol: &Protocol,
+    ) {
+        let old: HashSet<&SocketAddr> = HashSet::from_iter(old.iter());
+        let new = HashSet::from_iter(new.iter());
+
+        let only_in_old: Vec<_> = old.difference(&new).copied().collect();
+        if !only_in_old.is_empty() {
+            info!(
+                "removing {} candidates via {:?}",
+                only_in_old.len(),
+                protocol
+            );
+            if let Err(e) =
+                peer_connection.remove_ice_candidates(only_in_old.into_iter(), true, protocol)
+            {
+                warn!("Failed to remove ICE candidates: {:?}", e);
+            }
+        }
+
+        let mut only_in_new = new.difference(&old).copied().peekable();
+        if only_in_new.peek().is_some() {
+            Self::add_ice_candidates(peer_connection, only_in_new, protocol);
+        }
     }
 
     #[cfg(feature = "sim")]
@@ -5577,6 +5696,7 @@ mod tests {
     #[derive(Clone)]
     struct FakeSfuClient {
         sfu_info: SfuInfo,
+        sfu_address: SfuAddress,
         local_demux_id: DemuxId,
         call_creator: Option<UserId>,
         request_count: Arc<AtomicU64>,
@@ -5609,12 +5729,14 @@ mod tests {
             let server_dhe_pub_key = *PublicKey::from(&server_secret).as_bytes();
             Self {
                 sfu_info: SfuInfo {
+                    ice_ufrag: "fake ICE ufrag".to_string(),
+                    ice_pwd: "fake ICE pwd".to_string(),
+                },
+                sfu_address: SfuAddress {
                     udp_addresses: Vec::new(),
                     tcp_addresses: Vec::new(),
                     tls_addresses: Vec::new(),
                     hostname: None,
-                    ice_ufrag: "fake ICE ufrag".to_string(),
-                    ice_pwd: "fake ICE pwd".to_string(),
                 },
                 local_demux_id,
                 call_creator,
@@ -5663,6 +5785,7 @@ mod tests {
             }
             client.on_sfu_client_join_attempt_completed(Ok(Joined {
                 sfu_info: self.sfu_info.clone(),
+                sfu_address: self.sfu_address.clone(),
                 local_demux_id: self.local_demux_id,
                 server_dhe_pub_key: self.server_dhe_pub_key,
                 hkdf_extra_info: b"hkdf_extra_info".to_vec(),
@@ -9777,6 +9900,7 @@ mod remote_devices_tests {
             removed: None,
             raised_hands: None,
             endorsements: None,
+            server_address: None,
         };
 
         assert!(sfu_to_device.encode_to_vec().len() <= MAX_PACKET_SERIALIZED_BYTE_SIZE);

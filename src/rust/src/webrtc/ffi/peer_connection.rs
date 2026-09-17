@@ -110,6 +110,9 @@ unsafe extern "C" {
         peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
         removed_addresses_data: webrtc::ptr::Borrowed<RffiIpPort>,
         removed_addresses_len: usize,
+        group: bool,
+        tcp: bool,
+        hostname: webrtc::ptr::Borrowed<c_char>,
     ) -> bool;
 
     pub fn Rust_createSharedIceGatherer(
