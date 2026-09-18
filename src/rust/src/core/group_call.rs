@@ -1398,7 +1398,7 @@ impl Client {
                         );
                     })?;
                 let call_id_for_stats = CallId::from(client_id as u64);
-                let mut stats_observer =
+                let stats_observer =
                     create_stats_observer(call_id_for_stats, DEFAULT_STATS_INTERVAL);
                 let call_summary =
                     GroupCallSummary::new(DEFAULT_CALL_SUMMARY_TIME_LIMIT, DEFAULT_STATS_INTERVAL)?;

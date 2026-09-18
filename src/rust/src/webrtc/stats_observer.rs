@@ -182,7 +182,7 @@ impl_snapshot!(ConnectionStatsSnapshot, Connection);
 #[cfg(not(target_os = "android"))]
 impl_snapshot!(SystemStatsSnapshot, System);
 
-pub trait StatsSnapshotConsumer: Debug {
+pub trait StatsSnapshotConsumer: Debug + Send + Sync {
     fn on_stats_snapshot_ready(&self, stats: &StatsSnapshot);
 }
 
@@ -909,6 +909,13 @@ struct Stats {
     connections: HashMap<String, (Instant, ConnectionStatistics)>,
     report_json: Mutex<String>,
 }
+
+#[derive(Debug, Default)]
+struct NetworkRouteInfo {
+    to_report_network_route: Option<NetworkRoute>,
+    next_network_route: Option<NetworkRoute>,
+}
+
 /// Collector object for obtaining statistics.
 #[derive(Debug)]
 pub struct StatsObserver {
@@ -917,11 +924,10 @@ pub struct StatsObserver {
     stats: Stats,
     stats_initial_offset: Duration,
     stats_received_count: u32,
-    stats_snapshot_consumer: Box<dyn StatsSnapshotConsumer>,
+    stats_snapshot_consumer: Mutex<Box<dyn StatsSnapshotConsumer>>,
     #[cfg(not(target_os = "android"))]
     system_stats: sysinfo::System,
-    to_report_network_route: Option<NetworkRoute>,
-    next_network_route: Option<NetworkRoute>,
+    network_route_info: Mutex<NetworkRouteInfo>,
 }
 
 impl StatsObserver {
@@ -947,24 +953,26 @@ impl StatsObserver {
             stats
         };
 
-        let stats_snapshot_consumer = Box::new(DefaultStatsSnapshotConsumer);
+        let default_consumer = Box::new(DefaultStatsSnapshotConsumer);
 
         Self {
             call_id,
             rffi: webrtc::Arc::null(),
             stats: Default::default(),
             stats_initial_offset,
+            stats_snapshot_consumer: Mutex::new(default_consumer),
             stats_received_count: 0,
-            stats_snapshot_consumer,
             #[cfg(not(target_os = "android"))]
             system_stats,
-            to_report_network_route: None,
-            next_network_route: None,
+            network_route_info: Default::default(),
         }
     }
 
-    pub fn set_network_route(&mut self, route: NetworkRoute) {
-        self.next_network_route = Some(route);
+    pub fn set_network_route(&self, route: NetworkRoute) {
+        match self.network_route_info.lock() {
+            Ok(mut info) => info.next_network_route = Some(route),
+            Err(e) => error!("Failed to set network route info: {e}"),
+        }
     }
 
     /// Invoked when statistics are received via the stats observer callback.
@@ -980,8 +988,15 @@ impl StatsObserver {
         *stats_report_json = report_json;
         drop(stats_report_json);
 
-        self.stats_snapshot_consumer
-            .on_stats_snapshot_ready(&StatsSnapshot::Begin);
+        let stats_snapshot_consumer = match self.stats_snapshot_consumer.lock() {
+            Ok(stats_snapshot_consumer) => stats_snapshot_consumer,
+            Err(e) => {
+                error!("Failed to acquire the stats snapshot consumer: {e}");
+                return;
+            }
+        };
+
+        stats_snapshot_consumer.on_stats_snapshot_ready(&StatsSnapshot::Begin);
 
         // System
 
@@ -990,27 +1005,34 @@ impl StatsObserver {
             self.system_stats.refresh_cpu_usage();
             let system_stats_snapshot = SystemStatsSnapshot::derive(&self.system_stats);
             info!("{system_stats_snapshot}");
-            self.stats_snapshot_consumer
-                .on_stats_snapshot_ready(&system_stats_snapshot.into());
+            stats_snapshot_consumer.on_stats_snapshot_ready(&system_stats_snapshot.into());
         }
 
         // Connection
 
-        if self.to_report_network_route.is_none() {
-            self.to_report_network_route = self.next_network_route;
-        }
+        let network_route = match self.network_route_info.lock() {
+            Ok(mut info) => {
+                if info.to_report_network_route.is_none() {
+                    info.to_report_network_route = info.next_network_route;
+                }
+                let network_route = info.to_report_network_route;
+                info.to_report_network_route = info.next_network_route;
+                network_route
+            }
+            Err(e) => {
+                error!("Failed to get network route info: {e}");
+                None
+            }
+        };
 
         let connection_stats_snapshot = ConnectionStatsSnapshot::derive(
             self.call_id,
             media_statistics.timestamp_us,
             &media_statistics.nominated_connection_statistics,
-            self.to_report_network_route,
+            network_route,
         );
-        self.to_report_network_route = self.next_network_route;
-
         info!("{connection_stats_snapshot}");
-        self.stats_snapshot_consumer
-            .on_stats_snapshot_ready(&connection_stats_snapshot.into());
+        stats_snapshot_consumer.on_stats_snapshot_ready(&connection_stats_snapshot.into());
 
         // Audio senders
 
@@ -1022,8 +1044,7 @@ impl StatsObserver {
                 seconds_elapsed,
             );
             info!("{audio_sender_stats_snapshot}");
-            self.stats_snapshot_consumer
-                .on_stats_snapshot_ready(&audio_sender_stats_snapshot.into());
+            stats_snapshot_consumer.on_stats_snapshot_ready(&audio_sender_stats_snapshot.into());
             *prev_audio_send_stats = audio_sender.clone();
         }
 
@@ -1040,8 +1061,7 @@ impl StatsObserver {
                 seconds_elapsed,
             );
             info!("{video_sender_stats_snapshot}");
-            self.stats_snapshot_consumer
-                .on_stats_snapshot_ready(&video_sender_stats_snapshot.into());
+            stats_snapshot_consumer.on_stats_snapshot_ready(&video_sender_stats_snapshot.into());
             *prev_video_send_stats = video_sender.clone();
         }
 
@@ -1063,8 +1083,7 @@ impl StatsObserver {
             info!("{audio_receiver_stats_snapshot}");
             *prev_jb_delay = audio_receiver_stats_snapshot.jitter_buffer_delay;
             *prev_jb_target_delay = audio_receiver_stats_snapshot.jitter_buffer_target_delay;
-            self.stats_snapshot_consumer
-                .on_stats_snapshot_ready(&audio_receiver_stats_snapshot.into());
+            stats_snapshot_consumer.on_stats_snapshot_ready(&audio_receiver_stats_snapshot.into());
             *updated_at = Instant::now();
             *prev_audio_recv_stats = audio_receiver.clone();
         }
@@ -1083,14 +1102,14 @@ impl StatsObserver {
                 seconds_elapsed,
             );
             info!("{video_receiver_stats_snapshot}");
-            self.stats_snapshot_consumer
-                .on_stats_snapshot_ready(&video_receiver_stats_snapshot.into());
+            stats_snapshot_consumer.on_stats_snapshot_ready(&video_receiver_stats_snapshot.into());
             *updated_at = Instant::now();
             *prev_video_recv_stats = video_receiver.clone();
         }
 
-        self.stats_snapshot_consumer
-            .on_stats_snapshot_ready(&StatsSnapshot::End);
+        stats_snapshot_consumer.on_stats_snapshot_ready(&StatsSnapshot::End);
+
+        drop(stats_snapshot_consumer);
 
         self.stats.timestamp_us = media_statistics.timestamp_us;
         self.stats_received_count += 1;
@@ -1143,8 +1162,11 @@ impl StatsObserver {
         }
     }
 
-    pub fn set_stats_snapshot_consumer(&mut self, consumer: Box<dyn StatsSnapshotConsumer>) {
-        self.stats_snapshot_consumer = consumer;
+    pub fn set_stats_snapshot_consumer(&self, consumer: Box<dyn StatsSnapshotConsumer>) {
+        match self.stats_snapshot_consumer.lock() {
+            Ok(mut stats_snapshot_consumer) => *stats_snapshot_consumer = consumer,
+            Err(e) => error!("Failed to set the stats snapshot consumer: {e}"),
+        }
     }
 
     pub fn set_collect_raw_stats_report(&self, collect_raw_stats_report: bool) {
