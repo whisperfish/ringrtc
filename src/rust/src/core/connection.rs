@@ -1758,17 +1758,17 @@ where
         // Free up webrtc related resources.
         let mut webrtc = self.webrtc.lock()?;
 
-        // This makes it safe to destroy the stats observer
-        // and the Connection (which is also a PeerConnectionObserver).
         if let Ok(peer_connection) = webrtc.peer_connection() {
             peer_connection.close();
         }
 
-        // dispose of the incoming media
-        webrtc.incoming_media = None;
+        // Note that the order of release is important here. We want the peer
+        // connection references to be dropped first, before either the incoming
+        // media or the stats observer are released, in order to prevent
+        // possible UAF.
 
-        // dispose of the stats observer
-        webrtc.stats_observer = None;
+        // Release the reference to the native PeerConnection.
+        webrtc.peer_connection = None;
 
         // Free the application connection object, which is in essence
         // the PeerConnection object.  It is important to dispose of
@@ -1778,6 +1778,14 @@ where
         // PeerConnection is completely shutdown it is safe to free up
         // the connection_ptr.
         webrtc.app_connection = None;
+
+        // dispose of the incoming media
+        webrtc.incoming_media = None;
+
+        // dispose of the stats observer
+        // The PeerConnection's destructor has run, so there will be
+        // no callbacks into the stats observer.
+        webrtc.stats_observer = None;
 
         // Free the connection object previously used by the
         // PeerConnectionObserver.  Convert the pointer back into a
