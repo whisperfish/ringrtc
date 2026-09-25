@@ -4015,6 +4015,17 @@ impl Html {
             }
         }
 
+        let values = summary_row.mos_over_time.iter().map(|(_, mos)| *mos);
+        let min = values.clone().reduce(f32::min);
+        let max = values.reduce(f32::max);
+        for value in [min, max, summary_row.mos_average] {
+            if let Some(mos) = value {
+                let _ = writeln!(buf, "<td>{}{:.3}</td>", indent, mos);
+            } else {
+                buf.push_str("<td></td>\n");
+            }
+        }
+
         buf.push_str("</tr>\n");
 
         buf
@@ -4055,6 +4066,9 @@ impl Html {
         for timestamp in &timestamp_columns {
             let _ = writeln!(buf, "<th>{:.1}</th>", *timestamp as f32 / 10.0);
         }
+        buf.push_str("<th>Min</th>\n");
+        buf.push_str("<th>Max</th>\n");
+        buf.push_str("<th>Ave</th>\n");
         buf.push_str("</tr>\n");
         buf.push_str("</thead>\n");
 
@@ -4092,7 +4106,7 @@ impl Html {
                     }
                 }
                 Err(err) => {
-                    let column_count = timestamp_columns.len() + 1;
+                    let column_count = timestamp_columns.len() + 4;
                     buf.push_str("<tr class=\"table-dark\">\n");
                     let _ = writeln!(buf, "<td colspan=\"{}\">{:?}</td>", column_count, err);
                     buf.push_str("</tr>\n");

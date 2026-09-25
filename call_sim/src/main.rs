@@ -1186,6 +1186,72 @@ async fn run_dred_tests(test: &mut Test) -> Result<()> {
     Ok(())
 }
 
+async fn run_tcc_tests(test: &mut Test) -> Result<()> {
+    let tcc_values = [false, true];
+    let adaptation_values = 0..=1;
+    let min_bitrate_values = [32000, 24000, 16000];
+
+    let test_cases = iproduct!(tcc_values, adaptation_values, min_bitrate_values)
+        .map(|(enable_tcc, adaptation, min_bitrate_bps)| TestCaseConfig {
+            test_case_name: format!(
+                "tcc-{enable_tcc}_adaptation-{adaptation}_min-{min_bitrate_bps}"
+            ),
+            length_seconds: 60,
+            client_configs: vec![
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_12s".to_string(),
+                        min_bitrate_bps,
+                        adaptation,
+                        enable_tcc,
+                        generate_spectrogram: false,
+                        visqol_speech_analysis: false,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_12s".to_string(),
+                        min_bitrate_bps,
+                        adaptation,
+                        enable_tcc,
+                        analysis_mode: AudioAnalysisMode::Chopped,
+                        generate_spectrogram: false,
+                        visqol_speech_analysis: true,
+                        visqol_audio_analysis: true,
+                        pesq_speech_analysis: true,
+                        plc_speech_analysis: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+
+    test.run(
+        GroupConfig {
+            group_name: "tcc_tests".to_string(),
+            summary_report_columns: SummaryReportColumns {
+                show_visqol_mos_speech: true,
+                show_visqol_mos_audio: true,
+                show_pesq_mos: true,
+                show_plc_mos: true,
+                show_video: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        test_cases,
+        vec![NetworkProfile::None, NetworkProfile::LimitedBandwidth(30)],
+    )
+    .await?;
+
+    Ok(())
+}
+
 pub fn format_log_line(
     buf: &mut env_logger::fmt::Formatter,
     record: &log::Record<'_>,
@@ -1307,6 +1373,7 @@ async fn main() -> Result<()> {
             "profiling_suite" => run_perf_test(test).await?,
             "plc_tests" => run_plc_tests(test).await?,
             "dred_tests" => run_dred_tests(test).await?,
+            "tcc_tests" => run_tcc_tests(test).await?,
             _ => panic!("unknown test set \"{test_set_name}\""),
         }
         test.report().await?;
