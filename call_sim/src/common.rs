@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{fmt, path::Path, time::Duration};
+use std::{collections::HashSet, fmt, path::Path, time::Duration};
+
+use derive_builder::Builder;
 
 /// ChartDimension is used for summary reports, to help automate the summary charting and
 /// display of most tracked `dimensions` that are available.
@@ -239,10 +241,10 @@ pub struct TestCaseConfig {
     pub test_case_name: String,
     /// The amount of time that the test should consume (once client instances have started).
     pub length_seconds: u16,
-    /// The overall configuration specific to client A.
-    pub client_a_config: CallConfig,
-    /// The overall configuration specific to client B.
-    pub client_b_config: CallConfig,
+    /// The overall configuration of different clients
+    /// Requires a minimum of 1 client for group calls, 2 for 1:1 calls
+    /// Only uses the first 2 configs for 1:1
+    pub client_configs: Vec<CallConfig>,
     /// The number of times to run the test case.
     pub iterations: u16,
     /// Whether to create charts for reports. This takes time and is sometimes not needed
@@ -253,6 +255,36 @@ pub struct TestCaseConfig {
     pub save_media_files: bool,
     /// The number of analysis operations to run at once. Use 1 to keep analysis serial.
     pub analysis_concurrency: u16,
+    /// Whether or not this test case should be a group call
+    pub is_group_call: bool,
+}
+
+impl TestCaseConfig {
+    /// Gets the first config in `client_configs`
+    /// Panics if does not exist
+    pub fn client_a_config(&self) -> &CallConfig {
+        self.client_configs.first().unwrap()
+    }
+
+    /// Gets the first config in `client_configs`
+    /// Panics if does not exist
+    pub fn client_b_config(&self) -> &CallConfig {
+        self.client_configs.get(1).unwrap()
+    }
+
+    pub fn usable_client_configs(&self) -> Vec<&CallConfig> {
+        if self.is_group_call {
+            self.client_configs.iter().collect()
+        } else {
+            self.client_configs.iter().take(2).collect()
+        }
+    }
+
+    pub fn needs_turn_server(&self) -> bool {
+        self.usable_client_configs()
+            .iter()
+            .any(|config| config.start_turn_server)
+    }
 }
 
 impl Default for TestCaseConfig {
@@ -260,12 +292,12 @@ impl Default for TestCaseConfig {
         Self {
             test_case_name: "default".to_string(),
             length_seconds: 30,
-            client_a_config: Default::default(),
-            client_b_config: Default::default(),
+            client_configs: vec![Default::default(), Default::default()],
             iterations: 1,
             create_charts: true,
             save_media_files: true,
             analysis_concurrency: 16,
+            is_group_call: false,
         }
     }
 }
@@ -916,28 +948,76 @@ impl NetworkProfile {
     }
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Builder, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[builder(derive(Debug), setter(into))]
 pub struct ClientProfile {
     pub user_id: String,
     pub device_id: String,
     pub groups: Vec<Group>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Builder, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Group {
-    // friendly name for group, expected to be unique in config file
+#[builder(derive(Debug), setter(into))]
+pub struct GroupMetadata {
+    // friendly name for group, expected to be unique
     pub name: String,
-    // Base64 encoded
-    pub id: String,
-    pub membership_proof: String,
-    pub members: Vec<GroupMember>,
+    pub id_base64: String,
+    pub members: HashSet<GroupMember>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Builder, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[builder(derive(Debug), setter(into))]
+pub struct Group {
+    pub metadata: GroupMetadata,
+    pub membership_proof: String,
+}
+
+#[derive(Clone, Builder, Debug, Hash, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[builder(derive(Debug), setter(into))]
 pub struct GroupMember {
     pub user_id: String,
     pub member_id: String,
+}
+
+#[derive(Default)]
+pub struct AToZIterator {
+    idx: u8,
+}
+
+impl Iterator for AToZIterator {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx > 25 {
+            return None;
+        }
+
+        let result = Some((b'a' + self.idx) as char);
+        self.idx += 1;
+        result
+    }
+}
+
+/// Starts the iterator at 172.28.0.2 and increments by up to 172.28.0.130
+#[derive(Clone, Default)]
+pub struct ClientIpIterator {
+    idx: u8,
+}
+
+impl Iterator for ClientIpIterator {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx == 128 {
+            return None;
+        }
+
+        let result = Some(format!("172.28.0.{}", 2 + self.idx));
+        self.idx += 1;
+        result
+    }
 }

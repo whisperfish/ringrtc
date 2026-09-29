@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{process::Stdio, time::Duration};
+use std::{path::Path, process::Stdio, time::Duration};
 
 use anyhow::Result;
 use bollard::{
@@ -31,7 +31,7 @@ use crate::{
 };
 
 /// This function builds all docker images that we need.
-pub async fn build_images(build_visqol_mos: bool) -> Result<()> {
+pub async fn build_images(build_visqol_mos: bool, build_local_sfu: bool) -> Result<()> {
     info!("Building images:");
 
     info!("cli:");
@@ -109,24 +109,102 @@ pub async fn build_images(build_visqol_mos: bool) -> Result<()> {
         .await?;
     info!("... took {:.2?}", now.elapsed());
 
+    if build_local_sfu {
+        info!("local_sfu (cloning):");
+        stdout().flush().await?;
+        now = std::time::Instant::now();
+        pull_or_clone_sfu_repo().await?;
+        info!("... took {:.2?}", now.elapsed());
+
+        info!("local_sfu (building):");
+        stdout().flush().await?;
+        now = std::time::Instant::now();
+        let _ = Command::new("docker")
+            .args([
+                "build",
+                ".",
+                "-f",
+                "backend/Dockerfile",
+                "-t",
+                "calling-backend",
+            ])
+            .current_dir("call_sim/docker/local_sfu")
+            .spawn()?
+            .wait()
+            .await?;
+        info!("... took {:.2?}", now.elapsed());
+    }
+
+    Ok(())
+}
+
+async fn pull_or_clone_sfu_repo() -> Result<()> {
+    let path = Path::new("call_sim/docker/local_sfu");
+
+    // assume is directory and the matching repo
+    if path.exists() {
+        println!("Repo exists, pulling origin main");
+        let _ = Command::new("git")
+            .args(["pull", "origin", "main"])
+            .current_dir("call_sim/docker/local_sfu")
+            .spawn()?
+            .wait()
+            .await?;
+    } else {
+        println!("The directory does not exist.");
+        let _ = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "main",
+                "git@github.com:signalapp/Signal-Calling-Service.git",
+                "local_sfu",
+            ])
+            .current_dir("call_sim/docker")
+            .spawn()?
+            .wait()
+            .await?;
+    }
+
     Ok(())
 }
 
 /// This function cleans all docker containers that were used.
-pub async fn clean_up(container_names: Vec<&str>) -> Result<()> {
+pub async fn clean_up(container_names: Vec<&str>, container_prefixes: Vec<&str>) -> Result<()> {
     info!("Cleaning up containers:");
+    let mut args = vec!["docker", "ps", "-aq"];
+    let name_filter: String;
+    if !container_names.is_empty() {
+        name_filter = format!("name=\"^({})$\"", container_names.join("|"));
+        args.push("--filter");
+        args.push(name_filter.as_str());
+    }
 
-    // Ignore errors and try to move on.
-    for container in container_names.iter() {
-        let result = Command::new("docker")
-            .args(["rm", "--force", "--volumes", container])
-            .stderr(Stdio::null())
-            .spawn()?
-            .wait()
-            .await;
-        if result.is_err() {
-            info!("  Couldn't remove {}", container);
-        }
+    let prefix_filter: String;
+    if !container_prefixes.is_empty() {
+        prefix_filter = format!("name=\"^({})\"", container_prefixes.join("|"));
+        args.push("--filter");
+        args.push(prefix_filter.as_str());
+    }
+
+    let rm_args = vec!["xargs", "docker", "rm", "--force", "--volumes"];
+    args.push("|");
+    args.extend(rm_args);
+    info!("Running {}", args.join(" "));
+
+    // Use sh and pipe which has portable syntax vs command subtitution
+    if let Err(e) = Command::new("sh")
+        .arg("-c")
+        .arg(args.join(" "))
+        .stderr(Stdio::inherit())
+        .spawn()?
+        .wait()
+        .await
+    {
+        // Ignore errors and try to move on.
+        error!("Failed to completely cleanup with error: {e}");
     }
 
     Ok(())
@@ -239,6 +317,56 @@ pub async fn start_turn_server() -> Result<()> {
             "--no-tlsv1_1",
             "--lt-cred-mech",
             "--user=test:test",
+        ])
+        .spawn()?
+        .wait()
+        .await?;
+
+    Ok(())
+}
+
+/// Start an SFU at 172.28.0.252, but might be available at `calling-backend`. Exposes:
+/// - STUN at the standard port (3478) via UDP
+/// - Group call API at 8080 over HTTP
+/// - Ice candidate port over 9900 for TCP
+/// - Group calling at 10000 for UDP, port 80 for TCP.
+pub async fn start_sfu_server() -> Result<()> {
+    info!("Starting SFU server");
+
+    let _ = Command::new("docker")
+        .args([
+            "run",
+            "--name",
+            "calling-backend",
+            "-d",
+            "--privileged",
+            "--network",
+            "ringrtc_default",
+            "--ip",
+            "172.28.0.252",
+            "-p",
+            "80:80",
+            "-p",
+            "3478:3478/udp",
+            "-p",
+            "8080:8080",
+            "-p",
+            "9900:9900",
+            "-p",
+            "10000:10000",
+            "--entrypoint",
+            "calling_backend",
+            "calling-backend",
+            "--ice-candidate-ip",
+            "172.28.0.252",
+            "--signaling-port",
+            "8080",
+            "--ice-candidate-port-tcp",
+            "9900",
+            "--inactivity-timeout-secs",
+            "30",
+            "--diagnostics-interval-secs",
+            "1",
         ])
         .spawn()?
         .wait()
@@ -945,13 +1073,15 @@ pub async fn start_virtual_audio(name: &str, output_file: &Option<String>) -> Re
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_cli(
     name: &str,
     media_io: MediaFileIo,
     call_config: &CallConfig,
-    remote_call_config: &CallConfig,
+    remote_call_config: Option<&CallConfig>,
     client_profile: &ClientProfile,
     call_type: &CallTypeConfig,
+    ip: String,
     profile: bool,
 ) -> Result<()> {
     info!("Starting cli for `{}`", name);
@@ -1119,16 +1249,12 @@ pub async fn start_cli(
         args.push(format!("--output-video-file=/report/{}", output_video_file));
     }
 
-    if let Some((width, height)) = remote_call_config.video.dimensions() {
+    if let Some((width, height)) = remote_call_config.and_then(|rcc| rcc.video.dimensions()) {
         args.push(format!("--output-video-width={}", width));
         args.push(format!("--output-video-height={}", height));
     }
 
-    if name == "client_a" {
-        args.push("--ip=172.28.0.2".to_string());
-    } else {
-        args.push("--ip=172.28.0.3".to_string());
-    }
+    args.push(format!("--ip={ip}"));
 
     if let CallProfile::DeterministicLoss(loss_rate) = call_config.profile {
         args.push(format!("--deterministic-loss={}", loss_rate));
@@ -1139,18 +1265,18 @@ pub async fn start_cli(
     args.push(format!("--user-id={}", client_profile.user_id));
     args.push(format!("--device-id={}", client_profile.device_id));
     if let CallTypeConfig::Group {
-        sfu_url,
+        sfu_connection_params,
         group_name,
     } = call_type
     {
-        args.push(format!("--sfu-url={}", sfu_url));
+        args.push(format!("--sfu-url={}", sfu_connection_params.url()));
         args.push("--is-group-call".to_string());
 
         let group = if let Some(group_name) = group_name {
             client_profile
                 .groups
                 .iter()
-                .filter(|&g| group_name == &g.name)
+                .filter(|&g| group_name == &g.metadata.name)
                 .exactly_one()
                 .map_err(|_| {
                     anyhow::anyhow!("Did't find exactly one group named: {:?}", group_name)
@@ -1161,10 +1287,11 @@ pub async fn start_cli(
                 .first()
                 .expect("at least one group info detailed")
         };
-        args.push(format!("--group-id={}", group.id));
+        args.push(format!("--group-id={}", group.metadata.id_base64));
         args.push(format!("--membership-proof={}", group.membership_proof));
 
         let member_info = group
+            .metadata
             .members
             .iter()
             .map(|member| format!("{}:{}", member.user_id, member.member_id))
@@ -1616,6 +1743,25 @@ pub async fn get_turn_server_logs(path: &str) -> Result<()> {
         .create(true)
         .truncate(true)
         .open(format!("{}/turn.log", path))
+        .await?;
+    file.write_all(&output.stdout).await?;
+    file.write_all(&output.stderr).await?;
+
+    Ok(())
+}
+
+pub async fn get_sfu_server_logs(path: &str) -> Result<()> {
+    let output = Command::new("docker")
+        .args(["logs", "calling-backend"])
+        .output()
+        .await?;
+
+    // Save the logs.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(format!("{}/sfu.log", path))
         .await?;
     file.write_all(&output.stdout).await?;
     file.write_all(&output.stderr).await?;

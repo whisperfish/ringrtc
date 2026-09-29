@@ -39,3 +39,4 @@ tonic = "0.14.2"
 tonic-prost = "0.14.2"
 tower = { version = "0.5.2", features = ["timeout"] }
 uuid = { version = "1.19.0", features = ["v4", "fast-rng"] }
+derive_builder = "0.20.2"

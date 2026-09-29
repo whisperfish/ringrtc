@@ -10,19 +10,12 @@ mod docker;
 mod report;
 mod test;
 
-use std::{
-    env,
-    fs::File,
-    io::Write,
-    path::Path,
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashSet, env, io::Write, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
-use common::ClientProfile;
 use hex::FromHex;
-use itertools::{Itertools, iproduct};
+use itertools::iproduct;
 use log::info;
 
 use crate::{
@@ -31,8 +24,9 @@ use crate::{
         ChartDimension, GroupConfig, NetworkConfig, NetworkConfigWithOffset, NetworkProfile,
         RelayServerConfig, SummaryReportColumns, TestCaseConfig, VideoConfig,
     },
-    docker::{build_images, clean_network, clean_up},
-    test::{CallTypeConfig, Test},
+    config::DynamicClientProfileFactory,
+    docker::{build_images, clean_network},
+    test::{CallTypeConfig, Test, clean_up_all_containers},
 };
 
 fn compile_time_root_directory() -> &'static std::ffi::OsStr {
@@ -91,11 +85,24 @@ struct Args {
     /// certain analyses.
     #[arg(long)]
     skip_visqol_mos_build: bool,
+
+    /// Which clients to analyze and include a report section for, as a comma separated list.
+    /// For 1:1 calls, you must specify both a & b to get both sides of analysis
+    ///
+    /// Clients may be named either by their suffix or in full, so `--analyze-clients=a,b` and
+    /// `--analyze-clients=client_a,client_b` are equivalent.
+    ///
+    /// When unset, group calls analyze every client, and 1:1 calls analyze every client except
+    /// client_a, whose received media is usually not interesting.
+    #[arg(long, value_delimiter = ',')]
+    analyze_clients: Option<Vec<String>>,
 }
 
-// Set these two values when running call sim group calls. The Auth Key is used to generate profiles
-// and the SFU url points to the SFU connect to
-const SFU_URL: &str = "https://sfu.test.voip.signal.org";
+/// If set to None, the tests will default to a local SFU.
+/// Set the url and auth key when running call sim group calls on a remote sfu.
+/// The Auth Key is used to generate profiles that will be accepted by the SFUs
+/// authentication
+const SFU_URL: Option<&str> = None; // Some("https://sfu.test.voip.signal.org");
 fn group_auth_key_gen() -> [u8; 32] {
     <[u8; 32]>::from_hex("deaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead")
         .unwrap()
@@ -120,20 +127,22 @@ async fn run_minimal_example(test: &mut Test) -> Result<()> {
         },
         vec![TestCaseConfig {
             test_case_name: "default".to_string(),
-            // client_a is sending a set of spoken phrases, which will be analyzed from
-            // client_b's perspective.
-            client_a_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
-                    // We don't look at analysis from client_a's point of view, so there
-                    // is no need to generate anything for it.
-                    generate_spectrogram: false,
+            client_configs: vec![
+                // client_a is sending a set of spoken phrases, which will be analyzed from
+                // client_b's perspective.
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        // We don't look at analysis from client_a's point of view, so there
+                        // is no need to generate anything for it.
+                        generate_spectrogram: false,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-            // In this case, client_b is sending recorded silence (the default).
-            client_b_config: CallConfig::default(),
+                // In this case, client_b is sending recorded silence (the default).
+                CallConfig::default(),
+            ],
             ..Default::default()
         }],
         // Finally, the network profiles to test against can be specified. The `None`
@@ -177,28 +186,30 @@ async fn run_baseline(test: &mut Test, with_video: bool) -> Result<()> {
         },
         vec![TestCaseConfig {
             test_case_name: "ptime-60".to_string(),
-            client_a_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
-                    generate_spectrogram: false,
+            client_configs: vec![
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        generate_spectrogram: false,
+                        ..Default::default()
+                    },
+                    video: video.clone(),
                     ..Default::default()
                 },
-                video: video.clone(),
-                ..Default::default()
-            },
-            client_b_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
-                    // Calculate all mos values for these audio tests.
-                    visqol_speech_analysis: true,
-                    visqol_audio_analysis: true,
-                    pesq_speech_analysis: true,
-                    plc_speech_analysis: true,
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        // Calculate all mos values for these audio tests.
+                        visqol_speech_analysis: true,
+                        visqol_audio_analysis: true,
+                        pesq_speech_analysis: true,
+                        plc_speech_analysis: true,
+                        ..Default::default()
+                    },
+                    video,
                     ..Default::default()
                 },
-                video,
-                ..Default::default()
-            },
+            ],
             // Run 3 iterations of each test to get an average to help contain the
             // non-deterministic behavior of the tests.
             iterations: 3,
@@ -255,28 +266,30 @@ async fn run_bursty_loss_test(test: &mut Test, with_video: bool) -> Result<()> {
         },
         vec![TestCaseConfig {
             test_case_name: "ptime-60".to_string(),
-            client_a_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
-                    generate_spectrogram: false,
+            client_configs: vec![
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        generate_spectrogram: false,
+                        ..Default::default()
+                    },
+                    video: video.clone(),
                     ..Default::default()
                 },
-                video: video.clone(),
-                ..Default::default()
-            },
-            client_b_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
-                    // Calculate all mos values for these audio tests.
-                    visqol_speech_analysis: true,
-                    visqol_audio_analysis: true,
-                    pesq_speech_analysis: true,
-                    plc_speech_analysis: true,
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        // Calculate all mos values for these audio tests.
+                        visqol_speech_analysis: true,
+                        visqol_audio_analysis: true,
+                        pesq_speech_analysis: true,
+                        plc_speech_analysis: true,
+                        ..Default::default()
+                    },
+                    video,
                     ..Default::default()
                 },
-                video,
-                ..Default::default()
-            },
+            ],
             ..Default::default()
         }],
         vec![
@@ -329,34 +342,36 @@ async fn run_deterministic_loss_test(test: &mut Test, with_video: bool) -> Resul
             |(enable_dtx, initial_packet_size_ms, loss)| TestCaseConfig {
                 test_case_name: format!("ptime-{initial_packet_size_ms}_dtx-{enable_dtx}_{loss}"),
                 length_seconds: 30,
-                client_a_config: CallConfig {
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
-                        initial_packet_size_ms,
-                        enable_dtx,
-                        generate_spectrogram: false,
+                client_configs: vec![
+                    CallConfig {
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            initial_packet_size_ms,
+                            enable_dtx,
+                            generate_spectrogram: false,
+                            ..Default::default()
+                        },
+                        video: video.clone(),
+                        profile: DeterministicLoss(loss),
                         ..Default::default()
                     },
-                    video: video.clone(),
-                    profile: DeterministicLoss(loss),
-                    ..Default::default()
-                },
-                client_b_config: CallConfig {
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
-                        initial_packet_size_ms,
-                        enable_dtx,
-                        visqol_speech_analysis: true,
-                        visqol_audio_analysis: true,
-                        pesq_speech_analysis: true,
-                        plc_speech_analysis: true,
+                    CallConfig {
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            initial_packet_size_ms,
+                            enable_dtx,
+                            visqol_speech_analysis: true,
+                            visqol_audio_analysis: true,
+                            pesq_speech_analysis: true,
+                            plc_speech_analysis: true,
+                            ..Default::default()
+                        },
+                        video: video.clone(),
+                        profile: DeterministicLoss(loss),
                         ..Default::default()
                     },
-                    video: video.clone(),
-                    profile: DeterministicLoss(loss),
-                    ..Default::default()
-                },
-                iterations: 3,
+                ],
+                iterations: 1,
                 ..Default::default()
             },
         )
@@ -374,6 +389,88 @@ async fn run_deterministic_loss_test(test: &mut Test, with_video: bool) -> Resul
                 show_pesq_mos: true,
                 show_plc_mos: true,
                 show_video: with_video,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        test_cases,
+        vec![NetworkProfile::None],
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Run as a group call (`group_multi_deterministic_loss_test`).
+///
+/// Differs from `deterministic_loss_test` in three ways, all of which are needed to get a
+/// meaningful MOS out of a call with more than two participants:
+///
+///  - Only client A talks. If more than one client sends audio the listeners record a mix and
+///    score badly no matter how clean the network is.
+///  - Client A uses `constant_phrasing` instead of `normal_phrasing`. The SFU stops forwarding
+///    silent packets, typically when DTX has kicked in. The SFU forwarder preserves sequence \
+///    number offsets, those drops show up at the receivers as packet loss. `constant_phrasing`
+///    silences are short enough to avoid packets getting dropped.
+///  - Loss is applied only to the listeners. This stops client A from losing RTCP reports.
+async fn run_multi_deterministic_loss_test(test: &mut Test, client_count: usize) -> Result<()> {
+    assert!(
+        client_count >= 2,
+        "need at least one talker and one listener"
+    );
+
+    let loss_values = (0..=20).step_by(10);
+
+    let test_cases = loss_values
+        .map(|loss| {
+            // Client A is the only talker, and is not measured.
+            let talker = CallConfig {
+                audio: AudioConfig {
+                    input_name: "constant_phrasing".to_string(),
+                    initial_packet_size_ms: 60,
+                    generate_spectrogram: false,
+                    ..Default::default()
+                },
+                profile: DeterministicLoss(0),
+                ..Default::default()
+            };
+
+            // Everyone else stays silent and is measured against the talker's audio.
+            let listener = CallConfig {
+                audio: AudioConfig {
+                    input_name: "silence".to_string(),
+                    initial_packet_size_ms: 60,
+                    visqol_speech_analysis: true,
+                    visqol_audio_analysis: true,
+                    pesq_speech_analysis: true,
+                    plc_speech_analysis: true,
+                    ..Default::default()
+                },
+                profile: DeterministicLoss(loss),
+                ..Default::default()
+            };
+
+            let mut client_configs = vec![talker];
+            client_configs.extend(std::iter::repeat_n(listener, client_count - 1));
+
+            TestCaseConfig {
+                test_case_name: format!("clients-{client_count}_loss-{loss}"),
+                length_seconds: 30,
+                client_configs,
+                iterations: 1,
+                ..Default::default()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    test.run(
+        GroupConfig {
+            group_name: "multi_deterministic_loss_test".to_string(),
+            summary_report_columns: SummaryReportColumns {
+                show_visqol_mos_speech: true,
+                show_visqol_mos_audio: true,
+                show_pesq_mos: true,
+                show_plc_mos: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -407,116 +504,124 @@ async fn run_relay_tests(test: &mut Test) -> Result<()> {
         vec![
             TestCaseConfig {
                 test_case_name: "no_relay".to_string(),
-                client_a_config: CallConfig {
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
+                client_configs: vec![
+                    CallConfig {
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-                client_b_config: CallConfig {
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
+                    CallConfig {
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
+                ],
                 ..Default::default()
             },
             TestCaseConfig {
                 test_case_name: "with_relay".to_string(),
-                client_a_config: CallConfig {
-                    relay_servers: RelayServerConfig {
-                        urls: vec![
-                            "stun:turn".to_string(),
-                            "turn:turn".to_string(),
-                            "turn:turn:80?transport=tcp".to_string(),
-                        ],
+                client_configs: vec![
+                    CallConfig {
+                        relay_servers: RelayServerConfig {
+                            urls: vec![
+                                "stun:turn".to_string(),
+                                "turn:turn".to_string(),
+                                "turn:turn:80?transport=tcp".to_string(),
+                            ],
+                            ..Default::default()
+                        },
+                        start_turn_server: true,
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    start_turn_server: true,
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
+                    CallConfig {
+                        relay_servers: RelayServerConfig {
+                            urls: vec![
+                                "stun:turn".to_string(),
+                                "turn:turn".to_string(),
+                                "turn:turn:80?transport=tcp".to_string(),
+                            ],
+                            ..Default::default()
+                        },
+                        start_turn_server: true,
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-                client_b_config: CallConfig {
-                    relay_servers: RelayServerConfig {
-                        urls: vec![
-                            "stun:turn".to_string(),
-                            "turn:turn".to_string(),
-                            "turn:turn:80?transport=tcp".to_string(),
-                        ],
-                        ..Default::default()
-                    },
-                    start_turn_server: true,
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
+                ],
                 ..Default::default()
             },
             TestCaseConfig {
                 test_case_name: "force_udp_relay".to_string(),
-                client_a_config: CallConfig {
-                    relay_servers: RelayServerConfig {
-                        urls: vec!["turn:turn".to_string()],
+                client_configs: vec![
+                    CallConfig {
+                        relay_servers: RelayServerConfig {
+                            urls: vec!["turn:turn".to_string()],
+                            ..Default::default()
+                        },
+                        start_turn_server: true,
+                        force_relay: true,
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    start_turn_server: true,
-                    force_relay: true,
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
+                    CallConfig {
+                        relay_servers: RelayServerConfig {
+                            urls: vec!["turn:turn".to_string()],
+                            ..Default::default()
+                        },
+                        start_turn_server: true,
+                        force_relay: true,
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-                client_b_config: CallConfig {
-                    relay_servers: RelayServerConfig {
-                        urls: vec!["turn:turn".to_string()],
-                        ..Default::default()
-                    },
-                    start_turn_server: true,
-                    force_relay: true,
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
+                ],
                 ..Default::default()
             },
             TestCaseConfig {
                 test_case_name: "force_tcp_relay".to_string(),
-                client_a_config: CallConfig {
-                    relay_servers: RelayServerConfig {
-                        urls: vec!["turn:turn:80?transport=tcp".to_string()],
+                client_configs: vec![
+                    CallConfig {
+                        relay_servers: RelayServerConfig {
+                            urls: vec!["turn:turn:80?transport=tcp".to_string()],
+                            ..Default::default()
+                        },
+                        start_turn_server: true,
+                        force_relay: true,
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    start_turn_server: true,
-                    force_relay: true,
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
+                    CallConfig {
+                        relay_servers: RelayServerConfig {
+                            urls: vec!["turn:turn:80?transport=tcp".to_string()],
+                            ..Default::default()
+                        },
+                        start_turn_server: true,
+                        force_relay: true,
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-                client_b_config: CallConfig {
-                    relay_servers: RelayServerConfig {
-                        urls: vec!["turn:turn:80?transport=tcp".to_string()],
-                        ..Default::default()
-                    },
-                    start_turn_server: true,
-                    force_relay: true,
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
+                ],
                 ..Default::default()
             },
         ],
@@ -548,54 +653,56 @@ async fn run_turn_long_tests(test: &mut Test) -> Result<()> {
         vec![TestCaseConfig {
             test_case_name: "force_relay_with_video".to_string(),
             length_seconds: 1800,
-            client_a_config: CallConfig {
-                relay_servers: RelayServerConfig {
-                    username: relay_username.clone(),
-                    password: relay_password.clone(),
-                    urls: relay_urls.clone(),
-                    urls_with_ips: relay_urls_with_ips.clone(),
-                    hostname: Some(relay_hostname.clone()),
-                },
-                force_relay: true,
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
-                    generate_spectrogram: false,
-                    visqol_speech_analysis: false,
-                    visqol_audio_analysis: false,
-                    pesq_speech_analysis: false,
-                    plc_speech_analysis: false,
+            client_configs: vec![
+                CallConfig {
+                    relay_servers: RelayServerConfig {
+                        username: relay_username.clone(),
+                        password: relay_password.clone(),
+                        urls: relay_urls.clone(),
+                        urls_with_ips: relay_urls_with_ips.clone(),
+                        hostname: Some(relay_hostname.clone()),
+                    },
+                    force_relay: true,
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        generate_spectrogram: false,
+                        visqol_speech_analysis: false,
+                        visqol_audio_analysis: false,
+                        pesq_speech_analysis: false,
+                        plc_speech_analysis: false,
+                        ..Default::default()
+                    },
+                    video: VideoConfig {
+                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                video: VideoConfig {
-                    input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                CallConfig {
+                    relay_servers: RelayServerConfig {
+                        username: relay_username,
+                        password: relay_password,
+                        urls: relay_urls,
+                        urls_with_ips: relay_urls_with_ips,
+                        hostname: Some(relay_hostname),
+                    },
+                    force_relay: true,
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        generate_spectrogram: false,
+                        visqol_speech_analysis: false,
+                        visqol_audio_analysis: false,
+                        pesq_speech_analysis: false,
+                        plc_speech_analysis: false,
+                        ..Default::default()
+                    },
+                    video: VideoConfig {
+                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-            client_b_config: CallConfig {
-                relay_servers: RelayServerConfig {
-                    username: relay_username,
-                    password: relay_password,
-                    urls: relay_urls,
-                    urls_with_ips: relay_urls_with_ips,
-                    hostname: Some(relay_hostname),
-                },
-                force_relay: true,
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
-                    generate_spectrogram: false,
-                    visqol_speech_analysis: false,
-                    visqol_audio_analysis: false,
-                    pesq_speech_analysis: false,
-                    plc_speech_analysis: false,
-                    ..Default::default()
-                },
-                video: VideoConfig {
-                    input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            ],
             save_media_files: false,
             iterations: 4,
             ..Default::default()
@@ -619,18 +726,20 @@ async fn run_video_send_over_bandwidth(test: &mut Test) -> Result<()> {
         },
         vec![TestCaseConfig {
             test_case_name: "video".to_string(),
-            client_a_config: CallConfig {
-                video: VideoConfig {
-                    // This will expect a file named "ConferenceMotion_50fps@1280x720.mp4" in the media directory.
-                    // The dimensions are important, because the converted video only contains raw frame data.
-                    // (This particular video *is* 50fps, but the CLI hardcodes 30fps for both send and receive.)
-                    input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
-                    ..Default::default()
-                },
-                ..CallConfig::default()
-            }
-            .with_audio_input_name("normal_phrasing"),
-            client_b_config: CallConfig::default().with_audio_input_name("normal_phrasing"),
+            client_configs: vec![
+                CallConfig {
+                    video: VideoConfig {
+                        // This will expect a file named "ConferenceMotion_50fps@1280x720.mp4" in the media directory.
+                        // The dimensions are important, because the converted video only contains raw frame data.
+                        // (This particular video *is* 50fps, but the CLI hardcodes 30fps for both send and receive.)
+                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                        ..Default::default()
+                    },
+                    ..CallConfig::default()
+                }
+                .with_audio_input_name("normal_phrasing"),
+                CallConfig::default().with_audio_input_name("normal_phrasing"),
+            ],
             ..Default::default()
         }],
         vec![
@@ -660,59 +769,63 @@ async fn run_video_compare_vp8_vs_vp9(test: &mut Test, bitrate_values: &Vec<u16>
     for bitrate in bitrate_values {
         test_cases.push(TestCaseConfig {
             test_case_name: format!("vp8_{}", bitrate),
-            client_a_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
+            client_configs: vec![
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        ..Default::default()
+                    },
+                    video: VideoConfig {
+                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                        ..Default::default()
+                    },
+                    allowed_bitrate_kbps: *bitrate,
                     ..Default::default()
                 },
-                video: VideoConfig {
-                    input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        ..Default::default()
+                    },
+                    video: VideoConfig {
+                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                        ..Default::default()
+                    },
+                    allowed_bitrate_kbps: *bitrate,
                     ..Default::default()
                 },
-                allowed_bitrate_kbps: *bitrate,
-                ..Default::default()
-            },
-            client_b_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
-                    ..Default::default()
-                },
-                video: VideoConfig {
-                    input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
-                    ..Default::default()
-                },
-                allowed_bitrate_kbps: *bitrate,
-                ..Default::default()
-            },
+            ],
             ..Default::default()
         });
 
         test_cases.push(TestCaseConfig {
             test_case_name: format!("vp9_{}", bitrate),
-            client_a_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
+            client_configs: vec![
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        ..Default::default()
+                    },
+                    video: VideoConfig {
+                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                        enable_vp9: true,
+                    },
+                    allowed_bitrate_kbps: *bitrate,
                     ..Default::default()
                 },
-                video: VideoConfig {
-                    input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
-                    enable_vp9: true,
-                },
-                allowed_bitrate_kbps: *bitrate,
-                ..Default::default()
-            },
-            client_b_config: CallConfig {
-                audio: AudioConfig {
-                    input_name: "normal_phrasing".to_string(),
+                CallConfig {
+                    audio: AudioConfig {
+                        input_name: "normal_phrasing".to_string(),
+                        ..Default::default()
+                    },
+                    video: VideoConfig {
+                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                        enable_vp9: true,
+                    },
+                    allowed_bitrate_kbps: *bitrate,
                     ..Default::default()
                 },
-                video: VideoConfig {
-                    input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
-                    enable_vp9: true,
-                },
-                allowed_bitrate_kbps: *bitrate,
-                ..Default::default()
-            },
+            ],
             ..Default::default()
         });
     }
@@ -740,29 +853,31 @@ async fn run_changing_bandwidth_audio_test(test: &mut Test) -> Result<()> {
     let test_cases = [20, 60, 120].map(|initial_packet_size_ms| TestCaseConfig {
         test_case_name: format!("ptime_{initial_packet_size_ms}"),
         length_seconds: 240,
-        client_a_config: CallConfig {
-            audio: AudioConfig {
-                input_name: "normal_12s".to_string(),
-                initial_packet_size_ms,
-                generate_spectrogram: false,
+        client_configs: vec![
+            CallConfig {
+                audio: AudioConfig {
+                    input_name: "normal_12s".to_string(),
+                    initial_packet_size_ms,
+                    generate_spectrogram: false,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        },
-        client_b_config: CallConfig {
-            audio: AudioConfig {
-                input_name: "normal_12s".to_string(),
-                initial_packet_size_ms,
-                analysis_mode: AudioAnalysisMode::Chopped,
-                generate_spectrogram: false,
-                visqol_speech_analysis: true,
-                visqol_audio_analysis: true,
-                pesq_speech_analysis: true,
-                plc_speech_analysis: true,
+            CallConfig {
+                audio: AudioConfig {
+                    input_name: "normal_12s".to_string(),
+                    initial_packet_size_ms,
+                    analysis_mode: AudioAnalysisMode::Chopped,
+                    generate_spectrogram: false,
+                    visqol_speech_analysis: true,
+                    visqol_audio_analysis: true,
+                    pesq_speech_analysis: true,
+                    plc_speech_analysis: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        },
+        ],
         ..Default::default()
     });
 
@@ -838,32 +953,34 @@ async fn run_perf_test(test: &mut Test) -> Result<()> {
                 length_seconds: 60,
                 save_media_files: false,
                 analysis_concurrency: 1,
-                client_a_config: CallConfig {
-                    audio: AudioConfig {
-                        input_name: "speaker_b".to_string(),
-                        generate_spectrogram: false,
-                        visqol_speech_analysis: false,
-                        visqol_audio_analysis: false,
-                        pesq_speech_analysis: false,
-                        plc_speech_analysis: false,
-                        analysis_mode: AudioAnalysisMode::None,
+                client_configs: vec![
+                    CallConfig {
+                        audio: AudioConfig {
+                            input_name: "speaker_b".to_string(),
+                            generate_spectrogram: false,
+                            visqol_speech_analysis: false,
+                            visqol_audio_analysis: false,
+                            pesq_speech_analysis: false,
+                            plc_speech_analysis: false,
+                            analysis_mode: AudioAnalysisMode::None,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-                client_b_config: CallConfig {
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
-                        enable_aec: true,
-                        generate_spectrogram: false,
-                        visqol_speech_analysis: false,
-                        visqol_audio_analysis: false,
-                        pesq_speech_analysis: false,
-                        plc_speech_analysis: false,
+                    CallConfig {
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            enable_aec: true,
+                            generate_spectrogram: false,
+                            visqol_speech_analysis: false,
+                            visqol_audio_analysis: false,
+                            pesq_speech_analysis: false,
+                            plc_speech_analysis: false,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
+                ],
                 iterations: 1,
                 ..Default::default()
             },
@@ -872,40 +989,42 @@ async fn run_perf_test(test: &mut Test) -> Result<()> {
                 length_seconds: 60,
                 save_media_files: false,
                 analysis_concurrency: 1,
-                client_a_config: CallConfig {
-                    audio: AudioConfig {
-                        input_name: "speaker_b".to_string(),
-                        generate_spectrogram: false,
-                        visqol_speech_analysis: false,
-                        visqol_audio_analysis: false,
-                        pesq_speech_analysis: false,
-                        plc_speech_analysis: false,
-                        analysis_mode: AudioAnalysisMode::None,
+                client_configs: vec![
+                    CallConfig {
+                        audio: AudioConfig {
+                            input_name: "speaker_b".to_string(),
+                            generate_spectrogram: false,
+                            visqol_speech_analysis: false,
+                            visqol_audio_analysis: false,
+                            pesq_speech_analysis: false,
+                            plc_speech_analysis: false,
+                            analysis_mode: AudioAnalysisMode::None,
+                            ..Default::default()
+                        },
+                        video: VideoConfig {
+                            input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    video: VideoConfig {
-                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                    CallConfig {
+                        audio: AudioConfig {
+                            input_name: "normal_phrasing".to_string(),
+                            enable_aec: true,
+                            generate_spectrogram: false,
+                            visqol_speech_analysis: false,
+                            visqol_audio_analysis: false,
+                            pesq_speech_analysis: false,
+                            plc_speech_analysis: false,
+                            ..Default::default()
+                        },
+                        video: VideoConfig {
+                            input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-                client_b_config: CallConfig {
-                    audio: AudioConfig {
-                        input_name: "normal_phrasing".to_string(),
-                        enable_aec: true,
-                        generate_spectrogram: false,
-                        visqol_speech_analysis: false,
-                        visqol_audio_analysis: false,
-                        pesq_speech_analysis: false,
-                        plc_speech_analysis: false,
-                        ..Default::default()
-                    },
-                    video: VideoConfig {
-                        input_name: Some("ConferenceMotion_50fps@1280x720".to_string()),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
+                ],
                 iterations: 1,
                 ..Default::default()
             },
@@ -924,27 +1043,29 @@ async fn run_plc_tests(test: &mut Test) -> Result<()> {
             "plc_{}",
             decoder_complexity.map_or("None".to_string(), |c| c.to_string())
         ),
-        client_a_config: CallConfig {
-            audio: AudioConfig {
-                input_name: "normal_phrasing".to_string(),
-                generate_spectrogram: false,
-                decoder_complexity,
+        client_configs: vec![
+            CallConfig {
+                audio: AudioConfig {
+                    input_name: "normal_phrasing".to_string(),
+                    generate_spectrogram: false,
+                    decoder_complexity,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        },
-        client_b_config: CallConfig {
-            audio: AudioConfig {
-                input_name: "normal_phrasing".to_string(),
-                visqol_speech_analysis: true,
-                visqol_audio_analysis: true,
-                pesq_speech_analysis: true,
-                plc_speech_analysis: true,
-                decoder_complexity,
+            CallConfig {
+                audio: AudioConfig {
+                    input_name: "normal_phrasing".to_string(),
+                    visqol_speech_analysis: true,
+                    visqol_audio_analysis: true,
+                    pesq_speech_analysis: true,
+                    plc_speech_analysis: true,
+                    decoder_complexity,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        },
+        ],
         iterations: 1,
         ..Default::default()
     });
@@ -998,7 +1119,7 @@ async fn run_dred_tests(test: &mut Test) -> Result<()> {
                     decoder_complexity.map_or("None".to_string(), |c| c.to_string())
                 ),
                 length_seconds: 30,
-                client_a_config: CallConfig {
+                client_configs: vec![ CallConfig {
                     audio: AudioConfig {
                         input_name: "normal_phrasing".to_string(),
                         generate_spectrogram: false,
@@ -1018,7 +1139,7 @@ async fn run_dred_tests(test: &mut Test) -> Result<()> {
                     profile: DeterministicLoss(loss),
                     ..Default::default()
                 },
-                client_b_config: CallConfig {
+                CallConfig {
                     audio: AudioConfig {
                         input_name: "normal_phrasing".to_string(),
                         visqol_speech_analysis: true,
@@ -1036,7 +1157,8 @@ async fn run_dred_tests(test: &mut Test) -> Result<()> {
                     },
                     profile: DeterministicLoss(loss),
                     ..Default::default()
-                },
+                }
+                ],
                 iterations: 3,
                 ..Default::default()
             })
@@ -1102,30 +1224,7 @@ async fn main() -> Result<()> {
     info!("  Using root path: {}", root_path.display());
     env::set_current_dir(&root_path)?;
 
-    if args.build {
-        build_images(!args.skip_visqol_mos_build).await?;
-    }
-
-    if args.clean {
-        clean_up(vec![
-            "client_a",
-            "client_b",
-            "signaling_server",
-            "turn",
-            "tcpdump_client_a",
-            "tcpdump_client_b",
-            "visqol",
-        ])
-        .await?;
-        clean_network().await?;
-    }
-
-    let client_profiles = args
-        .client_profile_dir
-        .map_or_else(generate_client_profiles, |client_profile_dir| {
-            get_client_profiles(&client_profile_dir)
-        });
-
+    let client_profile_factory = DynamicClientProfileFactory::new_with_key(group_auth_key_gen());
     let mut test_sets = args.test_sets;
     if test_sets.is_empty() {
         // For quick testing, change this to the name of your test case.
@@ -1134,9 +1233,38 @@ async fn main() -> Result<()> {
 
     let direct_call_config = CallTypeConfig::Direct;
     let group_call_config = CallTypeConfig::Group {
-        sfu_url: SFU_URL.to_owned(),
+        sfu_connection_params: SFU_URL.map_or(test::SfuConnectionParams::Local, |url| {
+            test::SfuConnectionParams::Remote {
+                sfu_url: url.to_string(),
+            }
+        }),
         group_name: args.group_name,
     };
+    let contains_group_call = test_sets.iter().any(|name| name.starts_with("group_"));
+    let build_local_sfu = contains_group_call && group_call_config.requires_local_sfu();
+    // Normalize `a` or `client_a`
+    let analyze_clients: Option<HashSet<String>> = args.analyze_clients.map(|clients| {
+        clients
+            .iter()
+            .map(|client| {
+                let client = client.trim();
+                if client.starts_with("client_") {
+                    client.to_string()
+                } else {
+                    format!("client_{}", client)
+                }
+            })
+            .collect()
+    });
+
+    if args.build {
+        build_images(!args.skip_visqol_mos_build, build_local_sfu).await?;
+    }
+
+    if args.clean {
+        clean_up_all_containers().await?;
+        clean_network().await?;
+    }
 
     for test_set_name in test_sets {
         let (call_type_config, test_set_name) =
@@ -1155,9 +1283,10 @@ async fn main() -> Result<()> {
             &args.media_dir,
             &args.data_dir,
             &test_set_name,
-            client_profiles.clone(),
+            client_profile_factory.clone(),
             call_type_config,
             args.profile,
+            analyze_clients.clone(),
         )?;
         match test_set_name.as_str() {
             "minimal_example" => run_minimal_example(test).await?,
@@ -1167,6 +1296,7 @@ async fn main() -> Result<()> {
             "bursty_loss_test_with_video" => run_bursty_loss_test(test, true).await?,
             "deterministic_loss_test" => run_deterministic_loss_test(test, false).await?,
             "deterministic_loss_test_with_video" => run_deterministic_loss_test(test, true).await?,
+            "multi_deterministic_loss_test" => run_multi_deterministic_loss_test(test, 3).await?,
             "relay_tests" => run_relay_tests(test).await?,
             "turn_long_tests" => run_turn_long_tests(test).await?,
             "video_send_over_bandwidth" => run_video_send_over_bandwidth(test).await?,
@@ -1183,28 +1313,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn generate_client_profiles() -> Vec<ClientProfile> {
-    let now = SystemTime::now();
-    config::generate_client_profiles(2, &group_auth_key_gen(), now)
-}
-
-fn get_client_profiles(dir_path: &str) -> Vec<ClientProfile> {
-    info!("Looking for client profiles in `{}`", dir_path);
-    let files = std::fs::read_dir(dir_path)
-        .expect("Failed to list client profile directory")
-        .map(|entry| entry.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
-        .sorted();
-    info!("Found {} client profiles config files", files.len());
-    files.map(|path| get_client_profile(&path)).collect()
-}
-
-fn get_client_profile(path: &Path) -> ClientProfile {
-    if let Ok(file) = File::open(path) {
-        serde_json::from_reader(file).expect("client config file to be in JSON format")
-    } else {
-        panic!("Failed to find client config file `{}`", path.display());
-    }
 }

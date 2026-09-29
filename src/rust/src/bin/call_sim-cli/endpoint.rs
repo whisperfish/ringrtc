@@ -6,6 +6,7 @@
 mod direct_call_sim;
 mod group_call_sim;
 
+use core::unimplemented;
 use std::{
     collections::{HashMap, HashSet},
     sync::mpsc::Sender,
@@ -473,15 +474,48 @@ impl SignalingSender for CallEndpoint {
 
     fn send_call_message_to_group(
         &self,
-        _group_id: group_call::GroupId,
-        _message: Vec<u8>,
+        group_id: group_call::GroupId,
+        message: Vec<u8>,
         _urgency: group_call::SignalingMessageUrgency,
-        _recipients_override: HashSet<UserId>,
+        recipients_override: HashSet<UserId>,
     ) -> Result<()> {
-        error!("Asked to send call message to group, but is not implemented yet");
-        todo!("Implement so that this works with groups of greater size than 2")
+        let sender_id = self.peer_id();
+        let self_user_id = self.user_id.clone();
+
+        self.actor.send(move |state| {
+            let recipients: Vec<UserId> = if recipients_override.is_empty() {
+                match state.group_directory.get(&group_id) {
+                    Some(members) => members
+                        .iter()
+                        .filter(|member| Some(&member.user_id) != self_user_id.as_ref())
+                        .map(|member| member.user_id.clone())
+                        .collect(),
+                    None => {
+                        error!(
+                            "Could not resolve group members, group not found in directory; dropping message"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                recipients_override.into_iter().collect()
+            };
+
+            let sender_device_id = state.device_id;
+            for recipient_id in recipients {
+                state.signaling_server.send_call_message(
+                    &sender_id,
+                    sender_device_id,
+                    recipient_id,
+                    message.clone(),
+                );
+            }
+        });
+
+        Ok(())
     }
 
+    #[allow(clippy::disallowed_macros)]
     fn send_call_message_to_adhoc_group(
         &self,
         _message: Vec<u8>,
@@ -489,8 +523,10 @@ impl SignalingSender for CallEndpoint {
         _expiration: u64,
         _recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
     ) -> Result<()> {
+        // Dropping the message degrades the call; panicking here would tear down the
+        // PeerConnection and break the rest of the test run.
         error!("Asked to send call message adhoc group, but is not implemented yet");
-        todo!("Implement so that this works with call links")
+        unimplemented!("Have not implemented send_call_message_to_adhoc_group");
     }
 }
 
