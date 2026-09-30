@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.72.1
+
+- Update to webrtc 7871n
+  - If using adaptation use min/max bitrate values
+
+- Bound Linux virtual audio sink latency without rewinds
+
+- Protect stats observer lifetime and fields with mutexes
+
+- Process new ServerAddress message in SfuToDevice
+
+- Call Sim:
+  - Add audio twcc tests
+  - Parallelize analysis operations
+  - Make sure files exist before starting
+  - Fix workspace root lint reference
+  - Add local sfu support
+
+- CI: Remove baseline profiling comparisons
+
+- Integrate WebRTC FFI headers
+  - Fix ln invocation
+  - Remove git-move-helper.sh
+  - Create alias in WebRTC to headers in RingRTC
+
+- Do not allow unnecessary Return type in call termination
+
 ## v2.72.0
 
 - Update webrtc version to 7871k

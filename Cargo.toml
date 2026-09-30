@@ -18,5 +18,5 @@ members = [
 unnecessary_wraps = "warn"
 
 [workspace.package]
-version = "2.72.0"
+version = "2.72.1"
 authors = ["Calling Team <callingteam@signal.org>"]
