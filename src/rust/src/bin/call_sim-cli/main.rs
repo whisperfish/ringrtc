@@ -5,28 +5,30 @@
 
 mod endpoint;
 mod network;
+mod relay;
 mod scenario;
-mod server;
+mod util;
 mod video;
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use base64::prelude::*;
 use clap::Parser;
 use fern::Dispatch;
 use log::*;
 use ringrtc::{
-    common::{units, CallConfig, DataMode},
+    common::{CallConfig, DataMode, DeviceId, units},
+    core::group_call::GroupId,
+    lite::sfu::{GroupMember, MembershipProof, UserId},
     webrtc::{
-        media::AudioBandwidth,
-        media::AudioEncoderConfig,
-        peer_connection_factory::{
-            AudioConfig, AudioJitterBufferConfig, FileBasedAdmConfig, IceServer,
-            RffiAudioDeviceModuleType,
-        },
+        media::{AudioBandwidth, AudioDecoderConfig, AudioEncoderConfig},
+        peer_connection_factory::{AudioConfig, AudioJitterBufferConfig, IceServer},
     },
 };
-use std::ffi::CString;
+use scenario::ScenarioCallTypeConfig;
 
-use crate::scenario::ManagedScenario;
+use crate::{scenario::ScenarioManager, util::convert_relay_config_to_ice_servers};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -46,13 +48,8 @@ struct Args {
     #[arg(long, default_value = "2")]
     stats_initial_offset_secs: u16,
 
-    /// Specifies the file (including path) to use for audio input.
-    #[arg(long, default_value = "")]
-    input_file: String,
-
-    /// Specifies the file (including path) to use for audio output.
-    #[arg(long, default_value = "")]
-    output_file: String,
+    #[arg(long, default_value = "30")]
+    call_summary_time_limit_secs: u16,
 
     /// Specifies the file (including path) to use for video input.
     ///
@@ -100,8 +97,8 @@ struct Args {
     bandwidth: AudioBandwidth,
 
     /// The encoding complexity for audio.
-    #[arg(long, default_value = "9", value_parser = clap::value_parser!(i32).range(0..=10))]
-    complexity: i32,
+    #[arg(long, default_value = "9", value_parser = clap::value_parser!(u8).range(0..=10))]
+    complexity: u8,
 
     /// The size of an audio frame (ptime).
     #[arg(long, default_value = "20", value_parser = clap::builder::PossibleValuesParser::new(["20", "40", "60", "80", "100", "120"]))]
@@ -127,18 +124,30 @@ struct Args {
     #[arg(long, action = clap::ArgAction::Set, default_value = "true")]
     fec: bool,
 
+    /// The duration of dred to use in 10ms units. Set to 0 to disable (default).
+    #[arg(long, default_value = "0", value_parser = clap::value_parser!(u8).range(0..=100))]
+    dred_duration: u8,
+
+    /// Minimum packet loss percentage reported to encoder (0-100).
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
+    min_packet_loss_percent: u8,
+
     /// Whether to use adaptation when encoding audio. Set to 0 to disable (default).
     #[arg(long, default_value_t = 0)]
     adaptation: i32,
+
+    /// The decoding complexity for audio.
+    #[arg(long, default_value = None, value_parser = clap::value_parser!(u8).range(0..=10))]
+    decoder_complexity: Option<u8>,
+
+    /// Specifies the path to the Opus DNN weights file.
+    #[arg(long, default_value = "")]
+    dnn_weights_path: String,
 
     /// Whether to enable transport-cc feedback for audio. This will allow the bitrate to vary
     /// between `min_bitrate_bps` and `max_bitrate_bps` when using CBR.
     #[arg(long, action = clap::ArgAction::Set, default_value = "false")]
     tcc: bool,
-
-    /// Whether to enable redundant packets for audio.
-    #[arg(long, action = clap::ArgAction::Set, default_value = "false")]
-    red: bool,
 
     /// Whether to enable the VP9 codec for video.
     #[arg(long, action = clap::ArgAction::Set, default_value = "true")]
@@ -166,15 +175,22 @@ struct Args {
     #[arg(long, default_value = "")]
     field_trials: String,
 
-    /// A list of relay servers to provide to WebRTC for connectivity options.
+    /// A list of relay server urls to provide to WebRTC for connectivity options.
     #[arg(long)]
-    relay_servers: Vec<String>,
+    relay_urls: Vec<String>,
+
+    /// A list of relay server ips to provide to WebRTC for connectivity options.
+    #[arg(long)]
+    relay_ips: Vec<String>,
 
     #[arg(long, default_value = "")]
     relay_username: String,
 
     #[arg(long, default_value = "")]
     relay_password: String,
+
+    #[arg(long, default_value = "")]
+    relay_hostname: Option<String>,
 
     /// Whether to force the use of relay servers or not.
     #[arg(long, action = clap::ArgAction::Set, default_value = "false")]
@@ -203,6 +219,33 @@ struct Args {
     /// turn on the injectable network using a UDP socket.
     #[arg(long)]
     deterministic_loss: Option<u8>,
+
+    #[arg(short = 'g', long)]
+    is_group_call: bool,
+
+    /// Our UUID we use to identify our selves to the SFU. Should be a UUID.
+    #[arg(long, value_parser = parse_uuid)]
+    user_id: Option<UserId>,
+
+    #[arg(long, default_value = "1")]
+    device_id: DeviceId,
+
+    /// URL that exposes both the HTTP API and UDP media ports
+    #[arg(long)]
+    sfu_url: Option<String>,
+
+    /// Base64 encoded ID of the GroupV2
+    #[arg(long, value_parser = parse_base64)]
+    group_id: Option<GroupId>,
+
+    /// Base64 encoded Membership Proof
+    #[arg(long, value_parser = parse_base64)]
+    membership_proof: Option<MembershipProof>,
+
+    /// List of GroupMember info. Includes both the userId:memberId in base64 encoding.
+    /// Formatted as `{userId}:{memberId}`.
+    #[arg(short = 'm', long, value_delimiter = ',', value_parser = parse_group_member_info)]
+    pub group_member_info: Option<Vec<GroupMember>>,
 }
 
 fn main() -> Result<()> {
@@ -222,7 +265,10 @@ fn main() -> Result<()> {
         .level(LevelFilter::Debug);
 
     if let Some(log_file) = args.log_file {
-        fern_logger.chain(fern::log_file(log_file)?).apply()?;
+        fern_logger
+            .chain(std::io::stdout())
+            .chain(fern::log_file(log_file)?)
+            .apply()?;
     } else {
         fern_logger.chain(std::io::stdout()).apply()?;
     }
@@ -230,24 +276,31 @@ fn main() -> Result<()> {
     // Show WebRTC logs via application Logger while debugging.
     ringrtc::webrtc::logging::set_logger(log::LevelFilter::Debug);
 
-    info!("Setting field trials to {}", &args.field_trials);
-    ringrtc::webrtc::field_trial::init(&args.field_trials).expect("no null characters");
+    info!("Setting field trials to {}", args.field_trials);
 
-    let ice_server = if args.relay_servers.is_empty() {
-        IceServer::none()
+    let ice_servers = if args.relay_urls.is_empty() && args.relay_ips.is_empty() {
+        vec![IceServer::none()]
     } else {
-        info!("Setting relay servers: {:?}", args.relay_servers);
-        info!("  username: {}", args.relay_username);
-        info!("  password: {}", args.relay_password);
-        info!("     force: {}", args.force_relay);
-
-        IceServer::new(
+        convert_relay_config_to_ice_servers(
             args.relay_username,
             args.relay_password,
-            // TODO: Add support for hostname when TLS TURN is supported with the call sim
-            "".to_string(),
-            args.relay_servers,
+            args.relay_urls,
+            args.relay_ips,
+            args.relay_hostname,
         )
+    };
+
+    // Load Opus DNN weights model file if specified.
+    let dnn_weights = if !args.dnn_weights_path.is_empty() {
+        if let Ok(data) = std::fs::read(args.dnn_weights_path) {
+            info!("Loaded Opus DNN weights file: {} bytes", data.len());
+            Some(Arc::new(data))
+        } else {
+            error!("Could not load the Opus DNN weights file!");
+            anyhow::bail!("Could not load the Opus DNN weights file!");
+        }
+    } else {
+        None
     };
 
     // Create a call configuration that should be used for the call.
@@ -259,12 +312,8 @@ fn main() -> Result<()> {
         },
         stats_interval_secs: args.stats_interval_secs,
         stats_initial_offset_secs: args.stats_initial_offset_secs,
+        call_summary_time_limit_secs: args.call_summary_time_limit_secs,
         audio_config: AudioConfig {
-            audio_device_module_type: RffiAudioDeviceModuleType::File,
-            file_based_adm_config: Some(FileBasedAdmConfig {
-                input_file: CString::new(args.input_file).expect("CString::new failed"),
-                output_file: CString::new(args.output_file).expect("CString::new failed"),
-            }),
             high_pass_filter_enabled: args.high_pass_filter,
             aec_enabled: args.aec,
             ns_enabled: args.ns,
@@ -286,9 +335,15 @@ fn main() -> Result<()> {
             enable_cbr: args.cbr,
             enable_dtx: args.dtx,
             enable_fec: args.fec,
+            dred_duration: args.dred_duration,
+            min_packet_loss_percent: args.min_packet_loss_percent,
+            dnn_weights: dnn_weights.as_ref().map(Arc::clone),
+        },
+        audio_decoder_config: AudioDecoderConfig {
+            complexity: args.decoder_complexity,
+            dnn_weights,
         },
         enable_tcc_audio: args.tcc,
-        enable_red_audio: args.red,
         audio_jitter_buffer_config: AudioJitterBufferConfig {
             max_packets: args.audio_jitter_buffer_max_packets,
             min_delay_ms: args.audio_jitter_buffer_min_delay_ms,
@@ -296,13 +351,33 @@ fn main() -> Result<()> {
             fast_accelerate: args.audio_jitter_buffer_fast_accelerate,
         },
         audio_rtcp_report_interval_ms: args.audio_rtcp_report_interval_ms,
-        enable_vp9: args.vp9,
+        enable_vp9_encode: args.vp9,
+        enable_vp9_decode: args.vp9,
     };
 
-    let mut scenario = ManagedScenario::new()?;
+    let mut scenario = ScenarioManager::new()?;
+    let call_type_config = if args.is_group_call {
+        ScenarioCallTypeConfig::GroupCallConfig {
+            sfu_url: args.sfu_url.expect("sfu url should be provided"),
+            group_id: args.group_id.expect("group_id should be provided"),
+            membership_proof: args
+                .membership_proof
+                .expect("membership proof should be provided"),
+            group_member_info: args
+                .group_member_info
+                .expect("group_member_info should be provided"),
+        }
+    } else {
+        ScenarioCallTypeConfig::DirectCallConfig {
+            ice_servers,
+            force_relay: args.force_relay,
+        }
+    };
     scenario.run(
         &args.name,
         &args.ip,
+        args.user_id,
+        args.device_id,
         call_config,
         scenario::ScenarioConfig {
             video_width: args.input_video_width,
@@ -311,11 +386,35 @@ fn main() -> Result<()> {
             output_video_width: args.output_video_width,
             output_video_height: args.output_video_height,
             video_output: args.output_video_file.map(Into::into),
-            ice_server,
-            force_relay: args.force_relay,
+            deterministic_loss: args.deterministic_loss,
+            call_type_config,
+            field_trials: args.field_trials.to_string(),
         },
-        args.deterministic_loss,
     );
 
     Ok(())
+}
+
+fn parse_base64(s: &str) -> Result<GroupId, String> {
+    BASE64_STANDARD.decode(s).map_err(|e| e.to_string())
+}
+
+// parses output of ringrtc::core::util::uuid_to_string
+fn parse_uuid(id: &str) -> Result<UserId, String> {
+    util::string_to_uuid(id).map_err(|e| e.to_string())
+}
+
+/// parses base64 encoded, then formatted as `{base 64 userId}:{base64 memberId}`
+fn parse_group_member_info(s: &str) -> Result<GroupMember, String> {
+    let splits = s.split(':').collect::<Vec<_>>();
+    if splits.len() != 2 {
+        return Err(format!("expected `<userId>:<memberId>`, got `{s}`"));
+    }
+    let user_id = BASE64_STANDARD
+        .decode(splits[0])
+        .map_err(|e| format!("could not base64 decode user_id: {e}"))?;
+    let member_id = BASE64_STANDARD
+        .decode(splits[1])
+        .map_err(|e| format!("could not base64 decode member_id: {e}"))?;
+    Ok(GroupMember { user_id, member_id })
 }

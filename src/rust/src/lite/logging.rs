@@ -7,8 +7,9 @@
 
 #[cfg(any(target_os = "ios", feature = "check-all"))]
 pub mod ios {
-    use crate::lite::ffi::ios::{rtc_OptionalU32, rtc_String, FromOrDefault};
     use std::ffi::c_void;
+
+    use crate::lite::ffi::ios::{FromOrDefault, rtc_OptionalU32, rtc_String};
 
     #[repr(C)]
     pub struct rtc_log_Record<'a> {
@@ -29,7 +30,7 @@ pub mod ios {
         pub flush: extern "C" fn(ctx: *mut c_void),
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn rtc_log_init(delegate: rtc_log_Delegate, max_level: u8) -> bool {
         if log::set_boxed_logger(Box::new(delegate)).is_err() {
             warn!("Logging already initialized");

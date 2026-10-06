@@ -17,7 +17,12 @@ class TestGroupCallDelegate: GroupCallDelegate {
     var onRaisedHandsCount = 0
     var onPeekChangedCount = 0
     var onEndedCount = 0
-    var lastOnEndedReason: GroupCallEndReason? = nil
+    var onSpeakingCount = 0
+    var lastOnEndedReason: CallEndReason? = nil
+    var lastOnSpeakingEvent: SpeechEvent? = nil
+    var remoteMuteCount = 0
+    var lastRemoteMuteSource: UInt32 = 0
+    var lastObservedRemoteMute: (UInt32, UInt32) = (0, 0)
 
     func groupCall(requestMembershipProof groupCall: GroupCall) {
         requestMembershipProofCount += 1
@@ -55,8 +60,22 @@ class TestGroupCallDelegate: GroupCallDelegate {
         onPeekChangedCount += 1
     }
 
-    func groupCall(onEnded groupCall: GroupCall, reason: GroupCallEndReason) {
+    func groupCall(onEnded groupCall: GroupCall, reason: CallEndReason, summary: CallSummary) {
         onEndedCount += 1
         lastOnEndedReason = reason
+    }
+
+    func groupCall(onSpeakingNotification groupCall: GroupCall, event: SpeechEvent) {
+        onSpeakingCount += 1
+        lastOnSpeakingEvent = event
+    }
+
+    func groupCall(onRemoteMuteRequest groupCall: GroupCall, muteSource: UInt32) {
+        remoteMuteCount += 1
+        lastRemoteMuteSource = muteSource
+    }
+
+    func groupCall(onObservedRemoteMute groupCall: GroupCall, muteSource: UInt32, muteTarget: UInt32) {
+        lastObservedRemoteMute = (muteSource, muteTarget)
     }
 }

@@ -11,12 +11,16 @@ are run is simulated, with network conditions ranging from perfect to terrible. 
 The simulator is specific to RingRTC and the needs of Signal Messenger. Any other use is not supported.
 
 ## Requirements
-For best results, running the simulator on an amd64 platform with Ubuntu 20.04 is highly recommended. It can
-also be run on macOS, including arm64 machines [see below](#running-on-arm64). 
+For best results, running the simulator on an amd64 platform with Ubuntu 26.04 is highly recommended. It can
+also be run on macOS, including arm64 machines [see below](#running-on-arm64).
 
 In addition to the normal requirements for [building RingRTC](../BUILDING.md), you must also have Docker
 installed. We recommend that the [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) be installed, not the
 Docker Desktop.
+
+The host machine must have the `libpulse-dev` package installed before building the Call Simulator binary
+(call_sim-cli). If the simulation runs but produces only silent audio output, you may need to clear the
+build cache (i.e. `cargo clean`).
 
 ## Media Files
 To run the simulator, you need to provide a set of media files in an accessible location (by default, this is in
@@ -62,6 +66,16 @@ Run the simulator with the `--help` option to see more details about the availab
 - The first time you run the simulator, it could take a while to build the required Docker images
 - The `test_results` directory can get quite large if you run lots of tests, especially with video, 
 it is a good idea to clean it up occasionally
+
+### Running a Group Call
+By default, the call sim will run Direct (1 to 1) calls, potentially starting Turn server containers if enabled. If you
+want to run a test as a group call, prefix "group_" to the test name. For example:
+
+    cargo run --release -- -b -c -- group_minimal_example
+
+This will run the test in 2 person group call. Note that the call sim does not start an SFU. Instead, you have to
+configure the call sim with an SFU URL and either provide client profile config files (see <repo-root>/config/local for
+a template file) or configure an auth key in src/main.rs
 
 ## How Does It Work?
 The Call Simulator coordinates the tests, it is the _Test Manager_. When run, it executes the tests configured in the

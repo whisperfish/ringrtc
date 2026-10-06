@@ -3,7 +3,6 @@ out-arm/
 cscope.*
 .DS_Store
 .dir-locals.el
-.cargo
 .gradle/
 *.code-workspace
 **/.vscode
@@ -15,6 +14,10 @@ src/jar.list
 org.eclipse.buildship.core.prefs
 local.properties
 *.tar.gz
-.cargo
+.cargo/*
+!.cargo/config.toml
+!.cargo/audit.toml
 target
 .spr.yml
+src/android/.settings
+call_sim/docker/local_sfu

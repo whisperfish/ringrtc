@@ -10,33 +10,47 @@ set -e
 # shellcheck source=bin/env.sh
 . "$(dirname "$0")"/env.sh
 
-# Tests that take < 2 minutes.
-SMALL_CORRECTNESS_TESTS="audio_decoder_unittests \
-  common_audio_unittests \
-  common_video_unittests \
-  dcsctp_unittests \
-  examples_unittests \
-  neteq_opus_quality_test \
-  neteq_pcm16b_quality_test \
-  neteq_pcmu_quality_test \
-  rtc_media_unittests \
-  rtc_pc_unittests \
-  rtc_stats_unittests \
-  svc_tests \
-  system_wrappers_unittests \
-  test_support_unittests \
+# Tests that take < 1 minutes.
+SMALL_CORRECTNESS_TESTS="examples_unittests \
   video_capture_tests \
-  voip_unittests \
   webrtc_lib_link_test \
+  time_delta_rs_unittests \
+  timestamp_rs_unittests \
+  audio_decoder_unittests \
+  voip_unittests \
+  neteq_pcmu_quality_test \
+  neteq_pcm16b_quality_test \
+  rtc_stats_unittests \
+  resource_adaptation_tests \
+  neteq_opus_quality_test \
+  system_wrappers_unittests \
+  video_adaptation_tests \
+  dcsctp_unittests \
+  call_tests \
+  rtc_pc_unittests \
+  common_audio_unittests \
+  rtc_media_unittests \
+  common_video_unittests \
   webrtc_nonparallel_tests \
-  webrtc_opus_fec_test"
+  audio_engine_tests"
 
-# Tests that take > 2 minutes.
-MEDIUM_CORRECTNESS_TESTS="modules_tests rtc_unittests slow_peer_connection_unittests video_engine_tests"
+# Tests that take > 1 minutes.
+MEDIUM_CORRECTNESS_TESTS="rtc_unittests \
+  rtc_p2p_unittests \
+  slow_peer_connection_unittests \
+  webrtc_opus_fec_test \
+  modules_tests \
+  peerconnection_unittests \
+  test_support_unittests"
+
 # Tests that take > 5 minutes
-LARGE_CORRECTNESS_TESTS="modules_unittests peerconnection_unittests"
+LARGE_CORRECTNESS_TESTS="modules_unittests \
+  video_tests \
+  svc_tests"
 
-PERF_TESTS="audio_codec_speed_tests video_codec_perf_tests webrtc_perf_tests"
+PERF_TESTS="audio_codec_speed_tests \
+  video_codec_perf_tests \
+  webrtc_perf_tests"
 
 usage()
 {
@@ -61,13 +75,13 @@ function run_test() {
   set -o pipefail
   # This line's a bit complex, so it's worth digging into.
   # First, we run the command, redirecting *its* stderr to stdout, so we can
-  # filter on it and directly output it to the specified file.
+  # output it to the specified file.
   # Then, we need to capture the output of `time`, which is a bash builtin and
   # doesn't directly write to stdout or stderr. So, we run the `time` in a
   # subshell and redirect that *subshell's* output. Finally, we use `tee` to
   # echo the output of time to both stdout *AND* the output file, so that the
   # person running the script, if any, can get updates on progress.
-  ( time $1 2>&1 | grep -v "thread.cc.*will stop processing" >> "$2"; exit "${PIPESTATUS[0]}" ) 2>&1 | tee -a "$2"
+  ( time $1 >> "$2" 2>&1 ) 2>&1 | tee -a "$2"
   echo " =========== $1 exit status $? ======= " | tee -a "$2"
 }
 
@@ -75,7 +89,7 @@ function run_suite() {
   for t in $1
   do
     echo "$t" | tee -a "$3"
-    run_test "${OUTPUT_DIR}"/"${2}"/"${t}" "$3"
+    run_test "${WEBRTC_SRC_DIR}"/out/"${2}"/"${t}" "$3"
     echo | tee -a "$3"
     echo | tee -a "$3"
   done

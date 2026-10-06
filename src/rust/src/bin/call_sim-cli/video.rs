@@ -3,21 +3,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use log::info;
-use ringrtc::{
-    lite::sfu::DemuxId,
-    native::PeerId,
-    webrtc::media::{VideoFrame, VideoPixelFormat, VideoSink},
-};
-
 use std::{
     convert::TryInto,
     io::{Read, Seek, SeekFrom, Write},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
+};
+
+use ringrtc::{
+    lite::sfu::DemuxId,
+    webrtc::media::{VideoFrame, VideoPixelFormat, VideoSink},
 };
 
 pub const FRAME_INTERVAL_30FPS: Duration = Duration::from_millis(33);
@@ -43,7 +41,7 @@ impl<T: Seek> I420Source<T> {
         let stream_len = input.seek(SeekFrom::End(0)).expect("invalid input stream");
         input.rewind().expect("invalid input stream");
         assert!(
-            stream_len % (frame_size as u64) == 0,
+            stream_len.is_multiple_of(frame_size as u64),
             "input length ({}) is not a multiple of the frame size in bytes ({})",
             stream_len,
             frame_size,
@@ -88,19 +86,11 @@ impl<T: Read + Seek + Send> VideoInput for I420Source<T> {
 }
 
 #[derive(Clone)]
-pub struct LoggingVideoSink {
-    pub peer_id: PeerId,
-}
+pub struct DefaultVideoSink;
 
-impl VideoSink for LoggingVideoSink {
-    fn on_video_frame(&self, demux_id: DemuxId, frame: VideoFrame) {
-        info!(
-            "{:?}.{} received video frame size:{}x{}",
-            self.peer_id,
-            demux_id,
-            frame.width(),
-            frame.height(),
-        );
+impl VideoSink for DefaultVideoSink {
+    fn on_video_frame(&self, _demux_id: DemuxId, _frame: VideoFrame) {
+        // Do nothing.
     }
 
     fn box_clone(&self) -> Box<dyn VideoSink> {

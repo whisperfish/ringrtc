@@ -5,36 +5,41 @@
 
 //! iOS Call Manager
 
-use std::ffi::c_void;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{ffi::c_void, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 
-use crate::ios::api::call_manager_interface::{AppCallContext, AppInterface, AppObject};
-use crate::ios::ios_platform::IosPlatform;
-
-use crate::common::{CallConfig, CallId, CallMediaType, DataMode, DeviceId, Result};
-use crate::core::call_manager::CallManager;
-use crate::core::util::{ptr_as_box, ptr_as_mut};
-use crate::core::{call_manager, group_call, signaling};
-use crate::error::RingRtcError;
-use crate::lite::call_links::CallLinkRootKey;
-use crate::lite::{
-    http,
-    sfu::{DemuxId, GroupMember, UserId},
+use crate::{
+    common::{CallConfig, CallId, CallMediaType, DataMode, DeviceId, Result},
+    core::{
+        call_manager,
+        call_manager::{CallManager, CreateCallLinkCallParams, CreateGroupCallParams, SvcConfig},
+        group_call, signaling,
+        util::{ptr_as_box, ptr_as_mut},
+    },
+    error::RingRtcError,
+    ios::{
+        api::call_manager_interface::{AppCallContext, AppInterface},
+        ios_platform::{IosCallData, IosPlatform},
+    },
+    lite::{
+        call_links::CallLinkRootKey,
+        http,
+        sfu::{DemuxId, GroupMember, UserId},
+    },
+    protobuf, webrtc,
+    webrtc::{
+        media,
+        peer_connection_factory::{self as pcf, PeerConnectionFactory},
+    },
 };
-use crate::protobuf;
-use crate::webrtc;
-use crate::webrtc::media;
-use crate::webrtc::peer_connection_factory::{self as pcf, PeerConnectionFactory};
 
 /// Public type for iOS CallManager
 pub type IosCallManager = CallManager<IosPlatform>;
 
 /// Creates a new IosCallManager object.
 pub fn create(app_interface: AppInterface, http_client: http::ios::Client) -> Result<*mut c_void> {
-    let platform = IosPlatform::new(app_interface)?;
+    let platform = IosPlatform::new(app_interface);
     let call_manager = IosCallManager::new(platform, http_client)?;
     let call_manager_box = Box::new(call_manager);
     Ok(Box::into_raw(call_manager_box) as *mut c_void)
@@ -46,19 +51,27 @@ pub fn set_self_uuid(call_manager: *mut IosCallManager, uuid: UserId) -> Result<
     call_manager.set_self_uuid(uuid)
 }
 
+/// Adds an asset to the asset manager.
+pub fn add_asset(
+    call_manager: *mut IosCallManager,
+    asset_group: String,
+    handle: crate::core::assets::AssetHandle,
+) -> Result<()> {
+    let call_manager = unsafe { ptr_as_mut(call_manager)? };
+    call_manager.add_asset(&asset_group, handle)
+}
+
 /// Application notification to start a new call.
 pub fn call(
     call_manager: *mut IosCallManager,
-    app_remote: *const c_void,
+    call_data: IosCallData,
     call_media_type: CallMediaType,
     app_local_device: DeviceId,
 ) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.call(
-        AppObject::from(app_remote),
-        call_media_type,
-        app_local_device,
-    )
+
+    call_manager.call(call_data, call_media_type, app_local_device);
+    Ok(())
 }
 
 /// Application notification to proceed with a new call
@@ -76,27 +89,31 @@ pub fn proceed(
         Arc::new(app_call_context),
         call_config,
         audio_levels_interval,
-    )
+    );
+    Ok(())
 }
 
 /// Application notification that the sending of the previous message was a success.
 pub fn message_sent(call_manager: *mut IosCallManager, call_id: u64) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
-    call_manager.message_sent(call_id)
+    call_manager.message_sent(call_id);
+    Ok(())
 }
 
 /// Application notification that the sending of the previous message was a failure.
 pub fn message_send_failure(call_manager: *mut IosCallManager, call_id: u64) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
-    call_manager.message_send_failure(call_id)
+    call_manager.message_send_failure(call_id);
+    Ok(())
 }
 
 /// Application notification of local hangup.
 pub fn hangup(call_manager: *mut IosCallManager) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.hangup()
+    call_manager.hangup();
+    Ok(())
 }
 
 /// Application notification cancelling a group ring.
@@ -115,6 +132,7 @@ pub fn cancel_group_ring(
 pub fn received_answer(
     call_manager: *mut IosCallManager,
     call_id: u64,
+    call_data: IosCallData,
     sender_device_id: DeviceId,
     opaque: Option<Vec<u8>>,
     sender_identity_key: Option<Vec<u8>>,
@@ -122,7 +140,6 @@ pub fn received_answer(
 ) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
-
     let opaque = match opaque {
         Some(v) => v,
         None => {
@@ -157,6 +174,7 @@ pub fn received_answer(
     };
 
     call_manager.received_answer(
+        call_data,
         call_id,
         signaling::ReceivedAnswer {
             answer: signaling::Answer::new(opaque)?,
@@ -164,7 +182,8 @@ pub fn received_answer(
             sender_identity_key,
             receiver_identity_key,
         },
-    )
+    );
+    Ok(())
 }
 
 /// Application notification of received offer message
@@ -172,19 +191,17 @@ pub fn received_answer(
 pub fn received_offer(
     call_manager: *mut IosCallManager,
     call_id: u64,
-    remote_peer: *const c_void,
+    call_data: IosCallData,
     sender_device_id: DeviceId,
     opaque: Option<Vec<u8>>,
     age_sec: u64,
     call_media_type: CallMediaType,
     receiver_device_id: DeviceId,
-    receiver_device_is_primary: bool,
     sender_identity_key: Option<Vec<u8>>,
     receiver_identity_key: Option<Vec<u8>>,
 ) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
-    let remote_peer = AppObject::from(remote_peer);
 
     let opaque = match opaque {
         Some(v) => v,
@@ -220,35 +237,38 @@ pub fn received_offer(
     };
 
     call_manager.received_offer(
-        remote_peer,
+        call_data,
         call_id,
         signaling::ReceivedOffer {
             offer: signaling::Offer::new(call_media_type, opaque)?,
             age: Duration::from_secs(age_sec),
             sender_device_id,
             receiver_device_id,
-            receiver_device_is_primary,
             sender_identity_key,
             receiver_identity_key,
         },
-    )
+    );
+    Ok(())
 }
 
 /// Application notification to add ICE candidates to a Connection
 pub fn received_ice(
     call_manager: *mut IosCallManager,
     call_id: u64,
+    call_data: IosCallData,
     received: signaling::ReceivedIce,
 ) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
-    call_manager.received_ice(call_id, received)
+    call_manager.received_ice(call_data, call_id, received);
+    Ok(())
 }
 
 /// Application notification of received Hangup message
 pub fn received_hangup(
     call_manager: *mut IosCallManager,
     call_id: u64,
+    call_data: IosCallData,
     sender_device_id: DeviceId,
     hangup_type: signaling::HangupType,
     hangup_device_id: DeviceId,
@@ -256,23 +276,31 @@ pub fn received_hangup(
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
     call_manager.received_hangup(
+        call_data,
         call_id,
         signaling::ReceivedHangup {
             hangup: signaling::Hangup::from_type_and_device_id(hangup_type, hangup_device_id),
             sender_device_id,
         },
-    )
+    );
+    Ok(())
 }
 
 /// Application notification of received Busy message
 pub fn received_busy(
     call_manager: *mut IosCallManager,
     call_id: u64,
+    call_data: IosCallData,
     sender_device_id: DeviceId,
 ) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     let call_id = CallId::from(call_id);
-    call_manager.received_busy(call_id, signaling::ReceivedBusy { sender_device_id })
+    call_manager.received_busy(
+        call_data,
+        call_id,
+        signaling::ReceivedBusy { sender_device_id },
+    );
+    Ok(())
 }
 
 pub fn received_call_message(
@@ -290,14 +318,16 @@ pub fn received_call_message(
         local_device_id,
         message,
         message_age_sec,
-    )
+    );
+    Ok(())
 }
 
 /// Application notification to accept the incoming call
 pub fn accept_call(call_manager: *mut IosCallManager, call_id: u64) -> Result<()> {
     let call_id = CallId::from(call_id);
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.accept_call(call_id)
+    call_manager.accept_call(call_id);
+    Ok(())
 }
 
 /// CMI request for the active Connection object
@@ -349,13 +379,15 @@ pub fn update_data_mode(call_manager: *mut IosCallManager, data_mode: DataMode) 
 pub fn drop_call(call_manager: *mut IosCallManager, call_id: u64) -> Result<()> {
     let call_id = CallId::from(call_id);
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.drop_call(call_id)
+    call_manager.drop_call(call_id);
+    Ok(())
 }
 
 /// CMI request to reset the Call Manager
 pub fn reset(call_manager: *mut IosCallManager) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.reset()
+    call_manager.reset();
+    Ok(())
 }
 
 /// CMI request to close down the Call Manager.
@@ -377,6 +409,8 @@ pub fn create_group_call_client(
     sfu_url: String,
     hkdf_extra_info: Vec<u8>,
     audio_levels_interval: Option<Duration>,
+    dred_duration: u8,
+    svc_config: Option<SvcConfig>,
     native_peer_connection_factory: webrtc::ptr::OwnedRc<pcf::RffiPeerConnectionFactoryInterface>,
     native_audio_track: webrtc::ptr::OwnedRc<media::RffiAudioTrack>,
     native_video_track: webrtc::ptr::OwnedRc<media::RffiVideoTrack>,
@@ -398,27 +432,32 @@ pub fn create_group_call_client(
     );
 
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.create_group_call_client(
+    call_manager.create_group_call_client(CreateGroupCallParams {
         group_id,
         sfu_url,
         hkdf_extra_info,
         audio_levels_interval,
-        Some(peer_connection_factory),
+        dred_duration,
+        svc_config,
+        peer_connection_factory: Some(peer_connection_factory),
         outgoing_audio_track,
         outgoing_video_track,
-        None,
-    )
+        incoming_video_sink: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_call_link_call_client(
     call_manager: *mut IosCallManager,
     sfu_url: String,
+    endorsement_public_key: Vec<u8>,
     auth_credential_presentation: Vec<u8>,
     root_key: CallLinkRootKey,
     admin_passkey: Option<Vec<u8>>,
     hkdf_extra_info: Vec<u8>,
     audio_levels_interval: Option<Duration>,
+    dred_duration: u8,
+    svc_config: Option<SvcConfig>,
     native_peer_connection_factory: webrtc::ptr::OwnedRc<pcf::RffiPeerConnectionFactoryInterface>,
     native_audio_track: webrtc::ptr::OwnedRc<media::RffiAudioTrack>,
     native_video_track: webrtc::ptr::OwnedRc<media::RffiVideoTrack>,
@@ -440,18 +479,21 @@ pub fn create_call_link_call_client(
     );
 
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
-    call_manager.create_call_link_call_client(
+    call_manager.create_call_link_call_client(CreateCallLinkCallParams {
         sfu_url,
-        &auth_credential_presentation,
+        endorsement_public_key: &endorsement_public_key,
+        auth_presentation: &auth_credential_presentation,
         root_key,
         admin_passkey,
         hkdf_extra_info,
         audio_levels_interval,
-        Some(peer_connection_factory),
+        dred_duration,
+        svc_config,
+        peer_connection_factory: Some(peer_connection_factory),
         outgoing_audio_track,
         outgoing_video_track,
-        None,
-    )
+        incoming_video_sink: None,
+    })
 }
 
 pub fn delete_group_call_client(
@@ -497,6 +539,26 @@ pub fn set_outgoing_audio_muted(
 ) -> Result<()> {
     let call_manager = unsafe { ptr_as_mut(call_manager)? };
     call_manager.set_outgoing_audio_muted(client_id, muted);
+    Ok(())
+}
+
+pub fn set_outgoing_audio_muted_remotely(
+    call_manager: *mut IosCallManager,
+    client_id: group_call::ClientId,
+    source: DemuxId,
+) -> Result<()> {
+    let call_manager = unsafe { ptr_as_mut(call_manager)? };
+    call_manager.set_outgoing_audio_muted_remotely(client_id, source);
+    Ok(())
+}
+
+pub fn send_remote_mute_request(
+    call_manager: *mut IosCallManager,
+    client_id: group_call::ClientId,
+    target: DemuxId,
+) -> Result<()> {
+    let call_manager = unsafe { ptr_as_mut(call_manager)? };
+    call_manager.send_remote_mute_request(client_id, target);
     Ok(())
 }
 
@@ -651,7 +713,6 @@ pub fn validate_offer(
         age: Duration::from_secs(age_sec),
         sender_device_id: 1,
         receiver_device_id: 1,
-        receiver_device_is_primary: true,
         sender_identity_key: vec![],
         receiver_identity_key: vec![],
     })

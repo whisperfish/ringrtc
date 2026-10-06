@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-/* eslint-disable no-console */
+/* oxlint-disable eslint/no-console */
 
 import { chunk } from 'lodash';
 import { assert } from 'chai';
@@ -18,15 +18,16 @@ export function countDownLatch(count: number): {
     resolve = resolveInternal;
   });
 
+  let remaining = count;
   const countDown = () => {
-    count--;
-    if (count == 0) {
+    remaining--;
+    if (remaining == 0) {
       resolve();
     }
   };
 
   return {
-    countDown: countDown,
+    countDown,
     finished,
   };
 }
@@ -48,7 +49,7 @@ export function sleep(timeout: number): Promise<void> {
   });
 }
 
-export function uuidToBytes(uuid: string): Uint8Array {
+export function uuidToBytes(uuid: string): Uint8Array<ArrayBuffer> {
   if (uuid.length !== 36) {
     return new Uint8Array(0);
   }

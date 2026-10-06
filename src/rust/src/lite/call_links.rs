@@ -12,15 +12,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use base64::engine::general_purpose::STANDARD as base64;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD as base64};
+pub use member_resolver::CallLinkMemberResolver;
+pub use root_key::CallLinkRootKey;
 use serde::{self, Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::lite::http;
-
-pub use member_resolver::CallLinkMemberResolver;
-pub use root_key::CallLinkRootKey;
+use crate::{lite::http, protobuf::group_call::sfu_to_device};
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -31,26 +29,61 @@ pub enum CallLinkRestrictions {
     Unknown,
 }
 
+impl From<sfu_to_device::peek_info::CallLinkRestrictions> for CallLinkRestrictions {
+    fn from(value: sfu_to_device::peek_info::CallLinkRestrictions) -> Self {
+        use sfu_to_device::peek_info::CallLinkRestrictions as ProtoCallLinkRestrictions;
+
+        match value {
+            ProtoCallLinkRestrictions::AdminApproval => Self::AdminApproval,
+            ProtoCallLinkRestrictions::None => Self::None,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 pub struct CallLinkResponse<'a> {
     #[serde(rename = "name")]
-    encrypted_name: &'a [u8],
-    restrictions: CallLinkRestrictions,
-    revoked: bool,
+    pub encrypted_name: &'a [u8],
+    pub restrictions: CallLinkRestrictions,
+    pub revoked: bool,
     #[serde(rename = "expiration")]
     expiration_unix_timestamp: u64,
+    epoch: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
+impl<'a> TryFrom<&'a sfu_to_device::peek_info::CallLinkState> for CallLinkResponse<'a> {
+    type Error = String;
+
+    fn try_from(value: &'a sfu_to_device::peek_info::CallLinkState) -> Result<Self, Self::Error> {
+        if value.encrypted_name.is_none()
+            || value.restrictions.is_none()
+            || value.revoked.is_none()
+            || value.expiration_unix_timestamp.is_none()
+        {
+            return Err("Missing required fields in CallLinkState".to_string());
+        }
+
+        Ok(Self {
+            encrypted_name: value.encrypted_name().as_bytes(),
+            restrictions: value.restrictions().into(),
+            revoked: value.revoked(),
+            expiration_unix_timestamp: value.expiration_unix_timestamp(),
+            epoch: None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CallLinkState {
     pub name: String,
     pub restrictions: CallLinkRestrictions,
     pub revoked: bool,
     pub expiration: SystemTime,
+    pub root_key: CallLinkRootKey,
 }
 
 impl CallLinkState {
-    pub fn from(deserialized: CallLinkResponse<'_>, root_key: &CallLinkRootKey) -> Self {
+    pub fn from_serialized(deserialized: CallLinkResponse<'_>, root_key: &CallLinkRootKey) -> Self {
         let name = if deserialized.encrypted_name.is_empty() {
             "".to_string()
         } else {
@@ -66,6 +99,7 @@ impl CallLinkState {
         };
         CallLinkState {
             name,
+            root_key: *root_key,
             restrictions: deserialized.restrictions,
             revoked: deserialized.revoked,
             expiration: SystemTime::UNIX_EPOCH
@@ -81,6 +115,9 @@ pub struct Empty {}
 pub type ReadCallLinkResultCallback =
     Box<dyn FnOnce(Result<CallLinkState, http::ResponseStatus>) + Send>;
 
+pub type CreateCallLinkResultCallback =
+    Box<dyn FnOnce(Result<CallLinkState, http::ResponseStatus>) + Send>;
+
 pub type EmptyResultCallback = Box<dyn FnOnce(Result<Empty, http::ResponseStatus>) + Send>;
 
 fn call_link_url_from_sfu_url(sfu_url: &str) -> String {
@@ -91,6 +128,28 @@ pub fn auth_header_from_auth_credential(auth_presentation: &[u8]) -> String {
     format!("Bearer auth.{}", base64.encode(auth_presentation))
 }
 
+fn create_http_request_headers(
+    create_flag: bool,
+    auth_presentation: &[u8],
+    root_key: &CallLinkRootKey,
+    content_type: &str,
+) -> HashMap<String, String> {
+    let auth_header_value = if create_flag {
+        format!("Bearer create.{}", base64.encode(auth_presentation))
+    } else {
+        auth_header_from_auth_credential(auth_presentation)
+    };
+
+    let mut headers: HashMap<String, String> = HashMap::from_iter([
+        ("Authorization".to_string(), auth_header_value),
+        ("Content-Type".to_string(), content_type.to_string()),
+    ]);
+
+    root_key.prepare_http_headers(&mut headers);
+
+    headers
+}
+
 pub fn read_call_link(
     http_client: &dyn http::Client,
     sfu_url: &str,
@@ -98,25 +157,25 @@ pub fn read_call_link(
     auth_presentation: &[u8],
     result_callback: ReadCallLinkResultCallback,
 ) {
+    if !root_key.is_valid() {
+        result_callback(Err(http::ResponseStatus::CALL_LINK_INVALID));
+        return;
+    }
     http_client.send_request(
         http::Request {
             method: http::Method::Get,
             url: call_link_url_from_sfu_url(sfu_url),
-            headers: HashMap::from_iter([
-                (
-                    "Authorization".to_string(),
-                    auth_header_from_auth_credential(auth_presentation),
-                ),
-                (
-                    "X-Room-Id".to_string(),
-                    hex::encode(root_key.derive_room_id()),
-                ),
-            ]),
+            headers: create_http_request_headers(
+                false,
+                auth_presentation,
+                &root_key,
+                "application/json",
+            ),
             body: None,
         },
         Box::new(move |http_response| {
             let result = http::parse_json_response::<CallLinkResponse>(http_response.as_ref())
-                .map(|deserialized| CallLinkState::from(deserialized, &root_key));
+                .map(|response| CallLinkState::from_serialized(response, &root_key));
             result_callback(result);
         }),
     )
@@ -171,23 +230,22 @@ pub fn create_call_link(
     admin_passkey: &[u8],
     public_zkparams: &[u8],
     restrictions: Option<CallLinkRestrictions>,
-    result_callback: ReadCallLinkResultCallback,
+    result_callback: CreateCallLinkResultCallback,
 ) {
+    if root_key.is_valid() {
+        result_callback(Err(http::ResponseStatus::CALL_LINK_ALREADY_CREATED));
+        return;
+    }
     http_client.send_request(
         http::Request {
             method: http::Method::Put,
             url: call_link_url_from_sfu_url(sfu_url),
-            headers: HashMap::from_iter([
-                (
-                    "Authorization".to_string(),
-                    format!("Bearer create.{}", base64.encode(auth_presentation)),
-                ),
-                (
-                    "X-Room-Id".to_string(),
-                    hex::encode(root_key.derive_room_id()),
-                ),
-                ("Content-Type".to_string(), "application/json".to_string()),
-            ]),
+            headers: create_http_request_headers(
+                true,
+                auth_presentation,
+                &root_key,
+                "application/json",
+            ),
             body: Some(
                 serde_json::to_vec(&CallLinkCreateRequest {
                     admin_passkey,
@@ -199,7 +257,15 @@ pub fn create_call_link(
         },
         Box::new(move |http_response| {
             let result = http::parse_json_response::<CallLinkResponse>(http_response.as_ref())
-                .map(|deserialized| CallLinkState::from(deserialized, &root_key));
+                .and_then(
+                    |response| match root_key.process_server_response(&response) {
+                        Ok(updated_root_key) => Ok(CallLinkState::from_serialized(
+                            response,
+                            &updated_root_key.unwrap_or(root_key),
+                        )),
+                        Err(_) => Err(http::ResponseStatus::REQUEST_FAILED),
+                    },
+                );
             result_callback(result);
         }),
     )
@@ -213,26 +279,25 @@ pub fn update_call_link(
     update_request: &CallLinkUpdateRequest,
     result_callback: ReadCallLinkResultCallback,
 ) {
+    if !root_key.is_valid() {
+        result_callback(Err(http::ResponseStatus::CALL_LINK_INVALID));
+        return;
+    }
     http_client.send_request(
         http::Request {
             method: http::Method::Put,
             url: call_link_url_from_sfu_url(sfu_url),
-            headers: HashMap::from_iter([
-                (
-                    "Authorization".to_string(),
-                    auth_header_from_auth_credential(auth_presentation),
-                ),
-                (
-                    "X-Room-Id".to_string(),
-                    hex::encode(root_key.derive_room_id()),
-                ),
-                ("Content-Type".to_string(), "application/json".to_string()),
-            ]),
+            headers: create_http_request_headers(
+                false,
+                auth_presentation,
+                &root_key,
+                "application/json",
+            ),
             body: Some(serde_json::to_vec(update_request).expect("cannot fail to serialize")),
         },
         Box::new(move |http_response| {
             let result = http::parse_json_response::<CallLinkResponse>(http_response.as_ref())
-                .map(|deserialized| CallLinkState::from(deserialized, &root_key));
+                .map(|response| CallLinkState::from_serialized(response, &root_key));
             result_callback(result);
         }),
     )
@@ -246,21 +311,20 @@ pub fn delete_call_link(
     delete_request: &CallLinkDeleteRequest,
     result_callback: EmptyResultCallback,
 ) {
+    if !root_key.is_valid() {
+        result_callback(Err(http::ResponseStatus::CALL_LINK_INVALID));
+        return;
+    }
     http_client.send_request(
         http::Request {
             method: http::Method::Delete,
             url: call_link_url_from_sfu_url(sfu_url),
-            headers: HashMap::from_iter([
-                (
-                    "Authorization".to_string(),
-                    auth_header_from_auth_credential(auth_presentation),
-                ),
-                (
-                    "X-Room-Id".to_string(),
-                    hex::encode(root_key.derive_room_id()),
-                ),
-                ("Content-Type".to_string(), "application/json".to_string()),
-            ]),
+            headers: create_http_request_headers(
+                false,
+                auth_presentation,
+                &root_key,
+                "application/json",
+            ),
             body: Some(serde_json::to_vec(delete_request).expect("cannot fail to serialize")),
         },
         Box::new(move |http_response| {
@@ -272,10 +336,11 @@ pub fn delete_call_link(
 
 #[cfg(any(target_os = "ios", feature = "check-all"))]
 pub mod ios {
+    use std::ffi::{CStr, c_char, c_void};
+
+    use rand::rand_core::UnwrapErr;
+
     use super::*;
-
-    use std::ffi::{c_char, c_void, CStr};
-
     use crate::lite::{
         ffi::ios::{cstr, rtc_Bytes, rtc_OptionalU16, rtc_String},
         http,
@@ -297,50 +362,50 @@ pub mod ios {
     /// # Safety
     /// - `string` must be a valid, non-null C string
     /// - `callback` must not be null.
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn rtc_calllinks_CallLinkRootKey_parse(
         string: *const c_char,
         context: *mut c_void,
         callback: extern "C" fn(context: *mut c_void, result: rtc_Bytes),
     ) -> bool {
-        let string = CStr::from_ptr(string);
+        let string = unsafe { CStr::from_ptr(string) };
         let root_key = string
             .to_str()
             .ok()
             .and_then(|s| CallLinkRootKey::try_from(s).ok());
         match root_key {
             Some(key) => {
-                callback(context, rtc_Bytes::from(key.bytes().as_slice()));
+                callback(context, rtc_Bytes::from(key.as_slice()));
                 true
             }
             None => false,
         }
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn rtc_calllinks_CallLinkRootKey_validate(bytes: rtc_Bytes) -> bool {
         CallLinkRootKey::try_from(bytes.as_slice()).is_ok()
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn rtc_calllinks_CallLinkRootKey_generate(
         context: *mut c_void,
         callback: extern "C" fn(context: *mut c_void, result: rtc_Bytes),
     ) {
-        let root_key = CallLinkRootKey::generate(rand::rngs::OsRng);
-        callback(context, rtc_Bytes::from(root_key.bytes().as_slice()));
+        let root_key = CallLinkRootKey::generate(UnwrapErr(rand::rngs::SysRng));
+        callback(context, rtc_Bytes::from(root_key.as_slice()));
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn rtc_calllinks_CallLinkRootKey_generateAdminPasskey(
         context: *mut c_void,
         callback: extern "C" fn(context: *mut c_void, result: rtc_Bytes),
     ) {
-        let passkey = CallLinkRootKey::generate_admin_passkey(rand::rngs::OsRng);
+        let passkey = CallLinkRootKey::generate_admin_passkey(UnwrapErr(rand::rngs::SysRng));
         callback(context, rtc_Bytes::from(&passkey));
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn rtc_calllinks_CallLinkRootKey_deriveRoomId(
         root_key_bytes: rtc_Bytes,
         context: *mut c_void,
@@ -358,7 +423,7 @@ pub mod ios {
         }
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn rtc_calllinks_CallLinkRootKey_toFormattedString(
         root_key_bytes: rtc_Bytes,
         context: *mut c_void,
@@ -376,6 +441,24 @@ pub mod ios {
         }
     }
 
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rtc_calllinks_CallLinkRootKey_toRedactedString(
+        root_key_bytes: rtc_Bytes,
+        context: *mut c_void,
+        callback: extern "C" fn(context: *mut c_void, result: rtc_String),
+    ) -> *const c_char {
+        match CallLinkRootKey::try_from(root_key_bytes.as_slice()) {
+            Ok(root_key) => {
+                callback(
+                    context,
+                    rtc_String::from(root_key.to_redacted_string().as_str()),
+                );
+                std::ptr::null()
+            }
+            Err(_) => cstr!("invalid root key").as_ptr(),
+        }
+    }
+
     #[repr(C)]
     #[derive(Default, Debug)]
     pub struct rtc_calllinks_CallLinkState<'a> {
@@ -383,6 +466,7 @@ pub mod ios {
         pub expiration_epoch_seconds: u64,
         pub raw_restrictions: i8,
         pub revoked: bool,
+        pub root_key: rtc_Bytes<'a>,
     }
 
     impl<'a> From<&'a CallLinkState> for rtc_calllinks_CallLinkState<'a> {
@@ -400,6 +484,7 @@ pub mod ios {
                     CallLinkRestrictions::Unknown => -1,
                 },
                 revoked: value.revoked,
+                root_key: value.root_key.as_slice().into(),
             }
         }
     }
@@ -484,7 +569,7 @@ pub mod ios {
     ///
     /// - `http_client` must come from `rtc_http_Client_create` and not already be destroyed
     /// - `sfu_url` must be a valid, non-null C string.
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn rtc_sfu_readCallLink(
         http_client: *const http::ios::Client,
         request_id: u32,
@@ -495,8 +580,8 @@ pub mod ios {
     ) {
         info!("rtc_sfu_readCallLink():");
 
-        if let Some(http_client) = http_client.as_ref() {
-            if let Ok(sfu_url) = CStr::from_ptr(sfu_url).to_str() {
+        if let Some(http_client) = unsafe { http_client.as_ref() } {
+            if let Ok(sfu_url) = unsafe { CStr::from_ptr(sfu_url).to_str() } {
                 if let Ok(link_root_key) = CallLinkRootKey::try_from(link_root_key.as_slice()) {
                     read_call_link(
                         http_client,
@@ -520,7 +605,7 @@ pub mod ios {
     ///
     /// - `http_client` must come from `rtc_http_Client_create` and not already be destroyed
     /// - `sfu_url` must be a valid, non-null C string.
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn rtc_sfu_createCallLink(
         http_client: *const http::ios::Client,
         request_id: u32,
@@ -535,8 +620,8 @@ pub mod ios {
         info!("rtc_sfu_createCallLink():");
 
         let restrictions = from_i8_to_restrictions(restrictions);
-        if let Some(http_client) = http_client.as_ref() {
-            if let Ok(sfu_url) = CStr::from_ptr(sfu_url).to_str() {
+        if let Some(http_client) = unsafe { http_client.as_ref() } {
+            if let Ok(sfu_url) = unsafe { CStr::from_ptr(sfu_url).to_str() } {
                 if let Ok(link_root_key) = CallLinkRootKey::try_from(link_root_key.as_slice()) {
                     create_call_link(
                         http_client,
@@ -563,7 +648,7 @@ pub mod ios {
     ///
     /// - `http_client` must come from `rtc_http_Client_create` and not already be destroyed
     /// - `sfu_url` must be a valid, non-null C string.
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn rtc_sfu_updateCallLink(
         http_client: *const http::ios::Client,
         request_id: u32,
@@ -578,20 +663,20 @@ pub mod ios {
     ) {
         info!("rtc_sfu_updateCallLink():");
 
-        if let Some(http_client) = http_client.as_ref() {
-            if let Ok(sfu_url) = CStr::from_ptr(sfu_url).to_str() {
+        if let Some(http_client) = unsafe { http_client.as_ref() } {
+            if let Ok(sfu_url) = unsafe { CStr::from_ptr(sfu_url).to_str() } {
                 if let Ok(link_root_key) = CallLinkRootKey::try_from(link_root_key.as_slice()) {
                     let new_name = if new_name.is_null() {
                         None
                     } else {
-                        Some(CStr::from_ptr(new_name))
+                        Some(unsafe { CStr::from_ptr(new_name) })
                     };
                     let encrypted_name = new_name.map(|name| {
                         let name_bytes = name.to_bytes();
                         if name_bytes.is_empty() {
                             vec![]
                         } else {
-                            link_root_key.encrypt(name_bytes, rand::rngs::OsRng)
+                            link_root_key.encrypt(name_bytes, UnwrapErr(rand::rngs::SysRng))
                         }
                     });
                     update_call_link(
@@ -626,7 +711,7 @@ pub mod ios {
     ///
     /// - `http_client` must come from `rtc_http_Client_create` and not already be destroyed
     /// - `sfu_url` must be a valid, non-null C string.
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn rtc_sfu_deleteCallLink(
         http_client: *const http::ios::Client,
         request_id: u32,
@@ -638,8 +723,8 @@ pub mod ios {
     ) {
         info!("rtc_sfu_deleteCallLink():");
 
-        if let Some(http_client) = http_client.as_ref() {
-            if let Ok(sfu_url) = CStr::from_ptr(sfu_url).to_str() {
+        if let Some(http_client) = unsafe { http_client.as_ref() } {
+            if let Ok(sfu_url) = unsafe { CStr::from_ptr(sfu_url).to_str() } {
                 if let Ok(link_root_key) = CallLinkRootKey::try_from(link_root_key.as_slice()) {
                     delete_call_link(
                         http_client,

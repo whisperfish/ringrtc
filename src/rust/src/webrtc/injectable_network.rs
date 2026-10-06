@@ -3,14 +3,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::ffi::CString;
-use std::fmt::Debug;
-use std::net::{IpAddr, SocketAddr};
-use std::os::raw::c_char;
+use std::{
+    ffi::CString,
+    fmt::Debug,
+    net::{IpAddr, SocketAddr},
+    os::raw::c_char,
+};
 
-use crate::webrtc;
-use crate::webrtc::network::{NetworkInterfaceType, RffiIp, RffiIpPort};
-use crate::webrtc::peer_connection_factory::RffiPeerConnectionFactoryOwner;
+use crate::{
+    webrtc,
+    webrtc::{
+        network::{NetworkInterfaceType, RffiIp, RffiIpPort},
+        peer_connection_factory::RffiPeerConnectionFactoryOwner,
+    },
+};
 
 #[derive(Debug)]
 pub struct Packet {
@@ -115,7 +121,7 @@ pub struct RffiInjectableNetwork {
     _private: [u8; 0],
 }
 
-extern "C" {
+unsafe extern "C" {
     pub fn Rust_InjectableNetwork_SetSender(
         network: webrtc::ptr::Borrowed<RffiInjectableNetwork>,
         sender: webrtc::ptr::Borrowed<std::ffi::c_void>,
@@ -180,7 +186,7 @@ extern "C" fn Rust_InjectableNetworkSender_SendUdp(
 
 #[allow(non_snake_case)]
 extern "C" fn Rust_InjectableNetworkSender_Delete(
-    sender: webrtc::ptr::Owned<Box<dyn PacketSender>>,
+    mut sender: webrtc::ptr::Owned<Box<dyn PacketSender>>,
 ) {
     debug!("Rust_InjectableNetworkSender_Release({:?})", sender);
 

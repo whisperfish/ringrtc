@@ -8,6 +8,7 @@
 set -e
 
 WEBRTC_REVISION="$1"
+
 # shellcheck source=bin/env.sh
 . "$(dirname "$0")"/env.sh
 

@@ -30,7 +30,7 @@ public struct CallLinkRootKey: CustomStringConvertible {
         self.bytes = bytes
     }
 
-    private init(validatedBytes bytes: rtc_Bytes) {
+    fileprivate init(validatedBytes bytes: rtc_Bytes) {
         self.bytes = bytes.toData()!
     }
 
@@ -62,11 +62,24 @@ public struct CallLinkRootKey: CustomStringConvertible {
         }
         return result!
     }
+    
+    public var unredactedString: String {
+        var result: String? = nil
+        let errorCStr = bytes.withRtcBytes { bytes in
+            rtc_calllinks_CallLinkRootKey_toFormattedString(bytes, &result) { resultOpaquePtr, rtcString in
+                resultOpaquePtr!.assumingMemoryBound(to: Optional<String>.self).pointee = rtcString.toString()
+            }
+        }
+        if let errorCStr {
+            fail(String(cString: errorCStr))
+        }
+        return result!
+    }
 
     public var description: String {
         var result: String? = nil
         let errorCStr = bytes.withRtcBytes { bytes in
-            rtc_calllinks_CallLinkRootKey_toFormattedString(bytes, &result) { resultOpaquePtr, rtcString in
+            rtc_calllinks_CallLinkRootKey_toRedactedString(bytes, &result) { resultOpaquePtr, rtcString in
                 resultOpaquePtr!.assumingMemoryBound(to: Optional<String>.self).pointee = rtcString.toString()
             }
         }
@@ -98,12 +111,14 @@ public struct CallLinkState {
     public var restrictions: Restrictions
     public var revoked: Bool
     public var expiration: Date
+    public var rootKey: CallLinkRootKey
 
-    public init(name: String, restrictions: Restrictions, revoked: Bool, expiration: Date) {
+    public init(name: String, restrictions: Restrictions, revoked: Bool, expiration: Date, rootKey: CallLinkRootKey) {
         self.name = name
         self.restrictions = restrictions
         self.revoked = revoked
         self.expiration = expiration
+        self.rootKey = rootKey
     }
 
     static func fromRtc(_ rtcResponse: rtc_calllinks_CallLinkState) -> Self {
@@ -118,6 +133,7 @@ public struct CallLinkState {
             restrictions = .unknown
         }
         let expiration = Date(timeIntervalSince1970: TimeInterval(rtcResponse.expiration_epoch_seconds))
-        return Self(name: name, restrictions: restrictions, revoked: rtcResponse.revoked, expiration: expiration)
+        let rootKey = CallLinkRootKey(validatedBytes: rtcResponse.root_key)
+        return Self(name: name, restrictions: restrictions, revoked: rtcResponse.revoked, expiration: expiration, rootKey: rootKey)
     }
 }

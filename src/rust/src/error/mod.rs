@@ -15,12 +15,16 @@ pub enum RingRtcError {
     // Project wide common error codes
     #[error("Mutex poisoned: {0}")]
     MutexPoisoned(String),
+    #[error("RwLock poisoned: {0}")]
+    RwLockPoisoned(String),
     #[error("Null pointer in: {0}, var: {1}")]
     NullPointer(String, String),
     #[error("Expecting non-none option value in: {0}, var: {1}")]
     OptionValueNotSet(String, String),
     #[error("Couldn't register an actor")]
     RegisterActor,
+    #[error("Timed out waiting for termination: {0}")]
+    TerminateTimeout(String),
 
     // Call Manager error codes
     #[error("Active call already in progress, id: {0}")]
@@ -43,10 +47,14 @@ pub enum RingRtcError {
     AppConnectionAlreadySet(DeviceId),
     #[error("Application Call Context is already set, call_id: {0}")]
     AppCallContextAlreadySet(CallId),
+    #[error("Client already exists for call")]
+    ClientAlreadyExistsForCall,
 
     // WebRTC / C++ error codes
     #[error("Unable to create C++ PeerConnectionObserver")]
     CreatePeerConnectionObserver,
+    #[error("Unable to create C++ RtpObserver")]
+    CreateRtpObserver,
     #[error("Unable to create C++ PeerConnectionFactory")]
     CreatePeerConnectionFactory,
     #[error("Unable to create C++ PeerConnection")]
@@ -81,10 +89,6 @@ pub enum RingRtcError {
     // WebRTC / C++ offer / answer error codes
     #[error("Unable to convert offer or answer to SDP")]
     ToSdp,
-    #[error("Unable to convert sdp to answer")]
-    ConvertSdpAnswer,
-    #[error("Unable to convert sdp to offer")]
-    ConvertSdpOffer,
     #[error("Unable to munge SDP")]
     MungeSdp,
     #[error("Unknown signaled protocol version")]
@@ -93,7 +97,9 @@ pub enum RingRtcError {
     // RTP Data error codes
     #[error("RTP data protocol error: {0}")]
     RtpDataProtocol(String),
-    #[error("Unable to send RTP data (if the SFU is running locally, remember to turn off RingRTC-AnyAddressPortsKillSwitch)")]
+    #[error(
+        "Unable to send RTP data (if the SFU is running locally, remember to turn off RingRTC-AnyAddressPortsKillSwitch)"
+    )]
     SendRtp,
     #[error("Unable to receive RTP data")]
     ReceiveRtp,
@@ -123,6 +129,10 @@ pub enum RingRtcError {
     // Misc error codes
     #[error("Failed to negotiate SRTP keys")]
     SrtpKeyNegotiationFailure,
+    #[error("Failed to negotiate SRTP keys due to invalid remote key")]
+    InvalidRemoteSrtpKey,
     #[error("Buffer too small")]
     BufferTooSmall,
+    #[error("Failed to enable SVC")]
+    EnableScalableVideoCoding,
 }

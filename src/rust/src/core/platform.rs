@@ -5,24 +5,32 @@
 
 //! Platform trait describing the interface an operating system platform must
 /// implement for calling.
-use std::collections::HashSet;
-use std::fmt;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::{fmt, time::Duration};
 
-use crate::common::{
-    ApplicationEvent, CallConfig, CallDirection, CallId, CallMediaType, DeviceId, Result,
+use crate::{
+    common::{
+        ApplicationEvent, CallConfig, CallDirection, CallEndReason, CallId, CallMediaType,
+        DeviceId, Result,
+    },
+    core::{
+        call::Call,
+        call_summary::CallSummary,
+        connection::{Connection, ConnectionType},
+        group_call,
+        group_call::Reaction,
+        signaling,
+    },
+    lite::{
+        sfu,
+        sfu::{DemuxId, PeekInfo, UserId},
+    },
+    webrtc::{
+        media::{MediaStream, VideoTrack},
+        peer_connection::{AudioLevel, ReceivedAudioLevel},
+        peer_connection_observer::NetworkRoute,
+    },
 };
-use crate::core::call::Call;
-use crate::core::connection::{Connection, ConnectionType};
-use crate::core::group_call::Reaction;
-use crate::core::{group_call, signaling};
-use crate::lite::{
-    sfu,
-    sfu::{DemuxId, PeekInfo, UserId},
-};
-use crate::webrtc::media::{MediaStream, VideoTrack};
-use crate::webrtc::peer_connection::{AudioLevel, ReceivedAudioLevel};
-use crate::webrtc::peer_connection_observer::NetworkRoute;
 
 /// A trait encompassing the traits the platform associated types must
 /// implement.
@@ -153,6 +161,17 @@ pub trait Platform: sfu::Delegate + fmt::Debug + fmt::Display + Send + Sized + '
         recipients_override: HashSet<UserId>,
     ) -> Result<()>;
 
+    /// Send an opaque call message to an adhoc group of recipients. Provides the
+    /// endorsements in the same order as the corresponding recipient and the
+    /// endorsement set's expiration.
+    fn send_call_message_to_adhoc_group(
+        &self,
+        message: Vec<u8>,
+        urgency: group_call::SignalingMessageUrgency,
+        expiration: u64,
+        recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
+    ) -> Result<()>;
+
     /// Create a platform dependent media stream from the base WebRTC
     /// MediaStream.
     fn create_incoming_media(
@@ -188,6 +207,14 @@ pub trait Platform: sfu::Delegate + fmt::Debug + fmt::Display + Send + Sized + '
         remote_peer: &Self::AppRemotePeer,
         call_id: CallId,
         age: Duration,
+    ) -> Result<()>;
+
+    fn on_call_ended(
+        &self,
+        remote_peer: &Self::AppRemotePeer,
+        call_id: CallId,
+        reason: CallEndReason,
+        summary: CallSummary,
     ) -> Result<()>;
 
     /// Notify the application that the call is completely concluded
@@ -253,6 +280,12 @@ pub trait Platform: sfu::Delegate + fmt::Debug + fmt::Display + Send + Sized + '
         joined_members: &HashSet<UserId>,
     );
 
+    fn handle_speaking_notification(
+        &self,
+        client_id: group_call::ClientId,
+        event: group_call::SpeechEvent,
+    );
+
     fn handle_audio_levels(
         &self,
         _client_id: group_call::ClientId,
@@ -269,5 +302,19 @@ pub trait Platform: sfu::Delegate + fmt::Debug + fmt::Display + Send + Sized + '
 
     fn handle_rtc_stats_report(&self, _report_json: String) {}
 
-    fn handle_ended(&self, client_id: group_call::ClientId, reason: group_call::EndReason);
+    fn handle_ended(
+        &self,
+        client_id: group_call::ClientId,
+        reason: CallEndReason,
+        summary: CallSummary,
+    );
+
+    fn handle_remote_mute_request(&self, client_id: group_call::ClientId, mute_source: DemuxId);
+
+    fn handle_observed_remote_mute(
+        &self,
+        client_id: group_call::ClientId,
+        mute_source: DemuxId,
+        mute_target: DemuxId,
+    );
 }

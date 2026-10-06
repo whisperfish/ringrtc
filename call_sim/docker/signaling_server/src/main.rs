@@ -35,9 +35,10 @@ impl CallingServiceState {
     }
 
     async fn broadcast(&self, message: RelayMessage) {
+        let sender_id = format!("{}:{}", message.client, message.device_id);
         for (client, tx) in &self.clients {
             // Send only to other clients, not back to the sender...
-            if !client.eq(&message.client) {
+            if !client.eq(&sender_id) {
                 match tx.send(message.clone()).await {
                     Ok(_) => {
                         info!("[broadcast] to {}", client)
@@ -90,7 +91,7 @@ impl SignalingRelay for CallingService {
                     Ok(_) => {}
                     Err(_) => {
                         // If sending failed, then remove the client.
-                        error!("[register] stream_tx.send() error to {}", &client);
+                        error!("[register] stream_tx.send() error to {}", client);
                         state_clone.write().await.clients.remove(&client);
                     }
                 }
@@ -194,7 +195,7 @@ impl TestManagement for TestingService {
                     Ok(_) => {}
                     Err(_) => {
                         // If sending failed, then remove the client.
-                        error!("[ready] stream_tx.send() error to {}", &client);
+                        error!("[ready] stream_tx.send() error to {}", client);
                         state_clone.write().await.clients.remove(&client);
                     }
                 }

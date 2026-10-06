@@ -7,17 +7,15 @@ use std::{
     cmp::{Ord, Ordering, PartialEq, PartialOrd},
     collections::BinaryHeap,
     sync::{
-        atomic,
+        Arc, Mutex, atomic,
         atomic::AtomicBool,
-        mpsc::{channel, RecvError, RecvTimeoutError, Sender},
-        Arc, Mutex,
+        mpsc::{RecvError, RecvTimeoutError, Sender, channel},
     },
     thread,
     time::{Duration, Instant},
 };
 
-use crate::common::Result;
-use crate::error::RingRtcError;
+use crate::{common::Result, error::RingRtcError};
 
 pub struct Actor<State> {
     sender: Sender<Task<State>>,

@@ -3,47 +3,57 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use lazy_static::lazy_static;
-use neon::types::JsBigInt;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use crate::common::{CallConfig, CallId, CallMediaType, DataMode, DeviceId, Result};
-use crate::core::call_manager::CallManager;
-use crate::core::group_call;
-use crate::core::group_call::{GroupId, SignalingMessageUrgency};
-use crate::core::signaling;
-use crate::core::util::minmax;
-use crate::lite::sfu;
-use crate::lite::{
-    call_links::{
-        self, CallLinkDeleteRequest, CallLinkRestrictions, CallLinkRootKey, CallLinkState,
-        CallLinkUpdateRequest, Empty,
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    convert::TryFrom,
+    fmt::Formatter,
+    sync::{
+        Arc, LazyLock, Mutex, Once,
+        atomic::AtomicBool,
+        mpsc::{Receiver, Sender, channel},
     },
-    http,
-    sfu::{DemuxId, GroupMember, PeekInfo, UserId},
+    time::Duration,
 };
-use crate::native::{
-    CallState, CallStateHandler, EndReason, GroupUpdate, GroupUpdateHandler, NativeCallContext,
-    NativePlatform, PeerId, SignalingSender,
-};
-use crate::webrtc::field_trial;
-use crate::webrtc::media::{
-    AudioTrack, VideoFrame, VideoPixelFormat, VideoSink, VideoSource, VideoTrack,
-};
-use crate::webrtc::peer_connection::AudioLevel;
-use crate::webrtc::peer_connection_factory::{
-    self as pcf, AudioDevice, IceServer, PeerConnectionFactory,
-};
-use crate::webrtc::peer_connection_observer::NetworkRoute;
-use neon::types::buffer::TypedArray;
 
-use neon::prelude::*;
+use neon::{
+    prelude::*,
+    types::{JsBigInt, JsDate, buffer::TypedArray},
+};
+use rand::rand_core::UnwrapErr;
+use strum::IntoDiscriminant;
+
+use crate::{
+    common::{CallConfig, CallId, CallMediaType, DataMode, DeviceId, Result},
+    core::{
+        assets::AssetHandle,
+        call_manager::{CallManager, CreateCallLinkCallParams, CreateGroupCallParams, SvcConfig},
+        call_summary::{CallSummary, MediaQualityStats, QualityStats},
+        group_call::{self, GroupId, SignalingMessageUrgency},
+        signaling,
+        util::minmax,
+    },
+    lite::{
+        call_links::{
+            self, CallLinkDeleteRequest, CallLinkRestrictions, CallLinkRootKey, CallLinkState,
+            CallLinkUpdateRequest, Empty,
+        },
+        http,
+        sfu::{self, DemuxId, GroupMember, PeekArgs, PeekInfo, UserId},
+    },
+    native::{
+        CallState, CallStateHandler, GroupUpdate, GroupUpdateHandler, NativeCallContext,
+        NativePlatform, PeerId, RejectReason, SignalingSender,
+    },
+    webrtc::{
+        media::{AudioTrack, VideoFrame, VideoPixelFormat, VideoSink, VideoSource, VideoTrack},
+        peer_connection::AudioLevel,
+        peer_connection_factory::{
+            self as pcf, AudioDevice, AudioDeviceObserver, IceServer, PeerConnectionFactory,
+        },
+        peer_connection_observer::NetworkRoute,
+    },
+};
 
 const ENABLE_LOGGING: bool = true;
 
@@ -69,10 +79,9 @@ pub struct LogMessage {
 // We could report these as Events, but then logging during event processing would cause
 // the event handler to be rescheduled over and over.
 static LOG: Log = Log;
-lazy_static! {
-    static ref LOG_MESSAGES: Mutex<Vec<LogMessage>> = Mutex::new(Vec::new());
-    static ref CURRENT_EVENT_REPORTER: Mutex<Option<EventReporter>> = Mutex::new(None);
-}
+static LOG_MESSAGES: LazyLock<Mutex<Vec<LogMessage>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static CURRENT_EVENT_REPORTER: LazyLock<Mutex<Option<EventReporter>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 struct Log;
 
@@ -139,6 +148,15 @@ pub enum Event {
         urgency: group_call::SignalingMessageUrgency,
         recipients_override: Vec<UserId>,
     },
+    // The JavaScript should send the following opaque call message to all
+    // specified recipients, if not empty, using multi-recipient sealed sender
+    // and the provided endorsements
+    SendCallMessageToAdhocGroup {
+        message: Vec<u8>,
+        urgency: group_call::SignalingMessageUrgency,
+        expiration: u64,
+        recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
+    },
     // The call with the given remote PeerId has changed state.
     // We assume only one call per remote PeerId at a time.
     CallState(PeerId, CallId, CallState),
@@ -179,6 +197,8 @@ pub enum Event {
         peer_id: PeerId,
         recovered: bool,
     },
+    OutputDeviceChanged(Vec<Option<AudioDevice>>),
+    InputDeviceChanged(Vec<Option<AudioDevice>>),
 }
 
 /// Wraps a [`std::sync::mpsc::Sender`] with a callback to report new events.
@@ -248,6 +268,21 @@ impl SignalingSender for EventReporter {
             message,
             urgency,
             recipients_override: recipients_override.into_iter().collect::<Vec<_>>(),
+        })
+    }
+
+    fn send_call_message_to_adhoc_group(
+        &self,
+        message: Vec<u8>,
+        urgency: group_call::SignalingMessageUrgency,
+        expiration: u64,
+        recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
+    ) -> Result<()> {
+        self.send(Event::SendCallMessageToAdhocGroup {
+            message,
+            urgency,
+            expiration,
+            recipients_to_endorsements,
         })
     }
 }
@@ -335,6 +370,32 @@ impl GroupUpdateHandler for EventReporter {
     }
 }
 
+pub struct ElectronAudioDeviceObserver {
+    event_reporter: EventReporter,
+}
+impl AudioDeviceObserver for ElectronAudioDeviceObserver {
+    fn output_changed(&self, devices: Vec<Option<AudioDevice>>) {
+        if let Err(e) = self
+            .event_reporter
+            .send(Event::OutputDeviceChanged(devices))
+        {
+            error!("Failed to report output device change! {}", e);
+        }
+    }
+
+    fn input_changed(&self, devices: Vec<Option<AudioDevice>>) {
+        if let Err(e) = self.event_reporter.send(Event::InputDeviceChanged(devices)) {
+            error!("Failed to report input device change! {}", e);
+        }
+    }
+}
+
+impl std::fmt::Debug for ElectronAudioDeviceObserver {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ElectronAudioDeviceObserver")
+    }
+}
+
 pub struct CallEndpoint {
     call_manager: CallManager<NativePlatform>,
 
@@ -364,19 +425,13 @@ pub struct CallEndpoint {
 }
 
 impl CallEndpoint {
-    fn new<'a>(cx: &mut impl Context<'a>, js_object: Handle<'a, JsObject>) -> Result<Self> {
-        // Relevant for both group calls and 1:1 calls
+    fn new<'a>(
+        cx: &mut impl Context<'a>,
+        js_object: Handle<'a, JsObject>,
+        field_trial_string: &str,
+    ) -> Result<Self> {
+        // Set up a channel for events and logs.
         let (events_sender, events_receiver) = channel::<Event>();
-        let peer_connection_factory =
-            PeerConnectionFactory::new(&pcf::AudioConfig::default(), false)?;
-        let outgoing_audio_track = peer_connection_factory.create_outgoing_audio_track()?;
-        outgoing_audio_track.set_enabled(false);
-        let outgoing_video_source = peer_connection_factory.create_outgoing_video_source()?;
-        let outgoing_video_track =
-            peer_connection_factory.create_outgoing_video_track(&outgoing_video_source)?;
-        outgoing_video_track.set_enabled(false);
-        let incoming_video_sink = Box::<LastFramesVideoSink>::default();
-
         let event_reported = Arc::new(AtomicBool::new(false));
         let js_object = Arc::new(Root::new(cx, &*js_object));
         let js_object_weak = Arc::downgrade(&js_object);
@@ -431,6 +486,27 @@ impl CallEndpoint {
                 .expect("lock event reporter for logging");
             *event_reporter_for_logging = Some(event_reporter.clone());
         }
+
+        // Relevant for both group calls and 1:1 calls
+        let peer_connection_factory = PeerConnectionFactory::new(
+            &pcf::AudioConfig::default(),
+            false,
+            field_trial_string,
+            Some(Box::new(ElectronAudioDeviceObserver {
+                event_reporter: event_reporter.clone(),
+            })),
+        )?;
+        let outgoing_audio_track = peer_connection_factory.create_outgoing_audio_track()?;
+        outgoing_audio_track.set_enabled(false);
+        let outgoing_video_source = peer_connection_factory.create_outgoing_video_source()?;
+        let outgoing_video_track =
+            peer_connection_factory.create_outgoing_video_track(&outgoing_video_source)?;
+        outgoing_video_track.set_enabled(false);
+        let incoming_video_sink = Box::<LastFramesVideoSink>::default();
+
+        // After initializing logs, log the backend in use.
+        let backend = peer_connection_factory.audio_backend();
+        info!("audio_device_module using cubeb backend {:?}", backend);
 
         // Only relevant for 1:1 calls
         let signaling_sender = Box::new(event_reporter.clone());
@@ -496,49 +572,13 @@ impl LastFramesVideoSink {
     }
 }
 
-fn js_num_to_u64(num: f64) -> u64 {
-    // Convert safely from signed.
-    num as i32 as u32 as u64
-}
-
-fn u64_to_js_num(val: u64) -> f64 {
-    // Convert safely to signed.
-    val as u32 as i32 as f64
-}
-
 fn get_id_arg(cx: &mut FunctionContext, i: usize) -> u64 {
-    let obj = cx.argument::<JsObject>(i).expect("Get id argument");
-    let high = js_num_to_u64(
-        obj.get::<JsNumber, _, _>(cx, "high")
-            .expect("Get id.high")
-            .value(cx),
-    );
-    let low = js_num_to_u64(
-        obj.get::<JsNumber, _, _>(cx, "low")
-            .expect("Get id.low")
-            .value(cx),
-    );
-    let id = ((high << 32) & 0xFFFFFFFF00000000) | (low & 0xFFFFFFFF);
-    debug!("id: {} converted from (high: {} low: {})", id, high, low);
-    id
+    let obj = cx.argument::<JsBigInt>(i).expect("Get id argument");
+    obj.to_u64(cx).expect("bigint")
 }
 
 fn create_id_arg<'a>(cx: &mut FunctionContext<'a>, id: u64) -> Handle<'a, JsValue> {
-    let high = cx.number(u64_to_js_num((id >> 32) & 0xFFFFFFFF));
-    let low = cx.number(u64_to_js_num(id & 0xFFFFFFFF));
-    let unsigned = cx.boolean(true);
-    let obj = cx.empty_object();
-    obj.set(cx, "high", high).expect("set id.high");
-    obj.set(cx, "low", low).expect("set id.low");
-    obj.set(cx, "unsigned", unsigned).expect("set id.unsigned");
-    obj.upcast()
-}
-
-fn to_js_buffer<'a>(cx: &mut FunctionContext<'a>, data: &[u8]) -> Handle<'a, JsValue> {
-    let mut js_buffer = cx.buffer(data.len()).expect("create Buffer");
-    js_buffer.as_mut_slice(cx).copy_from_slice(data.as_ref());
-
-    js_buffer.upcast()
+    JsBigInt::from_u64(cx, id).as_value(cx)
 }
 
 fn to_js_peek_info<'a>(
@@ -552,6 +592,7 @@ fn to_js_peek_info<'a>(
         era_id,
         max_devices,
         call_link_state: _call_link_state,
+        ..
     } = &peek_info;
 
     let js_devices = JsArray::new(cx, devices.len());
@@ -560,14 +601,14 @@ fn to_js_peek_info<'a>(
         let js_demux_id = cx.number(device.demux_id);
         js_device.set(cx, "demuxId", js_demux_id)?;
         if let Some(user_id) = &device.user_id {
-            let js_user_id = to_js_buffer(cx, user_id);
+            let js_user_id = JsUint8Array::from_slice(cx, user_id.as_slice())?;
             js_device.set(cx, "userId", js_user_id)?;
         }
         js_devices.set(cx, i as u32, js_device)?;
     }
 
     let js_creator: Handle<JsValue> = match creator {
-        Some(creator) => to_js_buffer(cx, creator).upcast(),
+        Some(creator) => JsUint8Array::from_slice(cx, creator.as_slice())?.upcast(),
         None => cx.undefined().upcast(),
     };
     let era_id: Handle<JsValue> = match era_id {
@@ -587,7 +628,7 @@ fn to_js_peek_info<'a>(
     let pending_users = peek_info.unique_pending_users();
     let js_pending_users = JsArray::new(cx, pending_users.len());
     for (i, user_id) in pending_users.iter().enumerate() {
-        let js_user_id = to_js_buffer(cx, user_id);
+        let js_user_id = JsUint8Array::from_slice(cx, user_id.as_slice())?;
         js_pending_users.set(cx, i as u32, js_user_id)?;
     }
     let js_call_link_state = to_js_call_link_state(cx, peek_info.call_link_state.as_ref())?;
@@ -641,10 +682,92 @@ fn to_js_call_link_state<'a>(
                 )
                 .or_else(|e| cx.throw_range_error(e.to_string()))?;
             state_object.set(cx, "expiration", js_expiration)?;
+            let root_key = JsUint8Array::from_slice(cx, state.root_key.as_slice())?;
+            state_object.set(cx, "rootKey", root_key)?;
             Ok(state_object.upcast())
         }
         None => Ok(cx.undefined().upcast()),
     }
+}
+
+fn to_js_media_quality_stats<'a>(
+    cx: &mut FunctionContext<'a>,
+    media_quality_stats: &MediaQualityStats,
+) -> JsResult<'a, JsObject> {
+    let media_quality_stats_object = cx.empty_object();
+
+    if let Some(rtt_median) = media_quality_stats.rtt_median {
+        let rtt_median = cx.number(rtt_median);
+        media_quality_stats_object.set(cx, "rttMedianMillis", rtt_median)?;
+    }
+    if let Some(jitter_median_send) = media_quality_stats.jitter_median_send {
+        let jitter_median_send = cx.number(jitter_median_send);
+        media_quality_stats_object.set(cx, "jitterMedianSendMillis", jitter_median_send)?;
+    }
+    if let Some(jitter_median_recv) = media_quality_stats.jitter_median_recv {
+        let jitter_median_recv = cx.number(jitter_median_recv);
+        media_quality_stats_object.set(cx, "jitterMedianRecvMillis", jitter_median_recv)?;
+    }
+    if let Some(packet_loss_fraction_send) = media_quality_stats.packet_loss_fraction_send {
+        let packet_loss_fraction_send = cx.number(packet_loss_fraction_send);
+        media_quality_stats_object.set(cx, "packetLossFractionSend", packet_loss_fraction_send)?;
+    }
+    if let Some(packet_loss_fraction_recv) = media_quality_stats.packet_loss_fraction_recv {
+        let packet_loss_fraction_recv = cx.number(packet_loss_fraction_recv);
+        media_quality_stats_object.set(cx, "packetLossFractionRecv", packet_loss_fraction_recv)?;
+    }
+
+    Ok(media_quality_stats_object)
+}
+
+fn to_js_quality_stats<'a>(
+    cx: &mut FunctionContext<'a>,
+    quality_stats: &QualityStats,
+) -> JsResult<'a, JsObject> {
+    let quality_stats_object = cx.empty_object();
+
+    if let Some(rtt_median_connection) = quality_stats.rtt_median_connection {
+        let rtt_median_connection = cx.number(rtt_median_connection);
+        quality_stats_object.set(cx, "rttMedianConnectionMillis", rtt_median_connection)?;
+    }
+    let audio_stats = to_js_media_quality_stats(cx, &quality_stats.audio_stats)?;
+    quality_stats_object.set(cx, "audioStats", audio_stats)?;
+    let video_stats = to_js_media_quality_stats(cx, &quality_stats.video_stats)?;
+    quality_stats_object.set(cx, "videoStats", video_stats)?;
+
+    Ok(quality_stats_object)
+}
+
+fn to_js_call_summary<'a>(
+    cx: &mut FunctionContext<'a>,
+    summary: CallSummary,
+) -> JsResult<'a, JsObject> {
+    let summary_object = cx.empty_object();
+
+    if let Some(call_id_hash) = summary.call_id_hash.as_ref() {
+        let call_id_hash = JsUint8Array::from_slice(cx, call_id_hash)?;
+        summary_object.set(cx, "callIdHash", call_id_hash)?;
+    }
+    let start_time = cx.number(summary.start_time);
+    summary_object.set(cx, "startTime", start_time)?;
+    let end_time = cx.number(summary.end_time);
+    summary_object.set(cx, "endTime", end_time)?;
+    let quality_stats_object = to_js_quality_stats(cx, &summary.quality_stats)?;
+    summary_object.set(cx, "qualityStats", quality_stats_object)?;
+    if let Some(raw_stats) = summary.raw_stats.as_ref() {
+        let raw_stats = JsUint8Array::from_slice(cx, raw_stats)?;
+        summary_object.set(cx, "rawStats", raw_stats)?;
+    }
+    if let Some(raw_stats_text) = summary.raw_stats_text.as_ref() {
+        let raw_stats_text = cx.string(raw_stats_text);
+        summary_object.set(cx, "rawStatsText", raw_stats_text)?;
+    }
+    let call_end_reason_text = cx.string(&summary.call_end_reason_text);
+    summary_object.set(cx, "callEndReasonText", call_end_reason_text)?;
+    let is_survey_candidate = cx.boolean(summary.is_survey_candidate);
+    summary_object.set(cx, "isSurveyCandidate", is_survey_candidate)?;
+
+    Ok(summary_object)
 }
 
 static CALL_ENDPOINT_PROPERTY_KEY: &str = "__call_endpoint_addr";
@@ -690,10 +813,7 @@ fn createCallEndpoint(mut cx: FunctionContext) -> JsResult<JsValue> {
 
     debug!("JsCallManager()");
 
-    let _ = field_trial::init(&field_trial_string);
-    info!("initialized field trials with {}", field_trial_string);
-
-    let endpoint = CallEndpoint::new(&mut cx, js_call_manager)
+    let endpoint = CallEndpoint::new(&mut cx, js_call_manager, &field_trial_string)
         .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
     Ok(cx.boxed(RefCell::new(endpoint)).upcast())
 }
@@ -702,12 +822,38 @@ fn createCallEndpoint(mut cx: FunctionContext) -> JsResult<JsValue> {
 fn setSelfUuid(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.setSelfUuid()");
 
-    let uuid = cx.argument::<JsBuffer>(0)?;
-    let uuid = uuid.as_slice(&cx).to_vec();
+    let uuid = cx.argument::<JsUint8Array>(0)?.as_slice(&cx).to_vec();
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint.call_manager.set_self_uuid(uuid)?;
         Ok(())
+    })
+    .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
+    Ok(cx.undefined().upcast())
+}
+
+#[allow(non_snake_case)]
+fn addAsset(mut cx: FunctionContext) -> JsResult<JsValue> {
+    debug!("JsCallManager.addAsset()");
+
+    let asset_group = cx.argument::<JsString>(0)?.value(&mut cx);
+    let file_path = cx
+        .argument_opt(1)
+        .and_then(|v| v.downcast::<JsString, _>(&mut cx).ok())
+        .map(|s| s.value(&mut cx));
+    let content = cx
+        .argument_opt(2)
+        .and_then(|v| v.downcast::<JsUint8Array, _>(&mut cx).ok())
+        .map(|buf| buf.as_slice(&cx).to_vec());
+
+    let handle = match (file_path, content) {
+        (_, Some(bytes)) => AssetHandle::Content(bytes),
+        (Some(path), _) => AssetHandle::FilePath(path),
+        _ => return cx.throw_error("addAsset requires either a filePath or content"),
+    };
+
+    with_call_endpoint(&mut cx, |endpoint| {
+        endpoint.call_manager.add_asset(&asset_group, handle)
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
     Ok(cx.undefined().upcast())
@@ -732,12 +878,9 @@ fn createOutgoingCall(mut cx: FunctionContext) -> JsResult<JsValue> {
 
     let call_id = CallId::random();
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.create_outgoing_call(
-            peer_id,
-            call_id,
-            media_type,
-            local_device_id,
-        )?;
+        endpoint
+            .call_manager
+            .create_outgoing_call(peer_id, call_id, media_type, local_device_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -748,8 +891,7 @@ fn createOutgoingCall(mut cx: FunctionContext) -> JsResult<JsValue> {
 fn cancelGroupRing(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.cancelGroupRing()");
 
-    let group_id = cx.argument::<JsBuffer>(0)?;
-    let group_id = group_id.as_slice(&cx).to_vec();
+    let group_id = cx.argument::<JsUint8Array>(0)?.as_slice(&cx).to_vec();
     let ring_id = cx
         .argument::<JsString>(1)?
         .value(&mut cx)
@@ -785,8 +927,24 @@ fn proceed(mut cx: FunctionContext) -> JsResult<JsValue> {
     let call_id = CallId::new(get_id_arg(&mut cx, 0));
     let js_ice_servers = cx.argument::<JsArray>(1)?;
     let hide_ip = cx.argument::<JsBoolean>(2)?.value(&mut cx);
-    let data_mode = cx.argument::<JsNumber>(3)?.value(&mut cx) as i32;
+    let js_call_config = cx.argument::<JsObject>(3)?;
     let audio_levels_interval_millis = cx.argument::<JsNumber>(4)?.value(&mut cx) as u64;
+
+    let data_mode = js_call_config
+        .get::<JsNumber, _, _>(&mut cx, "dataMode")?
+        .value(&mut cx) as i32;
+    let dred_duration = js_call_config
+        .get::<JsNumber, _, _>(&mut cx, "dredDuration")?
+        .value(&mut cx) as u8;
+    let enable_vp9_encode = js_call_config
+        .get::<JsBoolean, _, _>(&mut cx, "enableVp9Encode")?
+        .value(&mut cx);
+    let enable_vp9_decode = js_call_config
+        .get::<JsBoolean, _, _>(&mut cx, "enableVp9Decode")?
+        .value(&mut cx);
+    let stats_interval_secs = js_call_config
+        .get_opt::<JsNumber, _, _>(&mut cx, "statsIntervalSecs")?
+        .map(|n| n.value(&mut cx) as u16);
 
     info!("proceed(): callId: {}, hideIp: {}", call_id, hide_ip);
     let mut ice_servers = Vec::new();
@@ -841,12 +999,17 @@ fn proceed(mut cx: FunctionContext) -> JsResult<JsValue> {
             MAX_VIDEO_HEIGHT,
             MAX_VIDEO_FPS,
         );
-        endpoint.call_manager.proceed(
-            call_id,
-            call_context,
-            CallConfig::default().with_data_mode(DataMode::from_i32(data_mode)),
-            audio_levels_interval,
-        )?;
+        let mut call_config = CallConfig::default()
+            .with_data_mode(DataMode::from_i32(data_mode))
+            .with_dred_duration(dred_duration)
+            .with_enable_vp9_encode(enable_vp9_encode)
+            .with_enable_vp9_decode(enable_vp9_decode);
+        if let Some(secs) = stats_interval_secs {
+            call_config = call_config.with_stats_interval_secs(secs);
+        }
+        endpoint
+            .call_manager
+            .proceed(call_id, call_context, call_config, audio_levels_interval);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -859,7 +1022,7 @@ fn accept(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.accept({})", call_id);
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.accept_call(call_id)?;
+        endpoint.call_manager.accept_call(call_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -872,7 +1035,7 @@ fn ignore(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.ignore({})", call_id);
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.drop_call(call_id)?;
+        endpoint.call_manager.drop_call(call_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -884,7 +1047,7 @@ fn hangup(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.hangup()");
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.hangup()?;
+        endpoint.call_manager.hangup();
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -897,7 +1060,7 @@ fn signalingMessageSent(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.signalingMessageSent({})", call_id);
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.message_sent(call_id)?;
+        endpoint.call_manager.message_sent(call_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -910,7 +1073,7 @@ fn signalingMessageSendFailed(mut cx: FunctionContext) -> JsResult<JsValue> {
     debug!("JsCallManager.signalingMessageSendFailed({})", call_id);
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint.call_manager.message_send_failure(call_id)?;
+        endpoint.call_manager.message_send_failure(call_id);
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -923,8 +1086,9 @@ fn updateDataMode(mut cx: FunctionContext) -> JsResult<JsValue> {
     let data_mode = cx.argument::<JsNumber>(0)?.value(&mut cx) as i32;
 
     with_call_endpoint(&mut cx, |endpoint| {
-        let active_connection = endpoint.call_manager.active_connection()?;
-        active_connection.update_data_mode(DataMode::from_i32(data_mode))?;
+        if let Ok(active_connection) = endpoint.call_manager.active_connection() {
+            active_connection.update_data_mode(DataMode::from_i32(data_mode))?;
+        }
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -939,13 +1103,9 @@ fn receivedOffer(mut cx: FunctionContext) -> JsResult<JsValue> {
     let age_sec = cx.argument::<JsNumber>(3)?.value(&mut cx) as u64;
     let call_id = CallId::new(get_id_arg(&mut cx, 4));
     let offer_type = cx.argument::<JsNumber>(5)?.value(&mut cx) as i32;
-    let opaque = cx.argument::<JsBuffer>(6)?;
-    let sender_identity_key = cx.argument::<JsBuffer>(7)?;
-    let receiver_identity_key = cx.argument::<JsBuffer>(8)?;
-
-    let opaque = opaque.as_slice(&cx).to_vec();
-    let sender_identity_key = sender_identity_key.as_slice(&cx).to_vec();
-    let receiver_identity_key = receiver_identity_key.as_slice(&cx).to_vec();
+    let opaque = cx.argument::<JsUint8Array>(6)?.as_slice(&cx).to_vec();
+    let sender_identity_key = cx.argument::<JsUint8Array>(7)?.as_slice(&cx).to_vec();
+    let receiver_identity_key = cx.argument::<JsUint8Array>(8)?.as_slice(&cx).to_vec();
 
     let call_media_type = match offer_type {
         1 => CallMediaType::Video,
@@ -963,12 +1123,10 @@ fn receivedOffer(mut cx: FunctionContext) -> JsResult<JsValue> {
                 age: Duration::from_secs(age_sec),
                 sender_device_id,
                 receiver_device_id,
-                // An electron client cannot be the primary device.
-                receiver_device_is_primary: false,
                 sender_identity_key,
                 receiver_identity_key,
             },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -977,20 +1135,17 @@ fn receivedOffer(mut cx: FunctionContext) -> JsResult<JsValue> {
 
 #[allow(non_snake_case)]
 fn receivedAnswer(mut cx: FunctionContext) -> JsResult<JsValue> {
-    let _peer_id = cx.argument::<JsString>(0)?.value(&mut cx) as PeerId;
+    let peer_id = cx.argument::<JsString>(0)?.value(&mut cx) as PeerId;
     let sender_device_id = cx.argument::<JsNumber>(1)?.value(&mut cx) as DeviceId;
     let call_id = CallId::new(get_id_arg(&mut cx, 2));
-    let opaque = cx.argument::<JsBuffer>(3)?;
-    let sender_identity_key = cx.argument::<JsBuffer>(4)?;
-    let receiver_identity_key = cx.argument::<JsBuffer>(5)?;
-
-    let opaque = opaque.as_slice(&cx).to_vec();
-    let sender_identity_key = sender_identity_key.as_slice(&cx).to_vec();
-    let receiver_identity_key = receiver_identity_key.as_slice(&cx).to_vec();
+    let opaque = cx.argument::<JsUint8Array>(3)?.as_slice(&cx).to_vec();
+    let sender_identity_key = cx.argument::<JsUint8Array>(4)?.as_slice(&cx).to_vec();
+    let receiver_identity_key = cx.argument::<JsUint8Array>(5)?.as_slice(&cx).to_vec();
 
     with_call_endpoint(&mut cx, |endpoint| {
         let answer = signaling::Answer::new(opaque)?;
         endpoint.call_manager.received_answer(
+            peer_id,
             call_id,
             signaling::ReceivedAnswer {
                 answer,
@@ -998,7 +1153,7 @@ fn receivedAnswer(mut cx: FunctionContext) -> JsResult<JsValue> {
                 sender_identity_key,
                 receiver_identity_key,
             },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1014,8 +1169,10 @@ fn receivedIceCandidates(mut cx: FunctionContext) -> JsResult<JsValue> {
 
     let mut candidates = Vec::with_capacity(js_candidates.len(&mut cx) as usize);
     for i in 0..js_candidates.len(&mut cx) {
-        let js_candidate = js_candidates.get::<JsBuffer, _, _>(&mut cx, i)?;
-        let opaque = js_candidate.as_slice(&cx).to_vec();
+        let opaque = js_candidates
+            .get::<JsUint8Array, _, _>(&mut cx, i)?
+            .as_slice(&cx)
+            .to_vec();
         candidates.push(signaling::IceCandidate::new(opaque));
     }
     debug!(
@@ -1028,12 +1185,13 @@ fn receivedIceCandidates(mut cx: FunctionContext) -> JsResult<JsValue> {
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint.call_manager.received_ice(
+            peer_id,
             call_id,
             signaling::ReceivedIce {
                 ice: signaling::Ice { candidates },
                 sender_device_id,
             },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1071,12 +1229,13 @@ fn receivedHangup(mut cx: FunctionContext) -> JsResult<JsValue> {
         let hangup = signaling::Hangup::from_type_and_device_id(hangup_type, hangup_device_id);
 
         endpoint.call_manager.received_hangup(
+            peer_id,
             call_id,
             signaling::ReceivedHangup {
                 hangup,
                 sender_device_id,
             },
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1094,9 +1253,11 @@ fn receivedBusy(mut cx: FunctionContext) -> JsResult<JsValue> {
     );
 
     with_call_endpoint(&mut cx, |endpoint| {
-        endpoint
-            .call_manager
-            .received_busy(call_id, signaling::ReceivedBusy { sender_device_id })?;
+        endpoint.call_manager.received_busy(
+            peer_id,
+            call_id,
+            signaling::ReceivedBusy { sender_device_id },
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1105,12 +1266,10 @@ fn receivedBusy(mut cx: FunctionContext) -> JsResult<JsValue> {
 
 #[allow(non_snake_case)]
 fn receivedCallMessage(mut cx: FunctionContext) -> JsResult<JsValue> {
-    let remote_user_id = cx.argument::<JsBuffer>(0)?;
-    let remote_user_id = remote_user_id.as_slice(&cx).to_vec();
+    let remote_user_id = cx.argument::<JsUint8Array>(0)?.as_slice(&cx).to_vec();
     let remote_device_id = cx.argument::<JsNumber>(1)?.value(&mut cx) as DeviceId;
     let local_device_id = cx.argument::<JsNumber>(2)?.value(&mut cx) as DeviceId;
-    let data = cx.argument::<JsBuffer>(3)?;
-    let data = data.as_slice(&cx).to_vec();
+    let data = cx.argument::<JsUint8Array>(3)?.as_slice(&cx).to_vec();
     let message_age_sec = cx.argument::<JsNumber>(4)?.value(&mut cx) as u64;
 
     with_call_endpoint(&mut cx, |endpoint| {
@@ -1120,7 +1279,7 @@ fn receivedCallMessage(mut cx: FunctionContext) -> JsResult<JsValue> {
             local_device_id,
             data,
             Duration::from_secs(message_age_sec),
-        )?;
+        );
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1131,8 +1290,7 @@ fn receivedCallMessage(mut cx: FunctionContext) -> JsResult<JsValue> {
 fn receivedHttpResponse(mut cx: FunctionContext) -> JsResult<JsValue> {
     let request_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as u32;
     let status_code = cx.argument::<JsNumber>(1)?.value(&mut cx) as u16;
-    let body = cx.argument::<JsBuffer>(2)?;
-    let body = body.as_slice(&cx).to_vec();
+    let body = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
     let response = http::Response {
         status: status_code.into(),
         body,
@@ -1170,7 +1328,7 @@ fn httpRequestFailed(mut cx: FunctionContext) -> JsResult<JsValue> {
 #[allow(non_snake_case)]
 fn setOutgoingAudioEnabled(mut cx: FunctionContext) -> JsResult<JsValue> {
     let enabled = cx.argument::<JsBoolean>(0)?.value(&mut cx);
-    info!("#outgoing_audio_enabled: {}", enabled);
+    info!("setOutgoingAudioEnabled({})", enabled);
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint.outgoing_audio_track.set_enabled(enabled);
@@ -1188,17 +1346,30 @@ fn setOutgoingAudioEnabled(mut cx: FunctionContext) -> JsResult<JsValue> {
 }
 
 #[allow(non_snake_case)]
+fn setMicrophoneWarmupEnabled(mut cx: FunctionContext) -> JsResult<JsValue> {
+    let enabled = cx.argument::<JsBoolean>(0)?.value(&mut cx);
+    info!("setMicrophoneWarmupEnabled({})", enabled);
+
+    with_call_endpoint(&mut cx, |endpoint| {
+        endpoint.peer_connection_factory.set_audio_warmup(enabled)
+    })
+    .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
+    Ok(cx.undefined().upcast())
+}
+
+#[allow(non_snake_case)]
 fn setOutgoingVideoEnabled(mut cx: FunctionContext) -> JsResult<JsValue> {
     let enabled = cx.argument::<JsBoolean>(0)?.value(&mut cx);
-    debug!("JsCallManager.setOutgoingVideoEnabled({})", enabled);
+    info!("setOutgoingVideoEnabled({})", enabled);
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint.outgoing_video_track.set_enabled(enabled);
-        let mut active_connection = endpoint.call_manager.active_connection()?;
-        active_connection.update_sender_status(signaling::SenderStatus {
-            video_enabled: Some(enabled),
-            ..Default::default()
-        })?;
+        if let Ok(mut active_connection) = endpoint.call_manager.active_connection() {
+            active_connection.update_sender_status(signaling::SenderStatus {
+                video_enabled: Some(enabled),
+                ..Default::default()
+            })?;
+        }
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1208,10 +1379,7 @@ fn setOutgoingVideoEnabled(mut cx: FunctionContext) -> JsResult<JsValue> {
 #[allow(non_snake_case)]
 fn setOutgoingVideoIsScreenShare(mut cx: FunctionContext) -> JsResult<JsValue> {
     let is_screenshare = cx.argument::<JsBoolean>(0)?.value(&mut cx);
-    debug!(
-        "JsCallManager.setOutgoingVideoIsScreenShare({})",
-        is_screenshare
-    );
+    info!("setOutgoingVideoIsScreenShare({})", is_screenshare);
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint
@@ -1228,11 +1396,9 @@ fn setOutgoingVideoIsScreenShare(mut cx: FunctionContext) -> JsResult<JsValue> {
             .outgoing_video_source
             .adapt_output_format(width, height, fps);
 
-        let mut active_connection = endpoint.call_manager.active_connection()?;
-        active_connection.update_sender_status(signaling::SenderStatus {
-            sharing_screen: Some(is_screenshare),
-            ..Default::default()
-        })?;
+        if let Ok(mut active_connection) = endpoint.call_manager.active_connection() {
+            active_connection.send_is_screenshare_update(is_screenshare)?;
+        }
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1244,7 +1410,7 @@ fn sendVideoFrame(mut cx: FunctionContext) -> JsResult<JsValue> {
     let width = cx.argument::<JsNumber>(0)?.value(&mut cx) as u32;
     let height = cx.argument::<JsNumber>(1)?.value(&mut cx) as u32;
     let pixel_format = cx.argument::<JsNumber>(2)?.value(&mut cx) as i32;
-    let buffer = cx.argument::<JsBuffer>(3)?;
+    let buffer = cx.argument::<JsUint8Array>(3)?;
 
     let pixel_format = VideoPixelFormat::from_i32(pixel_format);
     if pixel_format.is_none() {
@@ -1263,7 +1429,7 @@ fn sendVideoFrame(mut cx: FunctionContext) -> JsResult<JsValue> {
 
 fn receive_video_frame<'a>(
     cx: &mut FunctionContext<'a>,
-    mut rgba_buffer: Handle<JsBuffer>,
+    mut rgba_buffer: Handle<JsUint8Array>,
     demux_id: DemuxId,
     max_width: u32,
     max_height: u32,
@@ -1292,7 +1458,13 @@ fn receive_video_frame<'a>(
 
     if let Some(frame) = frame {
         let frame = frame.apply_rotation();
-        frame.to_rgba(rgba_buffer.as_mut_slice(cx));
+        if !frame.to_rgba(rgba_buffer.as_mut_slice(cx)) {
+            static TO_RGBA_FAILED_ONCE: Once = Once::new();
+            TO_RGBA_FAILED_ONCE.call_once(|| {
+                error!("receive_video_frame(): to_rgba failed, frame is likely not i420");
+            });
+            return Ok(cx.undefined().upcast());
+        }
         let js_width = cx.number(frame.width());
         let js_height = cx.number(frame.height());
         let result = JsArray::new(cx, 2);
@@ -1306,7 +1478,7 @@ fn receive_video_frame<'a>(
 
 #[allow(non_snake_case)]
 fn receiveVideoFrame(mut cx: FunctionContext) -> JsResult<JsValue> {
-    let rgba_buffer = cx.argument::<JsBuffer>(0)?;
+    let rgba_buffer = cx.argument::<JsUint8Array>(0)?;
     let max_width = cx.argument::<JsNumber>(1)?.value(&mut cx) as u32; // saturating cast
     let max_height = cx.argument::<JsNumber>(2)?.value(&mut cx) as u32; // saturating cast
     receive_video_frame(&mut cx, rgba_buffer, 0, max_width, max_height)
@@ -1318,40 +1490,59 @@ fn receiveVideoFrame(mut cx: FunctionContext) -> JsResult<JsValue> {
 fn receiveGroupCallVideoFrame(mut cx: FunctionContext) -> JsResult<JsValue> {
     let _client_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as group_call::ClientId;
     let remote_demux_id = cx.argument::<JsNumber>(1)?.value(&mut cx) as DemuxId;
-    let rgba_buffer = cx.argument::<JsBuffer>(2)?;
+    let rgba_buffer = cx.argument::<JsUint8Array>(2)?;
     let max_width = cx.argument::<JsNumber>(3)?.value(&mut cx) as u32; // saturating cast
     let max_height = cx.argument::<JsNumber>(4)?.value(&mut cx) as u32; // saturating cast
     receive_video_frame(&mut cx, rgba_buffer, remote_demux_id, max_width, max_height)
 }
 
+fn jsvalue_to_svc_config(
+    raw_svc_config: Handle<'_, JsValue>,
+    cx: &mut FunctionContext,
+) -> std::result::Result<Option<SvcConfig>, neon::result::Throw> {
+    if raw_svc_config.is_a::<JsUndefined, _>(cx) || raw_svc_config.is_a::<JsNull, _>(cx) {
+        Ok(None)
+    } else {
+        let raw_svc_config = raw_svc_config.downcast_or_throw::<JsObject, _>(cx)?;
+        let mode = raw_svc_config.get::<JsString, _, _>(cx, "mode")?.value(cx);
+        let mode_for_screenshare = raw_svc_config
+            .get::<JsString, _, _>(cx, "modeForScreenshare")?
+            .value(cx);
+        let max_bitrate_bps = raw_svc_config.get::<JsValue, _, _>(cx, "maxBitrateBps")?;
+        let max_bitrate_bps = if max_bitrate_bps.is_a::<JsUndefined, _>(cx) {
+            None
+        } else {
+            Some(
+                max_bitrate_bps
+                    .downcast_or_throw::<JsNumber, _>(cx)?
+                    .value(cx) as i32,
+            )
+        };
+        Ok(Some(SvcConfig {
+            mode,
+            mode_for_screenshare,
+            max_bitrate_bps,
+        }))
+    }
+}
+
 #[allow(non_snake_case)]
 fn createGroupCallClient(mut cx: FunctionContext) -> JsResult<JsValue> {
-    let group_id = cx.argument::<JsValue>(0)?.as_value(&mut cx);
+    let group_id = cx.argument::<JsUint8Array>(0)?.as_slice(&cx).to_vec();
     let sfu_url = cx.argument::<JsString>(1)?.value(&mut cx);
-    let hkdf_extra_info = cx.argument::<JsValue>(2)?.as_value(&mut cx);
+    let hkdf_extra_info = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
     let audio_levels_interval_millis = cx.argument::<JsNumber>(3)?.value(&mut cx) as u64;
+    let dred_duration = cx.argument::<JsNumber>(4)?.value(&mut cx) as u8;
 
     let mut client_id = group_call::INVALID_CLIENT_ID;
-
-    let group_id: std::vec::Vec<u8> = match group_id.downcast::<JsBuffer, _>(&mut cx) {
-        Ok(handle) => handle.as_slice(&cx).to_vec(),
-        Err(_) => {
-            return Ok(cx.number(client_id).upcast());
-        }
-    };
-    let hkdf_extra_info: std::vec::Vec<u8> = match hkdf_extra_info.downcast::<JsBuffer, _>(&mut cx)
-    {
-        Ok(handle) => handle.as_slice(&cx).to_vec(),
-        Err(_) => {
-            return Ok(cx.number(client_id).upcast());
-        }
-    };
 
     let audio_levels_interval = if audio_levels_interval_millis == 0 {
         None
     } else {
         Some(Duration::from_millis(audio_levels_interval_millis))
     };
+
+    let svc_config = jsvalue_to_svc_config(cx.argument::<JsValue>(5)?, &mut cx)?;
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint.outgoing_video_source.adapt_output_format(
@@ -1364,16 +1555,20 @@ fn createGroupCallClient(mut cx: FunctionContext) -> JsResult<JsValue> {
         let outgoing_audio_track = endpoint.outgoing_audio_track.clone();
         let outgoing_video_track = endpoint.outgoing_video_track.clone();
         let incoming_video_sink = endpoint.incoming_video_sink.clone();
-        let result = endpoint.call_manager.create_group_call_client(
-            group_id,
-            sfu_url,
-            hkdf_extra_info,
-            audio_levels_interval,
-            Some(peer_connection_factory),
-            outgoing_audio_track,
-            outgoing_video_track,
-            Some(incoming_video_sink),
-        );
+        let result = endpoint
+            .call_manager
+            .create_group_call_client(CreateGroupCallParams {
+                group_id,
+                sfu_url,
+                hkdf_extra_info,
+                audio_levels_interval,
+                dred_duration,
+                svc_config,
+                peer_connection_factory: Some(peer_connection_factory),
+                outgoing_audio_track,
+                outgoing_video_track,
+                incoming_video_sink: Some(incoming_video_sink),
+            });
         if let Ok(v) = result {
             client_id = v;
         }
@@ -1387,31 +1582,33 @@ fn createGroupCallClient(mut cx: FunctionContext) -> JsResult<JsValue> {
 #[allow(non_snake_case)]
 fn createCallLinkCallClient(mut cx: FunctionContext) -> JsResult<JsValue> {
     let sfu_url = cx.argument::<JsString>(0)?.value(&mut cx);
+    let endorsement_public_key = cx.argument::<JsUint8Array>(1)?.as_slice(&cx).to_vec();
 
-    let auth_presentation = cx.argument::<JsBuffer>(1)?;
-    let auth_presentation = auth_presentation.as_slice(&cx).to_vec();
+    let auth_presentation = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
 
-    let root_key_bytes = cx.argument::<JsBuffer>(2)?;
+    let root_key_bytes = cx.argument::<JsUint8Array>(3)?;
     let root_key = CallLinkRootKey::try_from(root_key_bytes.as_slice(&cx))
         .or_else(|e| cx.throw_type_error(e.to_string()))?;
 
-    let admin_passkey = cx.argument::<JsValue>(3)?;
+    let admin_passkey = cx.argument::<JsValue>(4)?;
     let admin_passkey = if admin_passkey.is_a::<JsUndefined, _>(&mut cx) {
         None
     } else {
-        let admin_passkey = admin_passkey.downcast_or_throw::<JsBuffer, _>(&mut cx)?;
+        let admin_passkey = admin_passkey.downcast_or_throw::<JsUint8Array, _>(&mut cx)?;
         Some(admin_passkey.as_slice(&cx).to_vec())
     };
 
-    let hkdf_extra_info = cx.argument::<JsBuffer>(4)?;
-    let hkdf_extra_info = hkdf_extra_info.as_slice(&cx).to_vec();
+    let hkdf_extra_info = cx.argument::<JsUint8Array>(5)?.as_slice(&cx).to_vec();
 
-    let audio_levels_interval_millis = cx.argument::<JsNumber>(5)?.value(&mut cx) as u64;
+    let audio_levels_interval_millis = cx.argument::<JsNumber>(6)?.value(&mut cx) as u64;
+    let dred_duration = cx.argument::<JsNumber>(7)?.value(&mut cx) as u8;
     let audio_levels_interval = if audio_levels_interval_millis == 0 {
         None
     } else {
         Some(Duration::from_millis(audio_levels_interval_millis))
     };
+
+    let svc_config = jsvalue_to_svc_config(cx.argument::<JsValue>(8)?, &mut cx)?;
 
     let mut client_id = group_call::INVALID_CLIENT_ID;
 
@@ -1420,18 +1617,23 @@ fn createCallLinkCallClient(mut cx: FunctionContext) -> JsResult<JsValue> {
         let outgoing_audio_track = endpoint.outgoing_audio_track.clone();
         let outgoing_video_track = endpoint.outgoing_video_track.clone();
         let incoming_video_sink = endpoint.incoming_video_sink.clone();
-        let result = endpoint.call_manager.create_call_link_call_client(
-            sfu_url,
-            &auth_presentation,
-            root_key,
-            admin_passkey,
-            hkdf_extra_info,
-            audio_levels_interval,
-            Some(peer_connection_factory),
-            outgoing_audio_track,
-            outgoing_video_track,
-            Some(incoming_video_sink),
-        );
+        let result = endpoint
+            .call_manager
+            .create_call_link_call_client(CreateCallLinkCallParams {
+                sfu_url,
+                endorsement_public_key: &endorsement_public_key,
+                auth_presentation: &auth_presentation,
+                root_key,
+                admin_passkey,
+                hkdf_extra_info,
+                audio_levels_interval,
+                dred_duration,
+                svc_config,
+                peer_connection_factory: Some(peer_connection_factory),
+                outgoing_audio_track,
+                outgoing_video_track,
+                incoming_video_sink: Some(incoming_video_sink),
+            });
         if let Ok(v) = result {
             client_id = v;
         }
@@ -1528,6 +1730,37 @@ fn setOutgoingAudioMuted(mut cx: FunctionContext) -> JsResult<JsValue> {
 }
 
 #[allow(non_snake_case)]
+fn setOutgoingAudioMutedRemotely(mut cx: FunctionContext) -> JsResult<JsValue> {
+    let client_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as group_call::ClientId;
+    let mute_source = cx.argument::<JsNumber>(1)?.value(&mut cx) as DemuxId;
+
+    with_call_endpoint(&mut cx, |endpoint| {
+        endpoint.outgoing_audio_track.set_enabled(false);
+        endpoint
+            .call_manager
+            .set_outgoing_audio_muted_remotely(client_id, mute_source);
+        Ok(())
+    })
+    .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
+    Ok(cx.undefined().upcast())
+}
+
+#[allow(non_snake_case)]
+fn sendRemoteMuteRequest(mut cx: FunctionContext) -> JsResult<JsValue> {
+    let client_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as group_call::ClientId;
+    let mute_target = cx.argument::<JsNumber>(1)?.value(&mut cx) as DemuxId;
+
+    with_call_endpoint(&mut cx, |endpoint| {
+        endpoint
+            .call_manager
+            .send_remote_mute_request(client_id, mute_target);
+        Ok(())
+    })
+    .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
+    Ok(cx.undefined().upcast())
+}
+
+#[allow(non_snake_case)]
 fn setOutgoingVideoMuted(mut cx: FunctionContext) -> JsResult<JsValue> {
     let client_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as group_call::ClientId;
     let muted = cx.argument::<JsBoolean>(1)?.value(&mut cx);
@@ -1562,9 +1795,10 @@ fn setOutgoingGroupCallVideoIsScreenShare(mut cx: FunctionContext) -> JsResult<J
     let is_screenshare = cx.argument::<JsBoolean>(1)?.value(&mut cx);
 
     with_call_endpoint(&mut cx, |endpoint| {
+        let video_track = endpoint.outgoing_video_track.clone();
         endpoint
-            .outgoing_video_track
-            .set_content_hint(is_screenshare);
+            .call_manager
+            .reconfigure_video_encoder_for_screenshare(client_id, video_track, is_screenshare);
 
         let (width, height, fps) = if is_screenshare {
             // Remove limit
@@ -1583,6 +1817,7 @@ fn setOutgoingGroupCallVideoIsScreenShare(mut cx: FunctionContext) -> JsResult<J
         endpoint
             .call_manager
             .set_sharing_screen(client_id, is_screenshare);
+
         Ok(())
     })
     .or_else(|err: anyhow::Error| cx.throw_error(format!("{}", err)))?;
@@ -1596,9 +1831,13 @@ fn groupRing(mut cx: FunctionContext) -> JsResult<JsValue> {
     let recipient = match recipient_or_undef.downcast::<JsUndefined, _>(&mut cx) {
         Ok(_) => None,
         Err(_) => {
-            // By checking 'undefined' first, we get an error message that mentions Buffer.
-            let recipient_buffer = recipient_or_undef.downcast_or_throw::<JsBuffer, _>(&mut cx)?;
-            Some(recipient_buffer.as_slice(&cx).to_vec())
+            // By checking 'undefined' first, we get an error message that mentions JsUint8Array.
+            Some(
+                recipient_or_undef
+                    .downcast_or_throw::<JsUint8Array, _>(&mut cx)?
+                    .as_slice(&cx)
+                    .to_vec(),
+            )
         }
     };
 
@@ -1711,7 +1950,7 @@ fn requestVideo(mut cx: FunctionContext) -> JsResult<JsValue> {
 #[allow(non_snake_case)]
 fn approveUser(mut cx: FunctionContext) -> JsResult<JsValue> {
     let client_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as group_call::ClientId;
-    let other_user_id = cx.argument::<JsBuffer>(1)?.as_slice(&cx).to_vec();
+    let other_user_id = cx.argument::<JsUint8Array>(1)?.as_slice(&cx).to_vec();
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint.call_manager.approve_user(client_id, other_user_id);
@@ -1724,7 +1963,7 @@ fn approveUser(mut cx: FunctionContext) -> JsResult<JsValue> {
 #[allow(non_snake_case)]
 fn denyUser(mut cx: FunctionContext) -> JsResult<JsValue> {
     let client_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as group_call::ClientId;
-    let other_user_id = cx.argument::<JsBuffer>(1)?.as_slice(&cx).to_vec();
+    let other_user_id = cx.argument::<JsUint8Array>(1)?.as_slice(&cx).to_vec();
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint.call_manager.deny_user(client_id, other_user_id);
@@ -1773,10 +2012,10 @@ fn setGroupMembers(mut cx: FunctionContext) -> JsResult<JsValue> {
     for i in 0..js_members.len(&mut cx) {
         let js_member = js_members.get::<JsObject, _, _>(&mut cx, i)?;
         let user_id = js_member
-            .get_opt::<JsBuffer, _, _>(&mut cx, "userId")?
+            .get_opt::<JsUint8Array, _, _>(&mut cx, "userId")?
             .map(|handle| handle.as_slice(&cx).to_vec());
         let member_id = js_member
-            .get_opt::<JsBuffer, _, _>(&mut cx, "userIdCipherText")?
+            .get_opt::<JsUint8Array, _, _>(&mut cx, "userIdCipherText")?
             .map(|handle| handle.as_slice(&cx).to_vec());
 
         match (user_id, member_id) {
@@ -1800,14 +2039,7 @@ fn setGroupMembers(mut cx: FunctionContext) -> JsResult<JsValue> {
 #[allow(non_snake_case)]
 fn setMembershipProof(mut cx: FunctionContext) -> JsResult<JsValue> {
     let client_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as group_call::ClientId;
-    let proof = cx.argument::<JsValue>(1)?.as_value(&mut cx);
-
-    let proof: std::vec::Vec<u8> = match proof.downcast::<JsBuffer, _>(&mut cx) {
-        Ok(handle) => handle.as_slice(&cx).to_vec(),
-        Err(_) => {
-            return Ok(cx.undefined().upcast());
-        }
-    };
+    let proof = cx.argument::<JsUint8Array>(1)?.as_slice(&cx).to_vec();
 
     with_call_endpoint(&mut cx, |endpoint| {
         endpoint.call_manager.set_membership_proof(client_id, proof);
@@ -1823,19 +2055,18 @@ fn peekGroupCall(mut cx: FunctionContext) -> JsResult<JsValue> {
 
     let sfu_url = cx.argument::<JsString>(1)?.value(&mut cx);
 
-    let membership_proof = cx.argument::<JsBuffer>(2)?;
-    let membership_proof = membership_proof.as_slice(&cx).to_vec();
+    let membership_proof = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
 
     let js_members = cx.argument::<JsArray>(3)?;
     let mut members = Vec::with_capacity(js_members.len(&mut cx) as usize);
     for i in 0..js_members.len(&mut cx) {
         let js_member = js_members.get::<JsObject, _, _>(&mut cx, i)?;
         let user_id = js_member
-            .get_opt::<JsBuffer, _, _>(&mut cx, "userId")?
+            .get_opt::<JsUint8Array, _, _>(&mut cx, "userId")?
             .map(|handle| handle.as_slice(&cx).to_vec());
 
         let member_id = js_member
-            .get_opt::<JsBuffer, _, _>(&mut cx, "userIdCipherText")?
+            .get_opt::<JsUint8Array, _, _>(&mut cx, "userIdCipherText")?
             .map(|handle| handle.as_slice(&cx).to_vec());
 
         match (user_id, member_id) {
@@ -1864,10 +2095,9 @@ fn peekCallLinkCall(mut cx: FunctionContext) -> JsResult<JsValue> {
 
     let sfu_url = cx.argument::<JsString>(1)?.value(&mut cx);
 
-    let auth_presentation = cx.argument::<JsBuffer>(2)?;
-    let auth_presentation = auth_presentation.as_slice(&cx).to_vec();
+    let auth_presentation = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
 
-    let root_key_bytes = cx.argument::<JsBuffer>(3)?;
+    let root_key_bytes = cx.argument::<JsUint8Array>(3)?;
     let root_key = CallLinkRootKey::try_from(root_key_bytes.as_slice(&cx))
         .or_else(|e| cx.throw_type_error(e.to_string()))?;
 
@@ -1876,10 +2106,12 @@ fn peekCallLinkCall(mut cx: FunctionContext) -> JsResult<JsValue> {
         sfu::peek(
             endpoint.call_manager.http_client(),
             &sfu_url,
-            Some(hex::encode(root_key.derive_room_id())),
-            call_links::auth_header_from_auth_credential(&auth_presentation),
-            Arc::new(call_links::CallLinkMemberResolver::from(&root_key)),
-            Some(root_key.clone()),
+            PeekArgs {
+                room_id_header: None,
+                auth_header: call_links::auth_header_from_auth_credential(&auth_presentation),
+                member_resolver: Arc::new(call_links::CallLinkMemberResolver::from(&root_key)),
+                call_link_root_key: Some(root_key),
+            },
             Box::new(move |peek_result| {
                 // Ignore errors, that can only mean we're shutting down.
                 let _ = event_reporter.send(Event::GroupUpdate(GroupUpdate::PeekResult {
@@ -1896,9 +2128,8 @@ fn peekCallLinkCall(mut cx: FunctionContext) -> JsResult<JsValue> {
 fn readCallLink(mut cx: FunctionContext) -> JsResult<JsValue> {
     let request_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as u32;
     let sfu_url = cx.argument::<JsString>(1)?.value(&mut cx);
-    let auth_presentation = cx.argument::<JsBuffer>(2)?;
-    let auth_presentation = auth_presentation.as_slice(&cx).to_vec();
-    let root_key_bytes = cx.argument::<JsBuffer>(3)?;
+    let auth_presentation = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
+    let root_key_bytes = cx.argument::<JsUint8Array>(3)?;
     let root_key = CallLinkRootKey::try_from(root_key_bytes.as_slice(&cx))
         .or_else(|e| cx.throw_type_error(e.to_string()))?;
 
@@ -1942,15 +2173,12 @@ fn jsvalue_to_restrictions(
 fn createCallLink(mut cx: FunctionContext) -> JsResult<JsValue> {
     let request_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as u32;
     let sfu_url = cx.argument::<JsString>(1)?.value(&mut cx);
-    let create_presentation = cx.argument::<JsBuffer>(2)?;
-    let create_presentation = create_presentation.as_slice(&cx).to_vec();
-    let root_key_bytes = cx.argument::<JsBuffer>(3)?;
+    let create_presentation = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
+    let root_key_bytes = cx.argument::<JsUint8Array>(3)?;
     let root_key = CallLinkRootKey::try_from(root_key_bytes.as_slice(&cx))
         .or_else(|e| cx.throw_type_error(e.to_string()))?;
-    let admin_passkey = cx.argument::<JsBuffer>(4)?;
-    let admin_passkey = admin_passkey.as_slice(&cx).to_vec();
-    let public_zkparams = cx.argument::<JsBuffer>(5)?;
-    let public_zkparams = public_zkparams.as_slice(&cx).to_vec();
+    let admin_passkey = cx.argument::<JsUint8Array>(4)?.as_slice(&cx).to_vec();
+    let public_zkparams = cx.argument::<JsUint8Array>(5)?.as_slice(&cx).to_vec();
     let restrictions = cx.argument::<JsValue>(6)?;
     let restrictions = jsvalue_to_restrictions(restrictions, &mut cx)?;
 
@@ -1979,13 +2207,11 @@ fn createCallLink(mut cx: FunctionContext) -> JsResult<JsValue> {
 fn updateCallLink(mut cx: FunctionContext) -> JsResult<JsValue> {
     let request_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as u32;
     let sfu_url = cx.argument::<JsString>(1)?.value(&mut cx);
-    let create_presentation = cx.argument::<JsBuffer>(2)?;
-    let create_presentation = create_presentation.as_slice(&cx).to_vec();
-    let root_key_bytes = cx.argument::<JsBuffer>(3)?;
+    let create_presentation = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
+    let root_key_bytes = cx.argument::<JsUint8Array>(3)?;
     let root_key = CallLinkRootKey::try_from(root_key_bytes.as_slice(&cx))
         .or_else(|e| cx.throw_type_error(e.to_string()))?;
-    let admin_passkey = cx.argument::<JsBuffer>(4)?;
-    let admin_passkey = admin_passkey.as_slice(&cx).to_vec();
+    let admin_passkey = cx.argument::<JsUint8Array>(4)?.as_slice(&cx).to_vec();
 
     let new_name = cx.argument::<JsValue>(5)?;
     let new_name = if new_name.is_a::<JsUndefined, _>(&mut cx) {
@@ -1997,7 +2223,7 @@ fn updateCallLink(mut cx: FunctionContext) -> JsResult<JsValue> {
         Some(if name.is_empty() {
             vec![]
         } else {
-            root_key.encrypt(name.as_bytes(), rand::rngs::OsRng)
+            root_key.encrypt(name.as_bytes(), UnwrapErr(rand::rngs::SysRng))
         })
     };
 
@@ -2043,13 +2269,11 @@ fn updateCallLink(mut cx: FunctionContext) -> JsResult<JsValue> {
 fn deleteCallLink(mut cx: FunctionContext) -> JsResult<JsValue> {
     let request_id = cx.argument::<JsNumber>(0)?.value(&mut cx) as u32;
     let sfu_url = cx.argument::<JsString>(1)?.value(&mut cx);
-    let auth_presentation = cx.argument::<JsBuffer>(2)?;
-    let auth_presentation = auth_presentation.as_slice(&cx).to_vec();
-    let root_key_bytes = cx.argument::<JsBuffer>(3)?;
+    let auth_presentation = cx.argument::<JsUint8Array>(2)?.as_slice(&cx).to_vec();
+    let root_key_bytes = cx.argument::<JsUint8Array>(3)?;
     let root_key = CallLinkRootKey::try_from(root_key_bytes.as_slice(&cx))
         .or_else(|e| cx.throw_type_error(e.to_string()))?;
-    let admin_passkey = cx.argument::<JsBuffer>(4)?;
-    let admin_passkey = admin_passkey.as_slice(&cx).to_vec();
+    let admin_passkey = cx.argument::<JsUint8Array>(4)?.as_slice(&cx).to_vec();
 
     with_call_endpoint(&mut cx, |endpoint| {
         let event_reporter = endpoint.event_reporter.clone();
@@ -2101,7 +2325,7 @@ fn getAudioInputs(mut cx: FunctionContext) -> JsResult<JsValue> {
 
 #[allow(non_snake_case)]
 fn setAudioInput(mut cx: FunctionContext) -> JsResult<JsValue> {
-    let index = cx.argument::<JsNumber>(0)?.value(&mut cx) as u16;
+    let index = cx.argument::<JsNumber>(0)?.value(&mut cx) as usize;
     match with_call_endpoint(&mut cx, |endpoint| {
         endpoint
             .peer_connection_factory
@@ -2141,7 +2365,7 @@ fn getAudioOutputs(mut cx: FunctionContext) -> JsResult<JsValue> {
 
 #[allow(non_snake_case)]
 fn setAudioOutput(mut cx: FunctionContext) -> JsResult<JsValue> {
-    let index = cx.argument::<JsNumber>(0)?.value(&mut cx) as u16;
+    let index = cx.argument::<JsNumber>(0)?.value(&mut cx) as usize;
     match with_call_endpoint(&mut cx, |endpoint| {
         endpoint
             .peer_connection_factory
@@ -2149,6 +2373,23 @@ fn setAudioOutput(mut cx: FunctionContext) -> JsResult<JsValue> {
     }) {
         Ok(_) => (),
         Err(err) => error!("setAudioOutput failed: {}", err),
+    };
+
+    Ok(cx.undefined().upcast())
+}
+
+#[allow(non_snake_case)]
+fn setVoiceProcessingEnabled(mut cx: FunctionContext) -> JsResult<JsValue> {
+    let enabled = cx.argument::<JsBoolean>(0)?.value(&mut cx);
+    info!("setVoiceProcessingEnabled(): {:?}", enabled);
+
+    match with_call_endpoint(&mut cx, |endpoint| {
+        endpoint
+            .peer_connection_factory
+            .set_input_voice_processing_enabled(enabled)
+    }) {
+        Ok(_) => (),
+        Err(err) => error!("setVoiceProcessingEnabled failed: {}", err),
     };
 
     Ok(cx.undefined().upcast())
@@ -2165,6 +2406,31 @@ fn setRtcStatsInterval(mut cx: FunctionContext) -> JsResult<JsValue> {
     });
 
     Ok(cx.undefined().upcast())
+}
+
+fn devices_to_js_array<'a>(
+    cx: &mut FunctionContext<'a>,
+    devices: Vec<Option<AudioDevice>>,
+) -> JsResult<'a, JsArray> {
+    // Maintain original indices as the ADM sees them.
+    let devices_filtered = devices
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.map(|dev| (i, dev)))
+        .collect::<Vec<_>>();
+    let js_devices = JsArray::new(cx, devices_filtered.len());
+    for (i, (adm_index, device)) in devices_filtered.into_iter().enumerate() {
+        let js_info = cx.empty_object();
+        let js_name = cx.string(&device.name);
+        js_info.set(cx, "name", js_name)?;
+        let js_unique_id = cx.string(&device.unique_id);
+        js_info.set(cx, "uniqueId", js_unique_id)?;
+        let js_index = cx.number(adm_index as f64);
+        js_info.set(cx, "index", js_index)?;
+
+        js_devices.set(cx, i as u32, js_info)?;
+    }
+    Ok(js_devices)
 }
 
 #[allow(non_snake_case)]
@@ -2200,8 +2466,7 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                     Handle<JsValue>,
                 ) = match signal {
                     signaling::Message::Offer(offer) => {
-                        let mut opaque = cx.buffer(offer.opaque.len())?;
-                        opaque.as_mut_slice(&mut cx).copy_from_slice(&offer.opaque);
+                        let opaque = JsUint8Array::from_slice(&mut cx, offer.opaque.as_slice())?;
 
                         (
                             "onSendOffer",
@@ -2211,8 +2476,7 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                         )
                     }
                     signaling::Message::Answer(answer) => {
-                        let mut opaque = cx.buffer(answer.opaque.len())?;
-                        opaque.as_mut_slice(&mut cx).copy_from_slice(&answer.opaque);
+                        let opaque = JsUint8Array::from_slice(&mut cx, answer.opaque.as_slice())?;
 
                         (
                             "onSendAnswer",
@@ -2225,10 +2489,8 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                         let js_candidates = JsArray::new(&mut cx, ice.candidates.len());
                         for (i, candidate) in ice.candidates.iter().enumerate() {
                             let opaque: neon::handle::Handle<JsValue> = {
-                                let mut js_opaque = cx.buffer(candidate.opaque.len())?;
-                                js_opaque
-                                    .as_mut_slice(&mut cx)
-                                    .copy_from_slice(candidate.opaque.as_ref());
+                                let js_opaque =
+                                    JsUint8Array::from_slice(&mut cx, candidate.opaque.as_slice())?;
                                 js_opaque.upcast()
                             };
 
@@ -2296,37 +2558,30 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 method.call(&mut cx, observer, args)?;
             }
 
-            Event::CallState(peer_id, call_id, CallState::Ended(reason)) => {
-                let method_name = "onCallEnded";
-                let reason_string = match reason {
-                    EndReason::LocalHangup => "LocalHangup",
-                    EndReason::RemoteHangup => "RemoteHangup",
-                    EndReason::RemoteHangupNeedPermission => "RemoteHangupNeedPermission",
-                    EndReason::Declined => "Declined",
-                    EndReason::Busy => "Busy",
-                    EndReason::Glare => "Glare",
-                    EndReason::ReCall => "ReCall",
-                    EndReason::ReceivedOfferExpired { .. } => "ReceivedOfferExpired",
-                    EndReason::ReceivedOfferWhileActive => "ReceivedOfferWhileActive",
-                    EndReason::ReceivedOfferWithGlare => "ReceivedOfferWithGlare",
-                    EndReason::SignalingFailure => "SignalingFailure",
-                    EndReason::GlareFailure => "GlareFailure",
-                    EndReason::ConnectionFailure => "ConnectionFailure",
-                    EndReason::InternalFailure => "InternalFailure",
-                    EndReason::Timeout => "Timeout",
-                    EndReason::AcceptedOnAnotherDevice => "AcceptedOnAnotherDevice",
-                    EndReason::DeclinedOnAnotherDevice => "DeclinedOnAnotherDevice",
-                    EndReason::BusyOnAnotherDevice => "BusyOnAnotherDevice",
-                };
+            Event::CallState(peer_id, call_id, CallState::Rejected(reason)) => {
+                let method_name = "onCallRejected";
                 let age = match reason {
-                    EndReason::ReceivedOfferExpired { age } => age,
+                    RejectReason::ReceivedOfferExpired { age } => age,
                     _ => Duration::ZERO,
                 };
                 let args = [
                     cx.string(peer_id).upcast(),
                     create_id_arg(&mut cx, call_id.as_u64()),
-                    cx.string(reason_string).upcast(),
+                    cx.number(reason.discriminant() as i32).upcast(),
                     cx.number(age.as_secs_f64()).upcast(),
+                ];
+                let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
+                method.call(&mut cx, observer, args)?;
+            }
+
+            Event::CallState(peer_id, call_id, CallState::Ended(reason, summary)) => {
+                let method_name = "onCallEnded";
+                let js_summary = to_js_call_summary(&mut cx, summary)?;
+                let args = [
+                    cx.string(peer_id).upcast(),
+                    create_id_arg(&mut cx, call_id.as_u64()),
+                    cx.number(reason as i32).upcast(),
+                    js_summary.upcast(),
                 ];
                 let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
                 method.call(&mut cx, observer, args)?;
@@ -2354,7 +2609,8 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                     // All covered above.
                     CallState::Incoming(_) => "incoming",
                     CallState::Outgoing(_) => "outgoing",
-                    CallState::Ended(_) => "ended",
+                    CallState::Ended(_, _) => "ended",
+                    CallState::Rejected(_) => "rejected",
                 };
                 let args = [
                     cx.string(peer_id).upcast(),
@@ -2447,11 +2703,7 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 let http_method = method as i32;
                 let body = match body {
                     None => cx.undefined().upcast(),
-                    Some(body) => {
-                        let mut js_body = cx.buffer(body.len())?;
-                        js_body.as_mut_slice(&mut cx).copy_from_slice(&body);
-                        js_body.upcast()
-                    }
+                    Some(body) => JsUint8Array::from_slice(&mut cx, body.as_slice())?.upcast(),
                 };
                 let args = [
                     cx.number(request_id).upcast(),
@@ -2470,8 +2722,9 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 urgency,
             } => {
                 let method_name = "sendCallMessage";
-                let recipient_id = to_js_buffer(&mut cx, &recipient_id);
-                let message = to_js_buffer(&mut cx, &message);
+                let recipient_id =
+                    JsUint8Array::from_slice(&mut cx, recipient_id.as_slice())?.upcast();
+                let message = JsUint8Array::from_slice(&mut cx, message.as_slice())?.upcast();
                 let urgency = cx.number(urgency as i32).upcast();
                 let args = [recipient_id, message, urgency];
                 let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
@@ -2485,15 +2738,55 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 recipients_override,
             } => {
                 let method_name = "sendCallMessageToGroup";
-                let group_id = to_js_buffer(&mut cx, &group_id);
-                let message = to_js_buffer(&mut cx, &message);
+                let group_id = JsUint8Array::from_slice(&mut cx, group_id.as_slice())?.upcast();
+                let message = JsUint8Array::from_slice(&mut cx, message.as_slice())?.upcast();
                 let urgency = cx.number(urgency as i32).upcast();
                 let js_recipients = JsArray::new(&mut cx, recipients_override.len());
                 for (i, recipient_id) in recipients_override.iter().enumerate() {
-                    let js_recipient_id = to_js_buffer(&mut cx, recipient_id);
+                    let js_recipient_id =
+                        JsUint8Array::from_slice(&mut cx, recipient_id.as_slice())?;
                     js_recipients.set(&mut cx, i as u32, js_recipient_id)?;
                 }
                 let args = [group_id, message, urgency, js_recipients.upcast()];
+                let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
+                method.call(&mut cx, observer, args)?;
+            }
+
+            Event::SendCallMessageToAdhocGroup {
+                message,
+                urgency,
+                expiration,
+                recipients_to_endorsements,
+            } => {
+                let method_name = "sendCallMessageToAdhocGroup";
+                let message = JsUint8Array::from_slice(&mut cx, &message)?.upcast();
+                let urgency = cx.number(urgency as i32).upcast();
+                let expiration_millis = (1000 * expiration) as f64;
+                let js_expiration = cx.date(expiration_millis).map_err(|_| {
+                    cx.throw_error::<String, Handle<JsDate>>(format!(
+                        "Invalid expiration in epoch milliseconds: {expiration_millis}"
+                    ))
+                    .expect_err("throw_error always returns Err")
+                })?;
+                let js_recipients_to_endorsements =
+                    JsArray::new(&mut cx, recipients_to_endorsements.len());
+                for (i, (recipient_id, endorsement)) in
+                    recipients_to_endorsements.into_iter().enumerate()
+                {
+                    let js_recipient_id =
+                        JsUint8Array::from_slice(&mut cx, recipient_id.as_slice())?;
+                    let js_endorsement = JsUint8Array::from_slice(&mut cx, endorsement.as_slice())?;
+                    let obj = cx.empty_object();
+                    obj.set(&mut cx, "recipientId", js_recipient_id)?;
+                    obj.set(&mut cx, "endorsement", js_endorsement)?;
+                    js_recipients_to_endorsements.set(&mut cx, i as u32, obj)?;
+                }
+                let args = [
+                    message,
+                    urgency,
+                    js_expiration.upcast(),
+                    js_recipients_to_endorsements.upcast(),
+                ];
                 let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
                 method.call(&mut cx, observer, args)?;
             }
@@ -2563,27 +2856,7 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 let js_request_id = cx.number(request_id);
                 let (status, state_object) = match result {
                     Ok(state) => {
-                        let state_object = cx.empty_object();
-                        let js_name = cx.string(state.name);
-                        state_object.set(&mut cx, "name", js_name)?;
-                        let js_revoked = cx.boolean(state.revoked);
-                        state_object.set(&mut cx, "revoked", js_revoked)?;
-                        let js_restrictions = cx.number(match state.restrictions {
-                            call_links::CallLinkRestrictions::None => 0,
-                            call_links::CallLinkRestrictions::AdminApproval => 1,
-                            call_links::CallLinkRestrictions::Unknown => -1,
-                        });
-                        state_object.set(&mut cx, "rawRestrictions", js_restrictions)?;
-                        let js_expiration = cx
-                            .date(
-                                state
-                                    .expiration
-                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as f64,
-                            )
-                            .or_else(|e| cx.throw_range_error(e.to_string()))?;
-                        state_object.set(&mut cx, "expiration", js_expiration)?;
+                        let state_object = to_js_call_link_state(&mut cx, Some(&state))?;
                         (cx.number(200), state_object.upcast())
                     }
                     Err(status_code) => (cx.number(status_code.code), cx.undefined().upcast()),
@@ -2622,7 +2895,8 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 let js_remote_device_states = JsArray::new(&mut cx, remote_device_states.len());
                 for (i, remote_device_state) in remote_device_states.iter().enumerate() {
                     let demux_id = cx.number(remote_device_state.demux_id);
-                    let user_id = to_js_buffer(&mut cx, &remote_device_state.user_id);
+                    let user_id =
+                        JsUint8Array::from_slice(&mut cx, remote_device_state.user_id.as_slice())?;
                     let media_keys_received = cx.boolean(remote_device_state.media_keys_received);
                     let audio_muted: neon::handle::Handle<JsValue> =
                         match remote_device_state.heartbeat_state.audio_muted {
@@ -2727,11 +3001,13 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 method.call(&mut cx, observer, args)?;
             }
 
-            Event::GroupUpdate(GroupUpdate::Ended(client_id, reason)) => {
+            Event::GroupUpdate(GroupUpdate::Ended(client_id, reason, summary)) => {
                 let method_name = "handleEnded";
+                let js_summary = to_js_call_summary(&mut cx, summary)?;
                 let args = [
                     cx.number(client_id).upcast(),
                     cx.number(reason as i32).upcast(),
+                    js_summary.upcast(),
                 ];
                 with_call_endpoint(&mut cx, |endpoint| {
                     endpoint.incoming_video_sink.clear();
@@ -2751,9 +3027,9 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 let method_name = "groupCallRingUpdate";
 
                 let args = [
-                    to_js_buffer(&mut cx, &group_id).upcast::<JsValue>(),
+                    JsUint8Array::from_slice(&mut cx, group_id.as_slice())?.upcast(),
                     JsBigInt::from_i64(&mut cx, ring_id.into()).upcast(),
-                    to_js_buffer(&mut cx, &sender_id).upcast(),
+                    JsUint8Array::from_slice(&mut cx, sender_id.as_slice())?.upcast(),
                     cx.number(update as i32).upcast(),
                 ];
                 let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
@@ -2839,6 +3115,55 @@ fn processEvents(mut cx: FunctionContext) -> JsResult<JsValue> {
                 let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
                 method.call(&mut cx, observer, args)?;
             }
+            Event::GroupUpdate(GroupUpdate::SpeechEvent(client_id, event)) => {
+                let method_name = "handleSpeechEvent";
+                let args = [
+                    cx.number(client_id).upcast(),
+                    cx.number(event as i32).upcast(),
+                ];
+                let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
+                method.call(&mut cx, observer, args)?;
+            }
+            Event::GroupUpdate(GroupUpdate::RemoteMute {
+                client_id,
+                mute_source,
+            }) => {
+                let method_name = "onRemoteMute";
+                let args = [
+                    cx.number(client_id).upcast(),
+                    cx.number(mute_source).upcast(),
+                ];
+                let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
+                method.call(&mut cx, observer, args)?;
+            }
+            Event::GroupUpdate(GroupUpdate::ObservedRemoteMute {
+                client_id,
+                mute_source,
+                mute_target,
+            }) => {
+                let method_name = "onObservedRemoteMute";
+                let args = [
+                    cx.number(client_id).upcast(),
+                    cx.number(mute_source).upcast(),
+                    cx.number(mute_target).upcast(),
+                ];
+                let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
+                method.call(&mut cx, observer, args)?;
+            }
+            Event::OutputDeviceChanged(devices) => {
+                let method_name = "onOutputDeviceChanged";
+                let js_devices = devices_to_js_array(&mut cx, devices)?;
+                let args = [js_devices.upcast()];
+                let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
+                method.call(&mut cx, observer, args)?;
+            }
+            Event::InputDeviceChanged(devices) => {
+                let method_name = "onInputDeviceChanged";
+                let js_devices = devices_to_js_array(&mut cx, devices)?;
+                let args = [js_devices.upcast()];
+                let method = observer.get::<JsFunction, _, _>(&mut cx, method_name)?;
+                method.call(&mut cx, observer, args)?;
+            }
         }
     }
     Ok(cx.undefined().upcast())
@@ -2852,21 +3177,17 @@ fn callIdFromEra(mut cx: FunctionContext) -> JsResult<JsValue> {
 }
 
 #[allow(non_snake_case)]
-fn CallLinkRootKey_parse(mut cx: FunctionContext) -> JsResult<JsBuffer> {
+fn CallLinkRootKey_parse(mut cx: FunctionContext) -> JsResult<JsUint8Array> {
     let string = cx.argument::<JsString>(0)?.value(&mut cx);
     match CallLinkRootKey::try_from(string.as_str()) {
-        Ok(key) => {
-            let mut buffer = cx.buffer(key.bytes().len())?;
-            buffer.as_mut_slice(&mut cx).copy_from_slice(&key.bytes());
-            Ok(buffer)
-        }
+        Ok(key) => JsUint8Array::from_slice(&mut cx, key.as_slice()),
         Err(e) => cx.throw_error(e.to_string()),
     }
 }
 
 #[allow(non_snake_case)]
 fn CallLinkRootKey_validate(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    let bytes = cx.argument::<JsBuffer>(0)?;
+    let bytes = cx.argument::<JsUint8Array>(0)?;
     match CallLinkRootKey::try_from(bytes.as_slice(&cx)) {
         Ok(_) => Ok(cx.undefined()),
         Err(e) => cx.throw_error(e.to_string()),
@@ -2874,30 +3195,24 @@ fn CallLinkRootKey_validate(mut cx: FunctionContext) -> JsResult<JsUndefined> {
 }
 
 #[allow(non_snake_case)]
-fn CallLinkRootKey_generate(mut cx: FunctionContext) -> JsResult<JsBuffer> {
-    let key = CallLinkRootKey::generate(rand::rngs::OsRng);
-    let mut buffer = cx.buffer(key.bytes().len())?;
-    buffer.as_mut_slice(&mut cx).copy_from_slice(&key.bytes());
-    Ok(buffer)
+fn CallLinkRootKey_generate(mut cx: FunctionContext) -> JsResult<JsUint8Array> {
+    let key = CallLinkRootKey::generate(UnwrapErr(rand::rngs::SysRng));
+    JsUint8Array::from_slice(&mut cx, key.as_slice())
 }
 
 #[allow(non_snake_case)]
-fn CallLinkRootKey_generateAdminPasskey(mut cx: FunctionContext) -> JsResult<JsBuffer> {
-    let passkey = CallLinkRootKey::generate_admin_passkey(rand::rngs::OsRng);
-    let mut buffer = cx.buffer(passkey.len())?;
-    buffer.as_mut_slice(&mut cx).copy_from_slice(&passkey);
-    Ok(buffer)
+fn CallLinkRootKey_generateAdminPasskey(mut cx: FunctionContext) -> JsResult<JsUint8Array> {
+    let passkey = CallLinkRootKey::generate_admin_passkey(UnwrapErr(rand::rngs::SysRng));
+    JsUint8Array::from_slice(&mut cx, passkey.as_slice())
 }
 
 #[allow(non_snake_case)]
-fn CallLinkRootKey_deriveRoomId(mut cx: FunctionContext) -> JsResult<JsBuffer> {
-    let bytes = cx.argument::<JsBuffer>(0)?;
+fn CallLinkRootKey_deriveRoomId(mut cx: FunctionContext) -> JsResult<JsUint8Array> {
+    let bytes = cx.argument::<JsUint8Array>(0)?;
     match CallLinkRootKey::try_from(bytes.as_slice(&cx)) {
         Ok(key) => {
             let room_id = key.derive_room_id();
-            let mut buffer = cx.buffer(room_id.len())?;
-            buffer.as_mut_slice(&mut cx).copy_from_slice(&room_id);
-            Ok(buffer)
+            JsUint8Array::from_slice(&mut cx, room_id.as_slice())
         }
         Err(e) => cx.throw_error(e.to_string()),
     }
@@ -2905,10 +3220,22 @@ fn CallLinkRootKey_deriveRoomId(mut cx: FunctionContext) -> JsResult<JsBuffer> {
 
 #[allow(non_snake_case)]
 fn CallLinkRootKey_toFormattedString(mut cx: FunctionContext) -> JsResult<JsString> {
-    let bytes = cx.argument::<JsBuffer>(0)?;
+    let bytes = cx.argument::<JsUint8Array>(0)?;
     match CallLinkRootKey::try_from(bytes.as_slice(&cx)) {
         Ok(key) => {
             let result = key.to_formatted_string();
+            Ok(cx.string(result))
+        }
+        Err(e) => cx.throw_error(e.to_string()),
+    }
+}
+
+#[allow(non_snake_case)]
+fn CallLinkRootKey_toRedactedString(mut cx: FunctionContext) -> JsResult<JsString> {
+    let bytes = cx.argument::<JsUint8Array>(0)?;
+    match CallLinkRootKey::try_from(bytes.as_slice(&cx)) {
+        Ok(key) => {
+            let result = key.to_redacted_string();
             Ok(cx.string(result))
         }
         Err(e) => cx.throw_error(e.to_string()),
@@ -2932,11 +3259,16 @@ fn register(mut cx: ModuleContext) -> NeonResult<()> {
         "CallLinkRootKey_toFormattedString",
         CallLinkRootKey_toFormattedString,
     )?;
+    cx.export_function(
+        "CallLinkRootKey_toRedactedString",
+        CallLinkRootKey_toRedactedString,
+    )?;
 
     let js_property_key = cx.string(CALL_ENDPOINT_PROPERTY_KEY);
     cx.export_value("callEndpointPropertyKey", js_property_key)?;
 
     cx.export_function("cm_setSelfUuid", setSelfUuid)?;
+    cx.export_function("cm_addAsset", addAsset)?;
     cx.export_function("cm_createOutgoingCall", createOutgoingCall)?;
     cx.export_function("cm_cancelGroupRing", cancelGroupRing)?;
     cx.export_function("cm_proceed", proceed)?;
@@ -2955,6 +3287,7 @@ fn register(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("cm_receivedHttpResponse", receivedHttpResponse)?;
     cx.export_function("cm_httpRequestFailed", httpRequestFailed)?;
     cx.export_function("cm_setOutgoingAudioEnabled", setOutgoingAudioEnabled)?;
+    cx.export_function("cm_setMicrophoneWarmupEnabled", setMicrophoneWarmupEnabled)?;
     cx.export_function("cm_setOutgoingVideoEnabled", setOutgoingVideoEnabled)?;
     cx.export_function(
         "cm_setOutgoingVideoIsScreenShare",
@@ -2971,6 +3304,11 @@ fn register(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("cm_leave", leave)?;
     cx.export_function("cm_disconnect", disconnect)?;
     cx.export_function("cm_setOutgoingAudioMuted", setOutgoingAudioMuted)?;
+    cx.export_function(
+        "cm_setOutgoingAudioMutedRemotely",
+        setOutgoingAudioMutedRemotely,
+    )?;
+    cx.export_function("cm_sendRemoteMuteRequest", sendRemoteMuteRequest)?;
     cx.export_function("cm_setOutgoingVideoMuted", setOutgoingVideoMuted)?;
     cx.export_function("cm_setPresenting", setPresenting)?;
     cx.export_function(
@@ -2999,6 +3337,7 @@ fn register(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("cm_setAudioInput", setAudioInput)?;
     cx.export_function("cm_getAudioOutputs", getAudioOutputs)?;
     cx.export_function("cm_setAudioOutput", setAudioOutput)?;
+    cx.export_function("cm_setVoiceProcessingEnabled", setVoiceProcessingEnabled)?;
     cx.export_function("cm_setRtcStatsInterval", setRtcStatsInterval)?;
     cx.export_function("cm_processEvents", processEvents)?;
     Ok(())

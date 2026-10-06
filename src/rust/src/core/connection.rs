@@ -5,50 +5,61 @@
 
 //! A peer-to-peer connection interface.
 
-use std::fmt;
-use std::net::SocketAddr;
-use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread;
-use std::time::{Duration, SystemTime};
+use std::{
+    fmt,
+    net::SocketAddr,
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender},
+    },
+    thread,
+    time::{Duration, SystemTime},
+};
 
-use bytes::{BufMut, BytesMut};
-
-use prost::Message;
-
+use bytes::BytesMut;
 use hkdf::Hkdf;
-use rand::rngs::OsRng;
+use prost::Message;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::common::actor::{Actor, Stopper};
-use crate::common::{
-    units::DataRate, CallConfig, CallDirection, CallId, CallMediaType, ConnectionState, DataMode,
-    DeviceId, Result, RingBench,
+use crate::{
+    common::{
+        CallConfig, CallDirection, CallId, CallMediaType, ConnectionState, DataMode, DeviceId,
+        EVENT_QUEUE_SIZE, Result, RingBench, TERMINATE_TIMEOUT,
+        actor::{Actor, Stopper},
+        slice::SafeSlicing,
+        units::DataRate,
+    },
+    core::{
+        call::Call,
+        call_mutex::CallMutex,
+        connection_fsm::{ConnectionEvent, ConnectionStateMachine},
+        platform::Platform,
+        signaling,
+        util::{self, ptr_as_box, redact_string},
+    },
+    error::RingRtcError,
+    lite::sfu::DemuxId,
+    protobuf,
+    webrtc::{
+        self,
+        ice_gatherer::IceGatherer,
+        media::{MediaStream, VideoFrame, VideoFrameMetadata, VideoSink},
+        peer_connection::{AudioLevel, PeerConnection, Protocol, SendRates},
+        peer_connection_observer::{
+            IceConnectionState, NetworkAdapterType, NetworkRoute, PeerConnectionObserverTrait,
+            TransportProtocol,
+        },
+        rtp,
+        rtp_observer::{RffiRtpObserver, RtpObserver, RtpObserverTrait},
+        sdp_observer::{
+            SessionDescription, SrtpCryptoSuite, SrtpKey, create_csd_observer, create_ssd_observer,
+        },
+        stats_observer::{StatsObserver, StatsSnapshotConsumer, create_stats_observer},
+    },
 };
-use crate::core::call::Call;
-use crate::core::call_mutex::CallMutex;
-use crate::core::connection_fsm::{ConnectionEvent, ConnectionStateMachine};
-use crate::core::platform::Platform;
-use crate::core::signaling;
-use crate::core::util::{ptr_as_box, redact_string};
-use crate::error::RingRtcError;
-use crate::lite::sfu::DemuxId;
-use crate::protobuf;
-
-use crate::webrtc;
-use crate::webrtc::ice_gatherer::IceGatherer;
-use crate::webrtc::media::{MediaStream, VideoFrame, VideoFrameMetadata, VideoSink};
-use crate::webrtc::peer_connection::{AudioLevel, PeerConnection, SendRates};
-use crate::webrtc::peer_connection_observer::{
-    IceConnectionState, NetworkAdapterType, NetworkRoute, PeerConnectionObserverTrait,
-    TransportProtocol,
-};
-use crate::webrtc::rtp;
-use crate::webrtc::sdp_observer::{
-    create_csd_observer, create_ssd_observer, SessionDescription, SrtpCryptoSuite, SrtpKey,
-};
-use crate::webrtc::stats_observer::{create_stats_observer, StatsObserver};
 
 /// Used to generate stats, to retransmit RTP messages, and to get audio levels.
 const TICK_INTERVAL_MILLIS: u64 = 200;
@@ -75,10 +86,7 @@ const DELAY_FOR_RECOVERED_BWE_CALLBACK_TICKS: u64 =
     DELAY_FOR_RECOVERED_BWE_CALLBACK_MILLIS / TICK_INTERVAL_MILLIS;
 
 pub const RTP_DATA_PAYLOAD_TYPE: rtp::PayloadType = 101;
-pub const OLD_RTP_DATA_SSRC_FOR_OUTGOING: rtp::Ssrc = 1001;
-pub const OLD_RTP_DATA_SSRC_FOR_INCOMING: rtp::Ssrc = 2001;
-pub const OLD_RTP_DATA_RESERVED: [u8; 4] = [0, 0, 0, 0];
-pub const NEW_RTP_DATA_SSRC: rtp::Ssrc = 0xD;
+pub const RTP_DATA_SSRC: rtp::Ssrc = 0xD;
 
 /// Connection observer status notification types
 /// Sent from the Connection to the parent Call object
@@ -96,6 +104,16 @@ pub enum ConnectionObserverEvent {
 
     /// The ICE network route changed
     IceNetworkRouteChanged(NetworkRoute),
+
+    /// ICE connection established. This event is always dispatched along with a
+    /// device ID identifying the device with which ICE connection has been
+    /// established. It is possible and likely to receive multiple IceConnected
+    /// events for each device.
+    IceConnected,
+
+    /// ICE connection lost. This event is always dispatched along with a device
+    /// ID identifying the device with which ICE connection has been lost.
+    IceDisconnected,
 
     AudioLevels {
         captured_level: AudioLevel,
@@ -137,6 +155,8 @@ where
     last_sent_rtp_data_timestamp: rtp::Timestamp,
     /// Raw pointer to Connection object for PeerConnectionObserver
     connection_ptr: Option<webrtc::ptr::Owned<Connection<T>>>,
+    /// RTP observer for the PeerConnection
+    rtp_observer_ptr: Option<webrtc::ptr::Unique<RffiRtpObserver>>,
     /// Application-specific incoming media
     incoming_media: Option<<T as Platform>::AppIncomingMedia>,
     /// Application specific peer connection
@@ -369,6 +389,8 @@ where
     buffered_local_ice_candidates: Arc<CallMutex<Vec<signaling::IceCandidate>>>,
     /// Condition variable used at termination to quiesce and synchronize the FSM.
     terminate_condvar: Arc<(Mutex<bool>, Condvar)>,
+    /// Set when the connection has been asked to terminate.
+    terminate_requested: Arc<AtomicBool>,
     /// This is write-once configuration and will not change.
     connection_type: ConnectionType,
     /// Execution context for the connection periodic timer tick
@@ -461,6 +483,7 @@ where
             poll_stats_config: self.poll_stats_config,
             buffered_local_ice_candidates: Arc::clone(&self.buffered_local_ice_candidates),
             terminate_condvar: Arc::clone(&self.terminate_condvar),
+            terminate_requested: Arc::clone(&self.terminate_requested),
             connection_type: self.connection_type,
             tick_context: self.tick_context.clone(),
             accumulated_rtp_data_message: Arc::clone(&self.accumulated_rtp_data_message),
@@ -485,7 +508,7 @@ where
         incoming_video_sink: Option<Box<dyn VideoSink>>,
     ) -> Result<Self> {
         // Create a FSM worker for this connection.
-        let (fsm_sender, fsm_receiver) = std::sync::mpsc::sync_channel(256);
+        let (fsm_sender, fsm_receiver) = std::sync::mpsc::sync_channel(EVENT_QUEUE_SIZE);
 
         let call_id = call.call_id();
         let direction = call.direction();
@@ -494,6 +517,7 @@ where
             peer_connection: None,
             last_sent_rtp_data_timestamp: 0,
             connection_ptr: None,
+            rtp_observer_ptr: None,
             incoming_media: None,
             app_connection: None,
             stats_observer: None,
@@ -535,6 +559,7 @@ where
                 "buffered_local_ice_candidates",
             )),
             terminate_condvar: Arc::new((Mutex::new(false), Condvar::new())),
+            terminate_requested: Arc::new(AtomicBool::new(false)),
             connection_type,
             tick_context: Actor::start("tick_context", Stopper::new(), |actor| {
                 Ok(TickState {
@@ -577,6 +602,17 @@ where
         Ok(())
     }
 
+    pub fn set_stats_snapshot_consumer(
+        &mut self,
+        consumer: Box<dyn StatsSnapshotConsumer>,
+    ) -> Result<()> {
+        let mut webrtc = self.webrtc.lock()?;
+        if let Some(stats_observer) = &mut webrtc.stats_observer {
+            stats_observer.set_stats_snapshot_consumer(consumer);
+        }
+        Ok(())
+    }
+
     // An outgoing parent is responsible for:
     // 1. Creating ICE gatherer that can be used multiple times (ICE forking)
     // 2. Creating an offer that can be used multiple times (call forking)
@@ -597,13 +633,14 @@ where
             let ice_gatherer = peer_connection.create_shared_ice_gatherer()?;
             peer_connection.use_shared_ice_gatherer(&ice_gatherer)?;
 
-            let observer = create_csd_observer();
+            // Start with asymmetric negotiation, and fall back if needed.
+            let observer = create_csd_observer(Some(true));
             peer_connection.create_offer(observer.as_ref());
             // This must be kept in sync with call.rs where it passes in V2 into create_connection.
             let offer = observer.get_result()?;
 
             // We have to do this before we pass ownership of offer_sdi into set_local_description.
-            let (local_secret, local_public_key) = generate_local_secret_and_public_key()?;
+            let (local_secret, local_public_key) = generate_local_secret_and_public_key();
             let v4_offer = offer.to_v4(
                 local_public_key.as_bytes().to_vec(),
                 &self.call_config,
@@ -611,13 +648,24 @@ where
             )?;
 
             info!(
-                "Outgoing offer codecs: {:?}, max_bitrate: {:?}",
-                v4_offer.receive_video_codecs, v4_offer.max_bitrate_bps
+                "Outgoing offer: bidirectional codecs: {:?}, encode codecs: {:?}, decode codecs: {:?}, max_bitrate: {:?}",
+                v4_offer.receive_video_codecs,
+                v4_offer.encode_only_video_codecs,
+                v4_offer.decode_only_video_codecs,
+                v4_offer.max_bitrate_bps
             );
 
-            if v4_offer.receive_video_codecs.is_empty() {
+            // For backwards compatibility, we require that clients send all 3 of these in
+            // outgoing offers.
+            // Note that this will **NOT** limit later removal of the receive_video_codecs field,
+            // because this is outgoing-offer-only.
+            // We need to be less strict about what we receive.
+            if v4_offer.receive_video_codecs.is_empty()
+                || v4_offer.encode_only_video_codecs.is_empty()
+                || v4_offer.decode_only_video_codecs.is_empty()
+            {
                 warn!(
-                    "No receive video codecs in outgoing offer. SDP:\n{}",
+                    "A required video codec field in outgoing offer is empty. SDP:\n{}",
                     redact_string(offer.to_sdp().as_deref().unwrap_or("None"))
                 );
             }
@@ -635,7 +683,7 @@ where
         })();
 
         // Always start the FSM no matter what happened above because
-        // close() relies on it running.
+        // terminate() relies on it running.
         self.start_fsm()?;
         result
     }
@@ -668,32 +716,56 @@ where
 
             peer_connection.use_shared_ice_gatherer(ice_gatherer)?;
 
+            // NOTE: create_send_only_transceiver must be called before create_offer.
+            // Otherwise, WebRTC would not properly create transceivers to match the SDP, and call
+            // negotiation will fail.
+            // (To a user this would look like the call never ringing for the callee and the call
+            // hanging up after ringing once for the caller.)
+            if !peer_connection.create_send_only_transceiver() {
+                anyhow::bail!("Couldn't create send-only transceiver for video");
+            }
+
             // Call create_offer again for the side effects it has with setting up the state of the
             // RtpTransceivers:
             // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/pc/sdp_offer_answer.cc;l=4307-4312;drc=a6544377bc1dde24394255c0c83b43dcaa8905db
-            let observer = create_csd_observer();
+            let observer = create_csd_observer(Some(true));
             peer_connection.create_offer(observer.as_ref());
             let _ = observer.get_result()?;
 
-            let (mut offer, mut answer, remote_public_key) =
-                if let (Some(v4_offer), Some(v4_answer)) = (offer.to_v4(), received.answer.to_v4())
+            let (mut offer, mut answer, remote_public_key) = if let (
+                Some(mut v4_offer),
+                Some(v4_answer),
+            ) =
+                (offer.to_v4(), received.answer.to_v4())
+            {
+                if v4_answer.encode_only_video_codecs.is_empty()
+                    || v4_answer.decode_only_video_codecs.is_empty()
                 {
-                    // Set the remote max based on the bitrate in the answer.
-                    bandwidth_controller.remote_max =
-                        v4_answer.max_bitrate_bps.map(DataRate::from_bps);
+                    // This indicates that the remote doesn't support asymmetric, so clear these to force
+                    // us back into the legacy path.
+                    v4_offer.encode_only_video_codecs.clear();
+                    v4_offer.decode_only_video_codecs.clear();
+                }
+                // Set the remote max based on the bitrate in the answer.
+                bandwidth_controller.remote_max = v4_answer.max_bitrate_bps.map(DataRate::from_bps);
 
-                    let offer = SessionDescription::offer_from_v4(&v4_offer, &self.call_config)?;
-                    let answer = SessionDescription::answer_from_v4(&v4_answer, &self.call_config)?;
+                let offer = SessionDescription::offer_from_v4(&v4_offer, &self.call_config, true)?;
+                let answer =
+                    SessionDescription::answer_from_v4(&v4_answer, &self.call_config, false)?;
 
-                    info!(
-                    "Incoming answer codecs: {:?}, max_bitrate: {:?}, bandwidth_controller: {:?}",
-                    v4_answer.receive_video_codecs, v4_answer.max_bitrate_bps, bandwidth_controller
+                info!(
+                    "Incoming answer: bidirectional codecs: {:?}, encode codecs: {:?}, decode codecs: {:?}, max_bitrate: {:?}, bandwidth_controller: {:?}",
+                    v4_answer.receive_video_codecs,
+                    v4_answer.encode_only_video_codecs,
+                    v4_answer.decode_only_video_codecs,
+                    v4_answer.max_bitrate_bps,
+                    bandwidth_controller
                 );
 
-                    (offer, answer, v4_answer.public_key)
-                } else {
-                    return Err(RingRtcError::UnknownSignaledProtocolVersion.into());
-                };
+                (offer, answer, v4_answer.public_key)
+            } else {
+                return Err(RingRtcError::UnknownSignaledProtocolVersion.into());
+            };
 
             if let Some(remote_public_key) = remote_public_key {
                 let callee_identity_key = &received.sender_identity_key;
@@ -730,6 +802,7 @@ where
             observer.get_result()?;
 
             peer_connection.configure_audio_encoders(&self.call_config.audio_encoder_config);
+            peer_connection.configure_audio_decoders(&self.call_config.audio_decoder_config);
 
             self.apply_bandwidth_controller(&mut bandwidth_controller, &mut webrtc)?;
 
@@ -741,7 +814,7 @@ where
         // checks the state and because we don't want to do things (like
         // handle ICE connected events) until after everything is set up.
         // Always start the FSM no matter what happened above because
-        // close() relies on it running.
+        // terminate() relies on it running.
         self.start_fsm()?;
         result
     }
@@ -776,18 +849,22 @@ where
                 bandwidth_controller.remote_max = v4_offer.max_bitrate_bps.map(DataRate::from_bps);
 
                 info!(
-                    "Incoming offer codecs: {:?}, max_bitrate: {:?}, bandwidth_controller: {:?}",
-                    v4_offer.receive_video_codecs, v4_offer.max_bitrate_bps, bandwidth_controller
+                    "Incoming offer: bidirectional codecs: {:?}, encode codecs: {:?}, decode codecs: {:?}, max_bitrate: {:?}, bandwidth_controller: {:?}",
+                    v4_offer.receive_video_codecs,
+                    v4_offer.encode_only_video_codecs,
+                    v4_offer.decode_only_video_codecs,
+                    v4_offer.max_bitrate_bps,
+                    bandwidth_controller
                 );
 
-                let offer = SessionDescription::offer_from_v4(v4_offer, &self.call_config)?;
+                let offer = SessionDescription::offer_from_v4(v4_offer, &self.call_config, false)?;
 
                 (offer, v4_offer.public_key.clone())
             } else {
                 return Err(RingRtcError::UnknownSignaledProtocolVersion.into());
             };
 
-            let (local_secret, local_public_key) = generate_local_secret_and_public_key()?;
+            let (local_secret, local_public_key) = generate_local_secret_and_public_key();
             let answer_key = match remote_public_key {
                 None => None,
                 Some(remote_public_key) => {
@@ -808,12 +885,13 @@ where
             };
 
             let observer = create_ssd_observer();
+            let offer_supports_asymmetric = offer.supports_asymmetric;
             peer_connection.set_remote_description(observer.as_ref(), offer);
             // on_add_stream can happen while SetRemoteDescription is happening.
             // But they won't be processed until start_fsm() is called below.
             observer.get_result()?;
 
-            let observer = create_csd_observer();
+            let observer = create_csd_observer(offer_supports_asymmetric);
             peer_connection.create_answer(observer.as_ref());
             let mut answer = observer.get_result()?;
             if let Some(answer_key) = &answer_key {
@@ -828,12 +906,16 @@ where
                 )?;
 
                 info!(
-                    "Outgoing answer codecs: {:?}, max_bitrate: {:?}, bandwidth_controller: {:?}",
-                    v4_answer.receive_video_codecs, v4_answer.max_bitrate_bps, bandwidth_controller
+                    "Outgoing answer: bidirectional codecs: {:?}, encode codecs: {:?}, decode codecs: {:?}, max_bitrate: {:?}, bandwidth_controller: {:?}",
+                    v4_answer.receive_video_codecs,
+                    v4_answer.encode_only_video_codecs,
+                    v4_answer.decode_only_video_codecs,
+                    v4_answer.max_bitrate_bps,
+                    bandwidth_controller
                 );
 
                 // We have to change the local answer to match what we send back
-                answer = SessionDescription::answer_from_v4(&v4_answer, &self.call_config)?;
+                answer = SessionDescription::answer_from_v4(&v4_answer, &self.call_config, true)?;
                 // And we have to make sure to do this again since answer_from_v4 doesn't do it.
                 if let Some(answer_key) = &answer_key {
                     answer.disable_dtls_and_set_srtp_key(answer_key)?;
@@ -856,6 +938,7 @@ where
             observer.get_result()?;
 
             peer_connection.configure_audio_encoders(&self.call_config.audio_encoder_config);
+            peer_connection.configure_audio_decoders(&self.call_config.audio_decoder_config);
 
             self.apply_bandwidth_controller(&mut bandwidth_controller, &mut webrtc)?;
 
@@ -866,7 +949,7 @@ where
             );
 
             let peer_connection = webrtc.peer_connection()?;
-            self.add_and_remove_remote_ice_candidates(peer_connection, &remote_ice_candidates)?;
+            self.add_and_remove_remote_ice_candidates(peer_connection, &remote_ice_candidates);
 
             self.set_state(ConnectionState::ConnectingBeforeAccepted)?;
             Ok(answer_to_send)
@@ -876,7 +959,7 @@ where
         // checks the state and because we don't want to do things (like
         // handle ICE connected events) until after everything is set up.
         // Always start the FSM no matter what happened above because
-        // close() relies on it running.
+        // terminate() relies on it running.
         self.start_fsm()?;
         result
     }
@@ -933,6 +1016,24 @@ where
 
     /// Update the current network route.
     pub fn set_network_route(&self, network_route: NetworkRoute) -> Result<()> {
+        if let Ok(mut webrtc) = self
+            .webrtc
+            .lock()
+            .inspect_err(|e| error!("couldn't get webrtc lock: {}", e))
+            && let Ok(old_network_route) = self.network_route()
+            && (old_network_route.local_relayed != network_route.local_relayed
+                || old_network_route.remote_relayed != network_route.remote_relayed
+                || old_network_route.local_relay_protocol != network_route.local_relay_protocol)
+        {
+            if let Some(observer) = webrtc.stats_observer.as_mut() {
+                observer.set_network_route(network_route);
+            }
+            if let Some(observer) = webrtc.stats_observer.as_ref()
+                && let Ok(peer_connection) = webrtc.peer_connection()
+            {
+                let _ = peer_connection.get_stats(observer);
+            }
+        }
         self.update_bandwidth_controller(move |bandwidth_controller| {
             if bandwidth_controller.network_route == network_route {
                 // Nothing changed
@@ -950,7 +1051,14 @@ where
 
     /// Update the PeerConnection.
     pub fn set_peer_connection(&self, peer_connection: PeerConnection) -> Result<()> {
+        // Create the RtpObserver, set it on the PeerConnection, and store it.
+        let connection_ptr = self.get_connection_ptr()?;
+        let rtp_observer = RtpObserver::new(connection_ptr)?;
+        let rtp_observer_ptr = rtp_observer.into_rffi();
+        peer_connection.set_rtp_packet_observer(rtp_observer_ptr.borrow());
+
         let mut webrtc = self.webrtc.lock()?;
+        webrtc.rtp_observer_ptr = Some(rtp_observer_ptr);
         webrtc.peer_connection = Some(peer_connection);
         Ok(())
     }
@@ -1010,13 +1118,9 @@ where
         }
     }
 
-    /// Returns `true` if the call is terminating.
+    /// Returns `true` if the call is terminating or already terminated..
     pub fn terminating(&self) -> Result<bool> {
-        if let ConnectionState::Terminating = self.state()? {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(self.state()?.terminating_or_terminated())
     }
 
     /// Clone the Connection, Box it and return a raw pointer to the Box.
@@ -1134,7 +1238,7 @@ where
     pub fn tick(&mut self, ticks_elapsed: u64) -> Result<()> {
         let mut webrtc = self.webrtc.lock()?;
 
-        if ticks_elapsed % SEND_RTP_DATA_MESSAGE_INTERVAL_TICKS == 0 {
+        if ticks_elapsed.is_multiple_of(SEND_RTP_DATA_MESSAGE_INTERVAL_TICKS) {
             self.send_latest_rtp_data_message(&mut webrtc)?;
         }
 
@@ -1151,7 +1255,7 @@ where
         if let Some(audio_levels_interval) = self.audio_levels_interval {
             let audio_levels_interval_ticks =
                 (audio_levels_interval.as_millis() as u64) / TICK_INTERVAL_MILLIS;
-            if ticks_elapsed % audio_levels_interval_ticks == 0 {
+            if ticks_elapsed.is_multiple_of(audio_levels_interval_ticks) {
                 let (captured_level, received_levels) =
                     webrtc.peer_connection()?.get_audio_levels();
                 let received_level = received_levels
@@ -1168,7 +1272,7 @@ where
             }
         }
 
-        if ticks_elapsed % CHECK_BWE_INTERVAL_TICKS == 0 {
+        if ticks_elapsed.is_multiple_of(CHECK_BWE_INTERVAL_TICKS) {
             match self.bwe_callback_state {
                 BweCallbackState::CheckIfLow { delayed_check_tick } => {
                     let is_video_enabled = self
@@ -1281,7 +1385,8 @@ where
         let webrtc = self.webrtc.lock()?;
         let pc = webrtc.peer_connection()?;
 
-        self.add_and_remove_remote_ice_candidates(pc, &ice.candidates)
+        self.add_and_remove_remote_ice_candidates(pc, &ice.candidates);
+        Ok(())
     }
 
     // This is where we differentiate between received candidate additions and removals.
@@ -1289,11 +1394,13 @@ where
         &self,
         pc: &PeerConnection,
         remote_ice_candidates: &[signaling::IceCandidate],
-    ) -> Result<()> {
+    ) {
         let mut added_sdps = vec![];
         let mut removed_addresses = vec![];
+        let mut removed_ports = vec![];
         for candidate in remote_ice_candidates {
             if let Some(removed_address) = candidate.removed_address() {
+                removed_ports.push(removed_address.port());
                 removed_addresses.push(removed_address);
                 // We don't add a candidate if it's both added and removed because of
                 // the backwards-compatibility mechanism we have that contains a dummy
@@ -1313,15 +1420,21 @@ where
             )
         );
 
+        if !removed_ports.is_empty() {
+            info!("Remote ICE candidates removed; ports: {:?}", removed_ports);
+        }
+
         for added_sdp in added_sdps {
             if let Err(e) = pc.add_ice_candidate_from_sdp(&added_sdp) {
                 warn!("Failed to add ICE candidate: {:?}", e);
             }
         }
-        if !removed_addresses.is_empty() {
-            pc.remove_ice_candidates(removed_addresses.into_iter());
+        if !removed_addresses.is_empty()
+            && let Err(e) =
+                pc.remove_ice_candidates(removed_addresses.iter(), false, &Protocol::Udp)
+        {
+            warn!("Failed to remove ICE candidate: {:?}", e);
         }
-        Ok(())
     }
 
     /// Send a hangup message to the remote peer via RTP data.
@@ -1460,19 +1573,14 @@ where
         webrtc_data: &mut std::sync::MutexGuard<WebRtcData<T>>,
         data: &protobuf::rtp_data::Message,
     ) -> Result<()> {
-        let mut bytes = BytesMut::with_capacity(OLD_RTP_DATA_RESERVED.len() + data.encoded_len());
-        bytes.put_slice(&OLD_RTP_DATA_RESERVED);
+        let mut bytes = BytesMut::with_capacity(data.encoded_len());
         data.encode(&mut bytes)?;
 
         // At 1hz, this would take 136 years to roll over.
         webrtc_data.last_sent_rtp_data_timestamp += 1;
         let header = rtp::Header {
             pt: RTP_DATA_PAYLOAD_TYPE,
-            // TODO: Once all clients are updated to accept the NEW_RTP_DATA_SSRC, use that.
-            ssrc: match self.direction {
-                CallDirection::Incoming => OLD_RTP_DATA_SSRC_FOR_INCOMING,
-                CallDirection::Outgoing => OLD_RTP_DATA_SSRC_FOR_OUTGOING,
-            },
+            ssrc: RTP_DATA_SSRC,
             // This has to be incremented to make sure SRTP functions properly, but rollovers are OK.
             seqnum: webrtc_data.last_sent_rtp_data_timestamp as rtp::SequenceNumber,
             // Just imagine the clock is the number of heartbeat ticks :).
@@ -1532,21 +1640,33 @@ where
         self.set_incoming_media(incoming_media)
     }
 
-    /// Connect incoming media (stored by webrtc.incoming_media) to the call, and enable
-    /// audio playout, incoming and outgoing RTP, and finally audio recording. The client
-    /// should be notified that media is flowing.
+    /// Connect incoming media (stored by webrtc.incoming_media) to the call and start
+    /// audio and RTP flows. The client should be notified that media is flowing.
     pub fn enable_media(&self) -> Result<()> {
         info!("enable_media(): id: {}", self.connection_id);
 
         #[cfg(feature = "call_sim")]
         thread::sleep(Duration::from_millis(20));
 
+        StatsObserver::print_headers();
+
         let webrtc = self.webrtc.lock()?;
         let pc = webrtc.peer_connection()?;
-        pc.set_audio_playout_enabled(true);
-        pc.set_incoming_media_enabled(true);
-        pc.set_outgoing_media_enabled(true);
-        pc.set_audio_recording_enabled(true);
+        if self.direction() == CallDirection::Incoming {
+            // callee dictates accept timing and can send media first
+            // so setup outgoing/recording before setting up incoming/playout
+            pc.set_outgoing_media_enabled(true);
+            pc.set_audio_recording_enabled(true);
+            pc.set_audio_playout_enabled(true);
+            pc.set_incoming_media_enabled(true);
+        } else {
+            // caller waits for accept and prioritizes receiving media first
+            // so setup incoming/playout before setting up outgoing/recording
+            pc.set_audio_playout_enabled(true);
+            pc.set_incoming_media_enabled(true);
+            pc.set_outgoing_media_enabled(true);
+            pc.set_audio_recording_enabled(true);
+        }
 
         let incoming_media = match webrtc.incoming_media.as_ref() {
             Some(v) => v,
@@ -1555,12 +1675,27 @@ where
                     String::from("enable_media()"),
                     String::from("webrtc.incoming_media"),
                 )
-                .into())
+                .into());
             }
         };
 
         let call = self.call()?;
         call.connect_incoming_media(incoming_media)
+    }
+
+    pub fn send_is_screenshare_update(&mut self, is_screenshare: bool) -> Result<()> {
+        self.update_sender_status(signaling::SenderStatus {
+            sharing_screen: Some(is_screenshare),
+            ..Default::default()
+        })
+    }
+
+    pub fn regather_on_all_networks(&self) -> Result<()> {
+        let webrtc = self.webrtc.lock()?;
+        let pc = webrtc.peer_connection()?;
+
+        pc.regather_on_all_networks();
+        Ok(())
     }
 
     /// Send a ConnectionEvent to the internal FSM.
@@ -1580,6 +1715,11 @@ where
             })
     }
 
+    /// Whether the connection has been asked to terminate.
+    pub fn terminate_requested(&self) -> bool {
+        self.terminate_requested.load(Ordering::SeqCst)
+    }
+
     /// Terminate the connection.
     ///
     /// Notify the internal FSM to terminate.
@@ -1589,12 +1729,28 @@ where
     pub fn terminate(&mut self) -> Result<()> {
         info!("terminate(): ref_count: {}", self.ref_count());
 
-        self.set_state(ConnectionState::Terminating)?;
+        // Set the state before the terminate_requested flag, so the FSM
+        // cannot observe the flag while the state still reads as active.
+        if let Err(err) = self.set_state(ConnectionState::Terminating) {
+            warn!(
+                "terminate(): failed to set and notify Terminating state: {}",
+                err
+            );
+        }
+        self.terminate_requested.store(true, Ordering::SeqCst);
 
-        self.inject_event(ConnectionEvent::Terminate)?;
-        self.wait_for_terminate()?;
-
-        self.set_state(ConnectionState::Terminated)?;
+        // Wait for the FSM to quiesce.
+        if let Err(err) = util::try_scoped(|| {
+            self.inject_event(ConnectionEvent::Terminate)?;
+            self.wait_for_terminate()?;
+            if let Err(err) = self.set_state(ConnectionState::Terminated) {
+                warn!("terminate(): failed to notify Terminated: {}", err);
+            }
+            Ok(())
+        }) {
+            // Log-and-continue so that teardown can continue below.
+            error!("terminate(): failed to quiesce the FSM: {}", err);
+        }
 
         // Stop the timer thread, if any.
         self.tick_context.stopper().stop_all_and_join();
@@ -1602,17 +1758,17 @@ where
         // Free up webrtc related resources.
         let mut webrtc = self.webrtc.lock()?;
 
-        // This makes it safe to destroy the stats observer
-        // and the Connection (which is also a PeerConnectionObserver).
         if let Ok(peer_connection) = webrtc.peer_connection() {
             peer_connection.close();
         }
 
-        // dispose of the incoming media
-        webrtc.incoming_media = None;
+        // Note that the order of release is important here. We want the peer
+        // connection references to be dropped first, before either the incoming
+        // media or the stats observer are released, in order to prevent
+        // possible UAF.
 
-        // dispose of the stats observer
-        webrtc.stats_observer = None;
+        // Release the reference to the native PeerConnection.
+        webrtc.peer_connection = None;
 
         // Free the application connection object, which is in essence
         // the PeerConnection object.  It is important to dispose of
@@ -1623,6 +1779,14 @@ where
         // the connection_ptr.
         webrtc.app_connection = None;
 
+        // dispose of the incoming media
+        webrtc.incoming_media = None;
+
+        // dispose of the stats observer
+        // The PeerConnection's destructor has run, so there will be
+        // no callbacks into the stats observer.
+        webrtc.stats_observer = None;
+
         // Free the connection object previously used by the
         // PeerConnectionObserver.  Convert the pointer back into a
         // Box and let it go out of scope.
@@ -1632,28 +1796,37 @@ where
                 Ok(())
             }
             None => Err(RingRtcError::OptionValueNotSet(
-                String::from("close()"),
+                String::from("terminate()"),
                 String::from("connection_ptr"),
             )
             .into()),
         }
     }
 
-    /// Bottom half of `close()`
+    /// Bottom half of `terminate()`
     ///
-    /// Waits for the FSM shutdown condition variable to signal that
-    /// shutdown is complete.
+    /// Waits for the FSM shutdown condition variable to signal that shutdown is
+    /// complete, or times out after `TERMINATE_TIMEOUT`.
     fn wait_for_terminate(&mut self) -> Result<()> {
-        // Wait for terminate operation to complete
         info!("terminate(): waiting for terminate complete...");
         let (mutex, condvar) = &*self.terminate_condvar;
-        if let Ok(mut terminate_complete) = mutex.lock() {
-            while !*terminate_complete {
-                terminate_complete = condvar.wait(terminate_complete).map_err(|_| {
+        if let Ok(terminate_complete) = mutex.lock() {
+            let (_terminate_complete, result) = condvar
+                .wait_timeout_while(
+                    terminate_complete,
+                    TERMINATE_TIMEOUT,
+                    |terminate_complete| !*terminate_complete,
+                )
+                .map_err(|_| {
                     RingRtcError::MutexPoisoned(
                         "Connection Terminate Condition Variable".to_string(),
                     )
                 })?;
+            if result.timed_out() {
+                return Err(RingRtcError::TerminateTimeout(
+                    "Connection Terminate Condition Variable".to_string(),
+                )
+                .into());
             }
         } else {
             return Err(RingRtcError::MutexPoisoned(
@@ -1723,43 +1896,38 @@ where
         Ok(())
     }
 
-    /// Inject a `LocalIceCandidatesRemoved` event into the FSM.
+    /// Inject a `LocalIceCandidateRemoved` event into the FSM.
     ///
     /// `Called By:` WebRTC `PeerConnectionObserver` call back thread.
     ///
     /// # Arguments
     ///
-    /// * `removed_addresses` - Locally removed candidate addresses
-    pub fn inject_local_ice_candidates_removed(
+    /// * `removed_address` - Locally removed candidate address
+    pub fn inject_local_ice_candidate_removed(
         &mut self,
-        removed_addresses: Vec<SocketAddr>,
+        removed_address: SocketAddr,
         force_send: bool,
     ) -> Result<()> {
         if !force_send && self.connection_type == ConnectionType::OutgoingChild {
             return Ok(());
         }
 
-        let removed_ports: Vec<u16> = removed_addresses
-            .iter()
-            .map(|address| address.port())
-            .collect();
-        info!("Local ICE candidates removed; ports: {:?}", removed_ports,);
+        match signaling::IceCandidate::from_removed_address(removed_address) {
+            Ok(candidate) => {
+                info!(
+                    "Local ICE candidate removed; port: {}",
+                    removed_address.port()
+                );
 
-        let candidates = removed_addresses
-            .into_iter()
-            .filter_map(|removed_address| {
-                signaling::IceCandidate::from_removed_address(removed_address)
-                    .map_err(|e| {
-                        warn!("Failed to signal removed candidate: {:?}", e);
-                        e
-                    })
-                    .ok()
-            })
-            .collect();
+                // This is where we make additions and removals look the same in signaling
+                // where a "candidate" (really, an update) can be either an addition or removal.
+                self.inject_event(ConnectionEvent::LocalIceCandidates(vec![candidate]))?;
+            }
+            Err(e) => {
+                warn!("Failed to signal removed candidate: {:?}", e);
+            }
+        }
 
-        // This is where we make additions and removals look the same in signaling
-        // where a "candidate" (really, an update) can be either an addition or removal.
-        self.inject_event(ConnectionEvent::LocalIceCandidates(candidates))?;
         Ok(())
     }
 
@@ -1900,7 +2068,11 @@ where
     /// # Arguments
     ///
     /// * `call_id` - Call ID from the remote peer.
-    fn inject_received_hangup(&mut self, call_id: CallId, hangup: signaling::Hangup) -> Result<()> {
+    pub fn inject_received_hangup(
+        &mut self,
+        call_id: CallId,
+        hangup: signaling::Hangup,
+    ) -> Result<()> {
         self.inject_event(ConnectionEvent::ReceivedHangup(call_id, hangup))
     }
 
@@ -2071,6 +2243,39 @@ where
             .unwrap()
             .sender_status
     }
+
+    /// Inject a pausing event into the FSM.
+    ///
+    /// Blocks the FSM (not the caller) once it dequeues the event, until `pause`
+    /// is released, so a test can saturate the event queue behind it.
+    ///
+    /// `Called By:` Test infrastructure
+    #[cfg(feature = "sim")]
+    pub fn inject_pause(&mut self, pause: Arc<(Mutex<bool>, Condvar)>) -> Result<()> {
+        self.inject_event(ConnectionEvent::Pause(pause))
+    }
+
+    /// Whether the FSM has signaled that termination is complete.
+    ///
+    /// `Called By:` Test infrastructure
+    #[cfg(feature = "sim")]
+    pub fn fsm_terminated(&self) -> bool {
+        *self.terminate_condvar.0.lock().unwrap()
+    }
+
+    /// Block the caller until the FSM signals termination, or the timeout
+    /// elapses. Returns whether termination is completed.
+    ///
+    /// `Called By:` Test infrastructure
+    #[cfg(feature = "sim")]
+    pub fn wait_for_fsm_terminated(&self, timeout: Duration) -> bool {
+        let (mutex, condvar) = &*self.terminate_condvar;
+        let guard = mutex.lock().unwrap();
+        let (guard, _) = condvar
+            .wait_timeout_while(guard, timeout, |terminated| !*terminated)
+            .unwrap();
+        *guard
+    }
 }
 
 #[cfg(feature = "sim")]
@@ -2108,9 +2313,9 @@ where
         self.inject_local_ice_candidate(ice_candidate, force_send, sdp_for_logging, relay_protocol)
     }
 
-    fn handle_ice_candidates_removed(&mut self, removed_addresses: Vec<SocketAddr>) -> Result<()> {
+    fn handle_ice_candidate_removed(&mut self, removed_address: SocketAddr) -> Result<()> {
         let force_send = false;
-        self.inject_local_ice_candidates_removed(removed_addresses, force_send)
+        self.inject_local_ice_candidate_removed(removed_address, force_send)
     }
 
     fn handle_ice_connection_state_changed(&mut self, new_state: IceConnectionState) -> Result<()> {
@@ -2145,16 +2350,18 @@ where
         }
         Ok(())
     }
+}
 
+impl<T> RtpObserverTrait for Connection<T>
+where
+    T: Platform,
+{
+    /// Warning: this runs on the WebRTC network thread, so doing anything that
+    /// would block is dangerous, especially taking a lock that is also taken
+    /// while calling something that blocks on the network thread.
     fn handle_rtp_received(&mut self, header: rtp::Header, payload: &[u8]) {
         let data = match (header.pt, header.ssrc) {
-            // Old clients send with 4 bytes of reserved data.
-            (
-                RTP_DATA_PAYLOAD_TYPE,
-                OLD_RTP_DATA_SSRC_FOR_INCOMING | OLD_RTP_DATA_SSRC_FOR_OUTGOING,
-            ) => &payload[OLD_RTP_DATA_RESERVED.len()..],
-            // New clients will send without 4 bytes of reserved data.
-            (RTP_DATA_PAYLOAD_TYPE, NEW_RTP_DATA_SSRC) => payload,
+            (RTP_DATA_PAYLOAD_TYPE, RTP_DATA_SSRC) => payload,
             (pt, ssrc) => {
                 warn!(
                     "Received RTP with unexpected (PT, SSRC) = ({:?}, {:?})",
@@ -2183,10 +2390,10 @@ where
     }
 }
 
-fn generate_local_secret_and_public_key() -> Result<(StaticSecret, PublicKey)> {
-    let secret = StaticSecret::random_from_rng(OsRng);
+fn generate_local_secret_and_public_key() -> (StaticSecret, PublicKey) {
+    let secret = StaticSecret::random_from_rng(&mut UnwrapErr(SysRng));
     let public = PublicKey::from(&secret);
-    Ok((secret, public))
+    (secret, public)
 }
 
 struct NegotiatedSrtpKeys {
@@ -2205,11 +2412,17 @@ fn negotiate_srtp_keys(
 
     let remote_public_key = {
         let mut array = [0u8; 32];
-        array.copy_from_slice(remote_public_key);
-        PublicKey::from(array)
-    };
+        array
+            .safe_copy_from_slice(remote_public_key)
+            .map(|_| PublicKey::from(array))
+    }
+    .map_err(|_| RingRtcError::InvalidRemoteSrtpKey)?;
 
     let shared_secret = local_secret.diffie_hellman(&remote_public_key);
+    if !shared_secret.was_contributory() {
+        error!("remote secret was non-contributory, rejecting srtp negotiation");
+        return Err(RingRtcError::InvalidRemoteSrtpKey.into());
+    }
 
     let hkdf_salt = vec![0u8; 32];
     let hkdf_info_prefix = "Signal_Calling_20200807_SignallingDH_SRTPKey_KDF";
@@ -2299,5 +2512,21 @@ mod tests {
         assert_eq!(expect(300_000), compute(Low, 1_999_999, true));
         assert_eq!(expect(300_000), compute(Low, 1_000_000, true));
         assert_eq!(expect(300_000), compute(Low, 300_000, true));
+    }
+
+    #[test]
+    fn negotiate_srtp_keys_rejects_low_order_remote_key() {
+        let local_secret = StaticSecret::random_from_rng(&mut UnwrapErr(SysRng));
+        let low_order_key = [0u8; 32];
+        let result =
+            negotiate_srtp_keys(&local_secret, &low_order_key, b"caller_key", b"callee_key");
+        let err = result
+            .err()
+            .expect("expected an error for a non-contributory remote key");
+        assert!(
+            err.downcast_ref::<RingRtcError>()
+                .is_some_and(|e| matches!(e, RingRtcError::InvalidRemoteSrtpKey)),
+            "expected RingRtcError::InvalidRemoteSrtpKey, got: {err}"
+        );
     }
 }

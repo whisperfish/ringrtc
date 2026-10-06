@@ -3,25 +3,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::{
+    io,
+    iter::{Cycle, StepBy},
+    net::{SocketAddr, UdpSocket},
+    thread,
+};
+
 use anyhow::anyhow;
 use bitvec::{
     bits,
     prelude::{BitSlice, LocalBits, Lsb0},
 };
 use log::*;
-use ringrtc::common::Result;
-use std::{
-    iter::{Cycle, StepBy},
-    thread,
-};
-
-use ringrtc::webrtc::{
-    injectable_network::{self, InjectableNetwork},
-    network::NetworkInterfaceType,
-};
-use std::{
-    io,
-    net::{SocketAddr, UdpSocket},
+use ringrtc::{
+    common::Result,
+    webrtc::{
+        injectable_network::{self, InjectableNetwork},
+        network::NetworkInterfaceType,
+    },
 };
 
 pub struct DeterministicLoss {
@@ -33,7 +33,7 @@ pub struct DeterministicLoss {
 
 impl DeterministicLoss {
     pub fn new(loss_rate: u8, packet_size_ms: i32, pre_delay: u8) -> Result<Self> {
-        if loss_rate > 50 || loss_rate % 5 != 0 {
+        if loss_rate > 50 || !loss_rate.is_multiple_of(5) {
             return Err(anyhow!(
                 "Loss rate must be less than 50% and a multiple of 5"
             ));

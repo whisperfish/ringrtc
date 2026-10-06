@@ -36,22 +36,23 @@ pub unsafe fn Rust_createStatsObserver(
         audio_receiver_statistics: ptr::null(),
         video_receiver_statistics_size: 0,
         video_receiver_statistics: ptr::null(),
-        connection_statistics: ConnectionStatistics {
-            current_round_trip_time: 0.0,
-            available_outgoing_bitrate: 0.0,
-        },
+        nominated_connection_statistics: ConnectionStatistics::default(),
+        connection_statistics: ptr::null(),
+        connection_statistics_size: 0,
     };
 
     // Hit on the onComplete() callback
     let callbacks = callbacks.as_ptr() as *const StatsObserverCallbacks;
     let report_json = std::ffi::CString::new("{}").expect("CString::new failed");
-    ((*callbacks).onStatsComplete)(
-        webrtc::ptr::Borrowed::from_ptr(stats_observer.as_ptr() as *mut StatsObserver),
-        webrtc::ptr::Borrowed::from_ptr(&dummy),
-        webrtc::ptr::Borrowed::from_ptr(report_json.as_ptr()),
-    );
+    unsafe {
+        ((*callbacks).onStatsComplete)(
+            webrtc::ptr::Borrowed::from_ptr(stats_observer.as_ptr() as *mut StatsObserver),
+            webrtc::ptr::Borrowed::from_ptr(&dummy),
+            webrtc::ptr::Borrowed::from_ptr(report_json.as_ptr()),
+        );
 
-    webrtc::ptr::OwnedRc::from_ptr(&FAKE_STATS_OBSERVER)
+        webrtc::ptr::OwnedRc::from_ptr(&FAKE_STATS_OBSERVER)
+    }
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]

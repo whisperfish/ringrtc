@@ -3,20 +3,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use ringrtc::lite::http::sim as sim_http;
-
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::io::Write;
-use std::time::{Duration, SystemTime};
-
-use base64::engine::general_purpose::STANDARD as base64;
-use base64::Engine;
-use rand::SeedableRng;
-use ringrtc::lite::call_links::{
-    CallLinkDeleteRequest, CallLinkRestrictions, CallLinkRootKey, CallLinkUpdateRequest,
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    io::Write,
+    time::{Duration, SystemTime},
 };
-use ringrtc::lite::http::{self, Client};
+
+use base64::{Engine, engine::general_purpose::STANDARD as base64};
+use rand::SeedableRng;
+use ringrtc::lite::{
+    call_links::{
+        CallLinkDeleteRequest, CallLinkRestrictions, CallLinkRootKey, CallLinkUpdateRequest,
+    },
+    http::{self, Client, sim as sim_http},
+};
 use uuid::Uuid;
 use zkgroup::call_links::CallLinkSecretParams;
 
@@ -52,7 +53,7 @@ fn prompt(s: &str) {
 fn root_key_from_id(id: &str) -> CallLinkRootKey {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
-    let prng = rand_chacha::ChaCha20Rng::seed_from_u64(hasher.finish());
+    let prng = rand::rngs::ChaCha20Rng::seed_from_u64(hasher.finish());
     CallLinkRootKey::generate(prng)
 }
 
@@ -79,7 +80,7 @@ fn issue_and_present_auth_credential(
     )
     .receive(user_id, timestamp, public_zkparams)
     .unwrap();
-    let call_link_zkparams = CallLinkSecretParams::derive_from_root_key(&root_key.bytes());
+    let call_link_zkparams = CallLinkSecretParams::derive_from_root_key(root_key.as_slice());
     auth_credential.present(
         user_id,
         timestamp,
@@ -89,6 +90,7 @@ fn issue_and_present_auth_credential(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_testing_request(
     id: &str,
     server_zkparams: &zkgroup::generic_server_params::GenericServerSecretParams,
@@ -179,9 +181,6 @@ fn main() {
     for line in std::io::stdin().lines() {
         let words: Vec<&str> = line.as_ref().unwrap().split_ascii_whitespace().collect();
         match &words[..] {
-            [] => {
-                prompt("> ");
-            }
             ["help"] => {
                 println!(
                     "
@@ -201,7 +200,6 @@ exit                         - quit
 The admin passkey for any created links is a constant {ADMIN_PASSKEY:?}.
 "
                 );
-                prompt("> ");
             }
             ["create", id] => {
                 let root_key = root_key_from_id(id);
@@ -222,7 +220,7 @@ The admin passkey for any created links is a constant {ADMIN_PASSKEY:?}.
                     .receive(create_credential_response, user_id, &public_zkparams)
                     .unwrap();
                 let call_link_zkparams =
-                    CallLinkSecretParams::derive_from_root_key(&root_key.bytes());
+                    CallLinkSecretParams::derive_from_root_key(root_key.as_slice());
                 let create_credential_presentation = create_credential.present(
                     &room_id,
                     user_id,
@@ -276,7 +274,7 @@ The admin passkey for any created links is a constant {ADMIN_PASSKEY:?}.
             }
             ["set-title", id, new_title] => {
                 let root_key = root_key_from_id(id);
-                let encrypted_name = root_key.encrypt(new_title.as_bytes(), rand::thread_rng());
+                let encrypted_name = root_key.encrypt(new_title.as_bytes(), rand::rng());
                 let auth_credential_presentation = issue_and_present_auth_credential(
                     &server_zkparams,
                     &public_zkparams,
@@ -350,10 +348,12 @@ The admin passkey for any created links is a constant {ADMIN_PASSKEY:?}.
             ["exit" | "quit"] => {
                 break;
             }
+            [] => {}
             _ => {
                 println!("Couldn't parse that.\n");
-                prompt("> ");
             }
         }
+
+        prompt("> ");
     }
 }

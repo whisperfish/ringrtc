@@ -6,18 +6,29 @@
 //! Common types used throughout the library.
 
 pub mod actor;
-pub mod jni_signature;
+pub mod slice;
+pub mod time;
 pub mod units;
+mod versioning;
 
-use std::fmt;
+use std::{fmt, time::Duration};
+
+use sha2::{Digest, Sha256};
+pub use versioning::SemanticVersion;
 
 use crate::webrtc::{
-    media::AudioEncoderConfig,
+    media::{AudioDecoderConfig, AudioEncoderConfig},
     peer_connection_factory::{AudioConfig, AudioJitterBufferConfig},
 };
 
 /// Common Result type, using `anyhow::Error` for Error.
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
+
+/// How long to wait for an FSM to quiesce before tearing down anyway.
+pub const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded capacity of each FSM event channel.
+pub const EVENT_QUEUE_SIZE: usize = 256;
 
 /// Unique call identification number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,6 +65,13 @@ impl CallId {
 
     pub fn format(self, device_id: DeviceId) -> String {
         format!("0x{:x}-{}", self.id, device_id)
+    }
+
+    pub fn call_summary_hash(&self) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"CALL_SUMMARY_CALL_ID");
+        hasher.update(self.id.to_be_bytes());
+        hasher.finalize().to_vec()
     }
 }
 
@@ -222,6 +240,23 @@ impl CallState {
         }
     }
 
+    pub fn accepted(self) -> bool {
+        match self {
+            CallState::NotYetStarted => false,
+
+            CallState::WaitingToProceed => false,
+            CallState::ConnectingBeforeAccepted => false,
+            CallState::ConnectedBeforeAccepted => false,
+
+            CallState::ConnectingAfterAccepted => true,
+            CallState::ConnectedAndAccepted => true,
+            CallState::ReconnectingAfterAccepted => true,
+
+            CallState::Terminating => false,
+            CallState::Terminated => false,
+        }
+    }
+
     pub fn can_send_hangup_via_rtp(self) -> bool {
         match self {
             CallState::NotYetStarted => false,
@@ -297,14 +332,112 @@ impl CallState {
     }
 }
 
+/// An enum representing the call end reasons.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum_macros::Display)]
+pub enum CallEndReason {
+    /// The call ended because of a local hangup. For direct calls.
+    LocalHangup,
+
+    /// The call ended because of a remote hangup. For direct calls.
+    RemoteHangup,
+
+    /// The call ended because the remote needs permission. For direct calls.
+    RemoteHangupNeedPermission,
+
+    /// The call ended because the call was accepted by a different device. For direct calls.
+    RemoteHangupAccepted,
+
+    /// The call ended because the call was declined by a different device. For direct calls.
+    RemoteHangupDeclined,
+
+    /// The call ended because the call was declared busy by a different device. For direct calls.
+    RemoteHangupBusy,
+
+    /// The call ended because of a remote busy message from a callee. For direct calls.
+    RemoteBusy,
+
+    /// The call ended because of glare, receiving an offer from the same remote
+    /// while calling them. For direct calls.
+    RemoteGlare,
+
+    /// The call ended because of recall, receiving an offer from the same remote
+    /// while still in an existing call with them. For direct calls.
+    RemoteReCall,
+
+    /// The call ended because it timed out during setup. For direct calls.
+    Timeout,
+
+    /// The call ended because of an internal error condition. For direct calls.
+    InternalFailure,
+
+    /// The call ended because a signaling message couldn't be sent. For direct calls.
+    SignalingFailure,
+
+    /// The call ended because the connection setup failed. For direct calls.
+    ConnectionFailure,
+
+    /// The call ended because the application wanted to drop the call. For direct calls.
+    AppDroppedCall,
+
+    /// The client disconnected by calling the disconnect() API. For group calls.
+    DeviceExplicitlyDisconnected,
+
+    /// The server disconnected due to policy or some other controlled reason. For group calls.
+    ServerExplicitlyDisconnected,
+
+    /// An admin denied your request to join the call. For group calls.
+    DeniedRequestToJoinCall,
+
+    /// An admin removed you from the call. For group calls.
+    RemovedFromCall,
+
+    /// Another direct call or group call is currently in progress and using media resources.
+    /// For group calls.
+    CallManagerIsBusy,
+
+    /// Could not join the group call. For group calls.
+    SfuClientFailedToJoin,
+
+    /// Could not create a usable peer connection factory for media. For group calls.
+    FailedToCreatePeerConnectionFactory,
+
+    /// Could not negotiate SRTP keys with a DHE. For group calls.
+    FailedToNegotiatedSrtpKeys,
+
+    /// Could not create a peer connection for media. For group calls.
+    FailedToCreatePeerConnection,
+
+    /// Could not start the peer connection for media. For group calls.
+    FailedToStartPeerConnection,
+
+    /// Could not update the peer connection for media. For group calls.
+    FailedToUpdatePeerConnection,
+
+    /// Could not set the requested bitrate for media. For group calls.
+    FailedToSetMaxSendBitrate,
+
+    /// Could not connect successfully. For group calls.
+    IceFailedWhileConnecting,
+
+    /// Lost a connection and retries were unsuccessful. For group calls.
+    IceFailedAfterConnected,
+
+    /// Unexpected change in demuxId requiring a new group call. For group calls.
+    ServerChangedDemuxId,
+
+    /// The SFU reported that the group call is full. For group calls.
+    HasMaxDevices,
+}
+
 /// An enum representing the status notification types sent to the
 /// client application.
 ///
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum_macros::Display)]
 pub enum ApplicationEvent {
     /// Inbound call only: The call signaling (ICE) is complete.
-    LocalRinging = 0,
+    LocalRinging,
 
     /// Outbound call only: The call signaling (ICE) is complete.
     RemoteRinging,
@@ -314,53 +447,6 @@ pub enum ApplicationEvent {
 
     /// The remote side has accepted the call.
     RemoteAccepted,
-
-    /// The call ended because of a local hangup.
-    EndedLocalHangup,
-
-    /// The call ended because of a remote hangup.
-    EndedRemoteHangup,
-
-    /// The call ended because the remote needs permission.
-    EndedRemoteHangupNeedPermission,
-
-    /// The call ended because the call was accepted by a different device.
-    EndedRemoteHangupAccepted,
-
-    /// The call ended because the call was declined by a different device.
-    EndedRemoteHangupDeclined,
-
-    /// The call ended because the call was declared busy by a different device.
-    EndedRemoteHangupBusy,
-
-    /// The call ended because of a remote busy message from a callee.
-    EndedRemoteBusy,
-
-    /// The call ended because of glare, receiving an offer from same remote
-    /// while calling them.
-    EndedRemoteGlare,
-
-    /// The call ended because of recall, receiving an offer from same remote
-    /// while still in an existing call with them.
-    EndedRemoteReCall,
-
-    /// The call ended because it timed out during setup.
-    EndedTimeout,
-
-    /// The call ended because of an internal error condition.
-    EndedInternalFailure,
-
-    /// The call ended because a signaling message couldn't be sent.
-    EndedSignalingFailure,
-
-    /// The call ended because setting up the connection failed.
-    EndedConnectionFailure,
-
-    /// The call ended because there was a failure during glare handling.
-    EndedGlareHandlingFailure,
-
-    /// The call ended because the application wanted to drop the call.
-    EndedAppDroppedCall,
 
     /// The remote side has enabled audio.
     RemoteAudioEnable,
@@ -386,6 +472,9 @@ pub enum ApplicationEvent {
     /// The call dropped while connected and is now reconnected.
     Reconnected,
 
+    /// The call ended because there was a failure during glare handling.
+    GlareHandlingFailure,
+
     /// The received offer is expired.
     ///
     /// This event should not be sent directly. Instead, use [`on_offer_expired`][],
@@ -400,12 +489,6 @@ pub enum ApplicationEvent {
     /// Received an offer while already handling an active call and glare
     /// was detected.
     ReceivedOfferWithGlare,
-}
-
-impl fmt::Display for ApplicationEvent {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
-    }
 }
 
 /// Tracks the state of a connection:
@@ -768,15 +851,17 @@ pub struct CallConfig {
     pub data_mode: DataMode,
     pub stats_interval_secs: u16,
     pub stats_initial_offset_secs: u16,
+    pub call_summary_time_limit_secs: u16,
 
     pub audio_config: AudioConfig,
     pub audio_encoder_config: AudioEncoderConfig,
+    pub audio_decoder_config: AudioDecoderConfig,
     pub enable_tcc_audio: bool,
-    pub enable_red_audio: bool,
     pub audio_jitter_buffer_config: AudioJitterBufferConfig,
     pub audio_rtcp_report_interval_ms: i32,
 
-    pub enable_vp9: bool,
+    pub enable_vp9_encode: bool,
+    pub enable_vp9_decode: bool,
 }
 
 impl Default for CallConfig {
@@ -785,13 +870,15 @@ impl Default for CallConfig {
             data_mode: DataMode::Normal,
             stats_interval_secs: 10,
             stats_initial_offset_secs: 2,
+            call_summary_time_limit_secs: 300,
             audio_config: Default::default(),
             audio_encoder_config: Default::default(),
+            audio_decoder_config: Default::default(),
             enable_tcc_audio: false,
-            enable_red_audio: false,
             audio_jitter_buffer_config: Default::default(),
             audio_rtcp_report_interval_ms: 5000,
-            enable_vp9: true,
+            enable_vp9_encode: true,
+            enable_vp9_decode: true,
         }
     }
 }
@@ -799,6 +886,31 @@ impl Default for CallConfig {
 impl CallConfig {
     pub fn with_data_mode(mut self, data_mode: DataMode) -> Self {
         self.data_mode = data_mode;
+        self
+    }
+    pub fn with_enable_vp9_encode(mut self, enable_vp9_encode: bool) -> Self {
+        self.enable_vp9_encode = enable_vp9_encode;
+        self
+    }
+
+    pub fn with_enable_vp9_decode(mut self, enable_vp9_decode: bool) -> Self {
+        self.enable_vp9_decode = enable_vp9_decode;
+        self
+    }
+
+    pub fn with_dred_duration(mut self, dred_duration: u8) -> Self {
+        self.audio_encoder_config.dred_duration = dred_duration;
+        self
+    }
+
+    pub fn with_stats_interval_secs(mut self, stats_interval_secs: u16) -> Self {
+        self.stats_interval_secs = stats_interval_secs;
+        // if stats_interval_secs <= stats_initial_offset_secs, then stats break
+        // guarantee that is not the case
+        self.stats_initial_offset_secs = core::cmp::min(
+            self.stats_initial_offset_secs,
+            stats_interval_secs.saturating_sub(1),
+        );
         self
     }
 }

@@ -6,9 +6,9 @@
 import Native from './Native';
 
 export class CallLinkRootKey {
-  readonly bytes: Buffer;
+  readonly bytes: Uint8Array<ArrayBuffer>;
 
-  private constructor(bytes: Buffer) {
+  constructor(bytes: Uint8Array<ArrayBuffer>) {
     this.bytes = bytes;
   }
 
@@ -16,7 +16,7 @@ export class CallLinkRootKey {
     return new CallLinkRootKey(Native.CallLinkRootKey_parse(str));
   }
 
-  static fromBytes(bytes: Buffer): CallLinkRootKey {
+  static fromBytes(bytes: Uint8Array<ArrayBuffer>): CallLinkRootKey {
     Native.CallLinkRootKey_validate(bytes);
     return new CallLinkRootKey(bytes);
   }
@@ -25,19 +25,24 @@ export class CallLinkRootKey {
     return new CallLinkRootKey(Native.CallLinkRootKey_generate());
   }
 
-  static generateAdminPassKey(): Buffer {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+  static generateAdminPassKey(): Uint8Array<ArrayBuffer> {
+    // oxlint-disable-next-line typescript/no-unsafe-return
     return Native.CallLinkRootKey_generateAdminPasskey();
   }
 
-  deriveRoomId(): Buffer {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+  deriveRoomId(): Uint8Array<ArrayBuffer> {
+    // oxlint-disable-next-line typescript/no-unsafe-return
     return Native.CallLinkRootKey_deriveRoomId(this.bytes);
   }
 
-  toString(): string {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+  toUnredactedString(): string {
+    // oxlint-disable-next-line typescript/no-unsafe-return
     return Native.CallLinkRootKey_toFormattedString(this.bytes);
+  }
+
+  toString(): string {
+    // oxlint-disable-next-line typescript/no-unsafe-return
+    return Native.CallLinkRootKey_toRedactedString(this.bytes);
   }
 }
 
@@ -46,7 +51,8 @@ export class CallLinkState {
     public name: string,
     public restrictions: CallLinkRestrictions,
     public revoked: boolean,
-    public expiration: Date
+    public expiration: Date,
+    public rootKey: CallLinkRootKey
   ) {}
 }
 

@@ -5,23 +5,31 @@
 
 //! WebRTC Simulation Peer Connection Interface
 
-use std::net::SocketAddr;
-use std::os::raw::c_char;
-use std::sync::{Arc, Mutex};
+use std::{
+    net::SocketAddr,
+    os::raw::c_char,
+    sync::{Arc, Mutex},
+};
 
 use prost::Message;
 
-use crate::core::platform::PlatformItem;
-use crate::webrtc;
-use crate::webrtc::media::RffiAudioEncoderConfig;
-use crate::webrtc::network::RffiIpPort;
-use crate::webrtc::peer_connection::{RffiAudioLevel, RffiReceivedAudioLevel};
-use crate::webrtc::rtp;
-use crate::webrtc::sdp_observer::{
-    RffiCreateSessionDescriptionObserver, RffiSessionDescription, RffiSetSessionDescriptionObserver,
+use crate::{
+    core::platform::PlatformItem,
+    webrtc,
+    webrtc::{
+        media::{RffiAudioDecoderConfig, RffiAudioEncoderConfig},
+        network::RffiIpPort,
+        peer_connection::{RffiAudioLevel, RffiReceivedAudioLevel},
+        rtp,
+        rtp_observer::RffiRtpObserver,
+        sdp_observer::{
+            RffiCreateSessionDescriptionObserver, RffiSessionDescription,
+            RffiSetSessionDescriptionObserver,
+        },
+        sim::ice_gatherer::{FAKE_ICE_GATHERER, RffiIceGatherer},
+        stats_observer::RffiStatsObserver,
+    },
 };
-use crate::webrtc::sim::ice_gatherer::{RffiIceGatherer, FAKE_ICE_GATHERER};
-use crate::webrtc::stats_observer::RffiStatsObserver;
 
 /// Simulation type for PeerConnection.
 #[derive(Clone)]
@@ -58,6 +66,7 @@ impl RffiPeerConnection {
                 removed_ice_candidates: vec![],
                 max_bitrate_bps: None,
                 last_sent_rtp_data: None,
+                closed: false,
             })),
         }
     }
@@ -74,7 +83,7 @@ impl RffiPeerConnection {
 
     fn set_outgoing_media_enabled(&self, enabled: bool) {
         let mut state = self.state.lock().unwrap();
-        if !(state.local_description_set && state.remote_description_set) {
+        if enabled && !(state.local_description_set && state.remote_description_set) {
             panic!("Can't Rust_setOutgoingMediaEnabled if you haven't received an answer yet.");
         }
         state.outgoing_audio_enabled = enabled;
@@ -83,6 +92,23 @@ impl RffiPeerConnection {
     pub fn outgoing_audio_enabled(&self) -> bool {
         let state = self.state.lock().unwrap();
         state.outgoing_audio_enabled
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        state.outgoing_audio_enabled = false;
+        state.rtp_packet_sink = None;
+    }
+
+    pub fn closed(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.closed
+    }
+
+    pub fn rtp_sink_registered(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.rtp_packet_sink.is_some()
     }
 
     fn set_incoming_media_enabled(&self, _enabled: bool) {
@@ -116,7 +142,7 @@ impl RffiPeerConnection {
     pub fn last_sent_rtp_message(&self) -> Option<crate::protobuf::rtp_data::Message> {
         let state = self.state.lock().unwrap();
         Some(
-            crate::protobuf::rtp_data::Message::decode(&state.last_sent_rtp_data.as_deref()?[4..])
+            crate::protobuf::rtp_data::Message::decode(state.last_sent_rtp_data.as_deref()?)
                 .unwrap(),
         )
     }
@@ -138,6 +164,17 @@ struct RffiPeerConnectionState {
     removed_ice_candidates: Vec<SocketAddr>,
     max_bitrate_bps: Option<i32>,
     last_sent_rtp_data: Option<Vec<u8>>,
+    closed: bool,
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_setScalabilityMode(
+    _peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+    _scalability_mode: webrtc::ptr::Borrowed<c_char>,
+    _max_bitrate_bps: i32,
+) -> bool {
+    info!("Rust_setScalabilityMode():");
+    true
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]
@@ -159,13 +196,23 @@ pub unsafe fn Rust_createOffer(
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_createSendOnlyTransceiver(
+    _peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+) -> bool {
+    info!("Rust_createSendOnlyTransceiver():");
+    true
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
 pub unsafe fn Rust_setLocalDescription(
     peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
     _ssd_observer: webrtc::ptr::BorrowedRc<RffiSetSessionDescriptionObserver>,
     _local_desc: webrtc::ptr::Owned<RffiSessionDescription>,
 ) {
     info!("Rust_setLocalDescription():");
-    (*peer_connection.as_ptr()).set_local_description();
+    unsafe {
+        (*peer_connection.as_ptr()).set_local_description();
+    }
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]
@@ -183,7 +230,9 @@ pub unsafe fn Rust_setRemoteDescription(
     _remote_desc: webrtc::ptr::Owned<RffiSessionDescription>,
 ) {
     info!("Rust_setRemoteDescription():");
-    (*peer_connection.as_ptr()).set_remote_description();
+    unsafe {
+        (*peer_connection.as_ptr()).set_remote_description();
+    }
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]
@@ -192,7 +241,9 @@ pub unsafe fn Rust_setOutgoingMediaEnabled(
     enabled: bool,
 ) {
     info!("Rust_setOutgoingMediaEnabled({})", enabled);
-    (*peer_connection.as_ptr()).set_outgoing_media_enabled(enabled);
+    unsafe {
+        (*peer_connection.as_ptr()).set_outgoing_media_enabled(enabled);
+    }
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]
@@ -201,7 +252,9 @@ pub unsafe fn Rust_setIncomingMediaEnabled(
     enabled: bool,
 ) -> bool {
     info!("Rust_setIncomingMediaEnabled({})", enabled);
-    (*peer_connection.as_ptr()).set_incoming_media_enabled(enabled);
+    unsafe {
+        (*peer_connection.as_ptr()).set_incoming_media_enabled(enabled);
+    }
     true
 }
 
@@ -236,6 +289,7 @@ pub unsafe fn Rust_addIceCandidateFromServer(
     _ip: RffiIp,
     _port: u16,
     _tcp: bool,
+    _hostname: webrtc::ptr::Borrowed<c_char>,
 ) -> bool {
     info!("Rust_addIceCandidateFromServer():");
     true
@@ -246,13 +300,18 @@ pub unsafe fn Rust_removeIceCandidates(
     peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
     removed_addresses_data: webrtc::ptr::Borrowed<RffiIpPort>,
     removed_addresses_len: usize,
+    _group: bool,
+    _tcp: bool,
+    _hostname_ptr: webrtc::ptr::Borrowed<i8>,
 ) -> bool {
     info!("Rust_removeIceCandidates():");
-    let removed_addresses =
-        std::slice::from_raw_parts(removed_addresses_data.as_ptr(), removed_addresses_len)
-            .iter()
-            .map(|ip_port| ip_port.into());
-    (*peer_connection.as_ptr()).remove_ice_candidates(removed_addresses);
+    unsafe {
+        let removed_addresses =
+            std::slice::from_raw_parts(removed_addresses_data.as_ptr(), removed_addresses_len)
+                .iter()
+                .map(|ip_port| ip_port.into());
+        (*peer_connection.as_ptr()).remove_ice_candidates(removed_addresses);
+    }
     true
 }
 
@@ -261,7 +320,7 @@ pub unsafe fn Rust_createSharedIceGatherer(
     _peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
 ) -> webrtc::ptr::OwnedRc<RffiIceGatherer> {
     info!("Rust_createSharedIceGatherer:");
-    webrtc::ptr::OwnedRc::from_ptr(&FAKE_ICE_GATHERER)
+    unsafe { webrtc::ptr::OwnedRc::from_ptr(&FAKE_ICE_GATHERER) }
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]
@@ -288,7 +347,7 @@ pub unsafe fn Rust_setSendBitrates(
     _start_bitrate_bps: i32,
     max_bitrate_bps: i32,
 ) {
-    let mut state = (*peer_connection.as_ptr()).state.lock().unwrap();
+    let mut state = unsafe { (*peer_connection.as_ptr()).state.lock().unwrap() };
     state.max_bitrate_bps = Some(max_bitrate_bps);
 }
 
@@ -303,8 +362,8 @@ pub unsafe fn Rust_sendRtp(
     payload_size: usize,
 ) -> bool {
     info!("Rust_sendRtp:");
-    let mut state = (*peer_connection.as_ptr()).state.lock().unwrap();
-    let payload = std::slice::from_raw_parts(payload_data.as_ptr(), payload_size);
+    let mut state = unsafe { (*peer_connection.as_ptr()).state.lock().unwrap() };
+    let payload = unsafe { std::slice::from_raw_parts(payload_data.as_ptr(), payload_size) };
     state.last_sent_rtp_data = Some(payload.to_vec());
     if let Some(rtp_packet_sink) = &state.rtp_packet_sink {
         let header = rtp::Header {
@@ -337,12 +396,20 @@ pub unsafe fn Rust_configureAudioEncoders(
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_configureAudioDecoders(
+    _peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+    _config: webrtc::ptr::Borrowed<RffiAudioDecoderConfig>,
+) {
+    info!("Rust_configureAudioDecoders:");
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
 pub fn Rust_getAudioLevels(
     _peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
-    captured_out: webrtc::ptr::Borrowed<RffiAudioLevel>,
+    mut captured_out: webrtc::ptr::Borrowed<RffiAudioLevel>,
     _received_out: webrtc::ptr::Borrowed<RffiReceivedAudioLevel>,
     _received_out_size: usize,
-    received_size_out: webrtc::ptr::Borrowed<usize>,
+    mut received_size_out: webrtc::ptr::Borrowed<usize>,
 ) {
     info!("Rust_getAudioLevels:");
     unsafe {
@@ -364,8 +431,26 @@ pub unsafe fn Rust_getLastBandwidthEstimateBps(
 }
 
 #[allow(non_snake_case, clippy::missing_safety_doc)]
-pub unsafe fn Rust_closePeerConnection(
+pub unsafe fn Rust_setRtpPacketObserver(
     _peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+    _rtp_observer: webrtc::ptr::Borrowed<RffiRtpObserver>,
+) {
+    info!("Rust_setRtpPacketObserver");
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_closePeerConnection(
+    peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
 ) {
     info!("Rust_closePeerConnection:");
+    unsafe {
+        (*peer_connection.as_ptr()).close();
+    }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_regatherOnAllNetworks(
+    _peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+) {
+    info!("Rust_regatherOnAllNetworks:");
 }

@@ -3,24 +3,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-/* eslint-disable max-classes-per-file */
-
-import { GumVideoCaptureOptions, VideoPixelFormatEnum } from './VideoSupport';
 import {
   CallLinkState,
   CallLinkRestrictions,
   CallLinkRootKey,
 } from './CallLinks';
+import type { CallSummary } from './CallSummary';
 import Native from './Native';
+
+const INVALID_CLIENT_ID = 0;
 
 export const callIdFromEra: (era: string) => CallId = Native.callIdFromEra;
 
 export function callIdFromRingId(ringId: bigint): CallId {
-  return {
-    low: Number(BigInt.asIntN(32, ringId)),
-    high: Number(BigInt.asIntN(32, ringId >> BigInt(32))),
-    unsigned: true,
-  };
+  return BigInt.asUintN(64, ringId);
 }
 
 class Config {
@@ -41,22 +37,19 @@ class NativeCallManager {
   }
 
   private createCallEndpoint(config: Config) {
-    const fieldTrials = Object.assign(
-      {
-        'RingRTC-AnyAddressPortsKillSwitch': 'Enabled',
-        'RingRTC-PruneTurnPorts': 'Enabled',
-        'WebRTC-Bwe-ProbingConfiguration':
-          'skip_if_est_larger_than_fraction_of_max:0.99',
-      },
-      config.field_trials
-    );
+    const fieldTrials = {
+      'RingRTC-AnyAddressPortsKillSwitch': 'Enabled',
+      'RingRTC-PruneTurnPorts': 'Enabled',
+      'WebRTC-Bwe-ProbingConfiguration':
+        'skip_if_est_larger_than_fraction_of_max:0.99',
+      'WebRTC-IncreaseIceCandidatePriorityHostSrflx': 'Enabled',
+      ...config.field_trials,
+    };
 
-    /* eslint-disable prefer-template */
     const fieldTrialsString =
       Object.entries(fieldTrials)
         .map(([k, v]) => `${k}/${v}`)
         .join('/') + '/';
-    /* eslint-enable prefer-template */
     Object.defineProperty(this, Native.callEndpointPropertyKey, {
       configurable: true, // allows it to be changed
       get() {
@@ -66,7 +59,7 @@ class NativeCallManager {
           configurable: true, // allows it to be changed
           value: callEndpoint,
         });
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+        // oxlint-disable-next-line typescript/no-unsafe-return
         return callEndpoint;
       },
     });
@@ -76,6 +69,7 @@ class NativeCallManager {
 // Mirror methods onto NativeCallManager.
 // This is done through direct assignment rather than wrapper methods to avoid indirection.
 (NativeCallManager.prototype as any).setSelfUuid = Native.cm_setSelfUuid;
+(NativeCallManager.prototype as any).addAsset = Native.cm_addAsset;
 (NativeCallManager.prototype as any).createOutgoingCall =
   Native.cm_createOutgoingCall;
 (NativeCallManager.prototype as any).proceed = Native.cm_proceed;
@@ -103,6 +97,8 @@ class NativeCallManager {
   Native.cm_httpRequestFailed;
 (NativeCallManager.prototype as any).setOutgoingAudioEnabled =
   Native.cm_setOutgoingAudioEnabled;
+(NativeCallManager.prototype as any).setMicrophoneWarmupEnabled =
+  Native.cm_setMicrophoneWarmupEnabled;
 (NativeCallManager.prototype as any).setOutgoingVideoEnabled =
   Native.cm_setOutgoingVideoEnabled;
 (NativeCallManager.prototype as any).setOutgoingVideoIsScreenShare =
@@ -127,6 +123,10 @@ class NativeCallManager {
 (NativeCallManager.prototype as any).groupRaiseHand = Native.cm_groupRaiseHand;
 (NativeCallManager.prototype as any).setOutgoingAudioMuted =
   Native.cm_setOutgoingAudioMuted;
+(NativeCallManager.prototype as any).setOutgoingAudioMutedRemotely =
+  Native.cm_setOutgoingAudioMutedRemotely;
+(NativeCallManager.prototype as any).sendRemoteMuteRequest =
+  Native.cm_sendRemoteMuteRequest;
 (NativeCallManager.prototype as any).setOutgoingVideoMuted =
   Native.cm_setOutgoingVideoMuted;
 (NativeCallManager.prototype as any).setOutgoingGroupCallVideoIsScreenShare =
@@ -156,25 +156,27 @@ class NativeCallManager {
 (NativeCallManager.prototype as any).getAudioOutputs =
   Native.cm_getAudioOutputs;
 (NativeCallManager.prototype as any).setAudioOutput = Native.cm_setAudioOutput;
+(NativeCallManager.prototype as any).setVoiceProcessingEnabled =
+  Native.cm_setVoiceProcessingEnabled;
 (NativeCallManager.prototype as any).processEvents = Native.cm_processEvents;
 (NativeCallManager.prototype as any).setRtcStatsInterval =
   Native.cm_setRtcStatsInterval;
 
-type GroupId = Buffer;
-type GroupCallUserId = Buffer;
+type GroupId = Uint8Array<ArrayBuffer>;
+type GroupCallUserId = Uint8Array<ArrayBuffer>;
 
-export interface PeekDeviceInfo {
+export type PeekDeviceInfo = {
   demuxId: number;
   userId?: GroupCallUserId;
-}
+};
 
-export interface Reaction {
+export type Reaction = {
   demuxId: number;
   value: string;
-}
+};
 
 /** type returned by Rust */
-export interface RawPeekInfo {
+export type RawPeekInfo = {
   devices: Array<PeekDeviceInfo>;
   creator?: GroupCallUserId;
   eraId?: string;
@@ -185,10 +187,10 @@ export interface RawPeekInfo {
   deviceCountExcludingPendingDevices: number;
   pendingUsers: Array<GroupCallUserId>;
   callLinkState?: RawCallLinkState;
-}
+};
 
 /** type derived from RawPeekInfo */
-export interface PeekInfo {
+export type PeekInfo = {
   devices: Array<PeekDeviceInfo>;
   creator?: GroupCallUserId;
   eraId?: string;
@@ -199,7 +201,7 @@ export interface PeekInfo {
   deviceCountExcludingPendingDevices: number;
   pendingUsers: Array<GroupCallUserId>;
   callLinkState?: CallLinkState;
-}
+};
 
 export enum PeekStatusCodes {
   EXPIRED_CALL_LINK = 703,
@@ -256,12 +258,13 @@ export class ReceivedAudioLevel {
   }
 }
 
-interface RawCallLinkState {
+type RawCallLinkState = {
   name: string;
   rawRestrictions: number;
   revoked: boolean;
   expiration: Date;
-}
+  rootKey: Uint8Array<ArrayBuffer>;
+};
 
 function normalizeAudioLevel(raw: RawAudioLevel): NormalizedAudioLevel {
   return raw / 32767;
@@ -287,11 +290,11 @@ function rawCallLinkStateToCallLinkState(
       raw.name,
       restrictions,
       raw.revoked,
-      raw.expiration
+      raw.expiration,
+      new CallLinkRootKey(raw.rootKey)
     );
-  } else {
-    return undefined;
   }
+  return undefined;
 }
 
 function rawPeekInfoToPeekInfo(raw: RawPeekInfo): PeekInfo {
@@ -302,23 +305,36 @@ function rawPeekInfoToPeekInfo(raw: RawPeekInfo): PeekInfo {
 }
 
 class Requests<T> {
-  private _resolveById: Map<number, (response: T) => void> = new Map();
+  private readonly _resolveById = new Map<
+    number,
+    [(response: T) => void, () => void]
+  >();
   private _nextId = 1;
 
   add(): [number, Promise<T>] {
     const id = this._nextId++;
-    const promise = new Promise<T>((resolve, _reject) => {
-      this._resolveById.set(id, resolve);
+    const promise = new Promise<T>((resolve, reject) => {
+      this._resolveById.set(id, [resolve, reject]);
     });
     return [id, promise];
   }
 
   resolve(id: number, response: T): boolean {
-    const resolve = this._resolveById.get(id);
-    if (!resolve) {
+    const callbacks = this._resolveById.get(id);
+    if (!callbacks) {
       return false;
     }
-    resolve(response);
+    callbacks[0](response);
+    this._resolveById.delete(id);
+    return true;
+  }
+
+  reject(id: number) {
+    const callbacks = this._resolveById.get(id);
+    if (!callbacks) {
+      return false;
+    }
+    callbacks[1]();
     this._resolveById.delete(id);
     return true;
   }
@@ -349,20 +365,16 @@ export type HttpResult<T> =
 export class RingRTCType {
   private readonly callManager: CallManager;
   private _call: Call | null;
-  private _groupCallByClientId: Map<GroupCallClientId, GroupCall>;
-  private _peekRequests: Requests<HttpResult<PeekInfo>>;
-  private _callLinkRequests: Requests<HttpResult<CallLinkState>>;
-  private _emptyRequests: Requests<HttpResult<undefined>>;
+  private readonly _groupCallByClientId: Map<GroupCallClientId, GroupCall>;
+  private readonly _peekRequests: Requests<HttpResult<PeekInfo>>;
+  private readonly _callLinkRequests: Requests<HttpResult<CallLinkState>>;
+  private readonly _emptyRequests: Requests<HttpResult<undefined>>;
 
   // A map to hold call information not maintained in RingRTC.
-  private _callInfoByCallId: Map<string, CallInfo>;
+  private readonly _callInfoByCallId: Map<string, CallInfo>;
 
   private getCallInfoKey(callId: CallId): string {
-    // CallId is u64 so use a string key instead.
-    // Note that the representation is not padded, so we include a separator.
-    // Otherwise {1, 123} and {11, 23} would have the same key.
-    // (We could use Long.toString as well, but it doesn't matter what the key is.)
-    return `${callId.high} ${callId.low}`;
+    return callId.toString();
   }
 
   // Set by UX
@@ -374,11 +386,19 @@ export class RingRTCType {
 
   handleStartCall: ((call: Call) => Promise<boolean>) | null = null;
 
-  handleAutoEndedIncomingCallRequest:
+  handleOutputDeviceChanged:
+    | ((devices: Array<AudioDevice>) => Promise<void>)
+    | null = null;
+
+  handleInputDeviceChanged:
+    | ((devices: Array<AudioDevice>) => Promise<void>)
+    | null = null;
+
+  handleRejectedIncomingCallRequest:
     | ((
         callId: CallId,
         remoteUserId: UserId,
-        reason: CallEndedReason,
+        reason: CallRejectReason,
         ageSec: number,
         wasVideoCall: boolean,
         receivedAtCounter: number | undefined,
@@ -401,32 +421,44 @@ export class RingRTCType {
         url: string,
         method: HttpMethod,
         headers: { [name: string]: string },
-        body: Buffer | undefined
+        body: Uint8Array<ArrayBuffer> | undefined
       ) => void)
     | null = null;
 
   handleSendCallMessage:
     | ((
-        recipientUuid: Buffer,
-        message: Buffer,
+        recipientUuid: Uint8Array<ArrayBuffer>,
+        message: Uint8Array<ArrayBuffer>,
         urgency: CallMessageUrgency
       ) => void)
     | null = null;
 
   handleSendCallMessageToGroup:
     | ((
-        groupId: Buffer,
-        message: Buffer,
+        groupId: GroupId,
+        message: Uint8Array<ArrayBuffer>,
         urgency: CallMessageUrgency,
-        overrideRecipients: Array<Buffer>
+        overrideRecipients: Array<Uint8Array<ArrayBuffer>>
+      ) => void)
+    | null = null;
+
+  handleSendCallMessageToAdhocGroup:
+    | ((
+        message: Uint8Array<ArrayBuffer>,
+        urgency: CallMessageUrgency,
+        expiration: Date,
+        recipientsAndEndorsements: Array<{
+          recipientId: Uint8Array<ArrayBuffer>;
+          endorsement: Uint8Array<ArrayBuffer>;
+        }>
       ) => void)
     | null = null;
 
   handleGroupCallRingUpdate:
     | ((
-        groupId: Buffer,
+        groupId: GroupId,
         ringId: bigint,
-        sender: Buffer,
+        sender: GroupCallUserId,
         update: RingUpdate
       ) => void)
     | null = null;
@@ -448,8 +480,18 @@ export class RingRTCType {
   }
 
   // Called by UX
-  setSelfUuid(uuid: Buffer): void {
+  setSelfUuid(uuid: Uint8Array<ArrayBuffer>): void {
     this.callManager.setSelfUuid(uuid);
+  }
+
+  // Called by UX
+  addAsset(
+    assetGroup: string,
+    asset: { filePath: string } | { content: Uint8Array<ArrayBuffer> }
+  ): void {
+    const filePath = 'filePath' in asset ? asset.filePath : null;
+    const content = 'content' in asset ? asset.content : null;
+    this.callManager.addAsset(assetGroup, filePath, content);
   }
 
   // Called by UX
@@ -473,7 +515,6 @@ export class RingRTCType {
       CallState.Prering
     );
     this._call = call;
-    call.outgoingVideoEnabled = isVideoCall;
     return call;
   }
 
@@ -529,8 +570,8 @@ export class RingRTCType {
     // after the outgoing call is ended. In that case, ignore it once.
     if (
       this._call &&
-      (this._call.endedReason === CallEndedReason.Glare ||
-        this._call.endedReason === CallEndedReason.ReCall)
+      (this._call.endedReason === CallEndReason.RemoteGlare ||
+        this._call.endedReason === CallEndReason.RemoteReCall)
     ) {
       this._call.endedReason = undefined;
       // EVIL HACK: We are the "loser" of a glare collision and have ended the outgoing call
@@ -596,7 +637,13 @@ export class RingRTCType {
         callId,
         settings.iceServers,
         settings.hideIp,
-        settings.dataMode,
+        {
+          dataMode: settings.dataMode,
+          dredDuration: settings.dredDuration ?? 0,
+          enableVp9Encode: settings.enableVp9Encode ?? true,
+          enableVp9Decode: settings.enableVp9Decode ?? true,
+          statsIntervalSecs: settings.statsIntervalSecs,
+        },
         settings.audioLevelsIntervalMillis || 0
       );
     });
@@ -612,10 +659,10 @@ export class RingRTCType {
   }
 
   // Called by Rust
-  onCallEnded(
+  onCallRejected(
     remoteUserId: UserId,
     callId: CallId,
-    reason: CallEndedReason,
+    reason: CallRejectReason,
     ageSec: number
   ): void {
     const callInfo = this._callInfoByCallId.get(this.getCallInfoKey(callId));
@@ -624,24 +671,13 @@ export class RingRTCType {
       receivedAtCounter: undefined,
       receivedAtDate: undefined,
     };
-    this._callInfoByCallId.delete(this.getCallInfoKey(callId));
 
     const call = this._call;
-    if (call && reason == CallEndedReason.ReceivedOfferWithGlare) {
+    if (call && reason == CallRejectReason.ReceivedOfferWithGlare) {
       // The current call is the outgoing call.
-      // The ended call is the incoming call.
+      // The rejected call is the incoming call.
       // We're the "winner", so ignore the incoming call and keep going with the outgoing call.
       return;
-    }
-
-    if (
-      call &&
-      (reason === CallEndedReason.Glare || reason === CallEndedReason.ReCall)
-    ) {
-      // The current call is the outgoing call.
-      // The ended call is the outgoing call.
-      // We're the "loser", so end the outgoing/current call and wait for a new incoming call.
-      // (proceeded down to the code below)
     }
 
     // If there is no call or the remoteUserId doesn't match that of the current
@@ -653,12 +689,12 @@ export class RingRTCType {
     if (
       !call ||
       call.remoteUserId !== remoteUserId ||
-      reason === CallEndedReason.ReceivedOfferWhileActive ||
-      reason === CallEndedReason.ReceivedOfferExpired ||
+      reason === CallRejectReason.ReceivedOfferWhileActive ||
+      reason === CallRejectReason.ReceivedOfferExpired ||
       (call.state === CallState.Prering && call.isIncoming)
     ) {
-      if (this.handleAutoEndedIncomingCallRequest) {
-        this.handleAutoEndedIncomingCallRequest(
+      if (this.handleRejectedIncomingCallRequest) {
+        this.handleRejectedIncomingCallRequest(
           callId,
           remoteUserId,
           reason,
@@ -668,21 +704,26 @@ export class RingRTCType {
           receivedAtDate
         );
       }
-
-      if (call && call.state === CallState.Prering && call.isIncoming) {
-        // Set the state to Ended without triggering a state update since we
-        // already notified the client.
-        call.endedReason = reason;
-        call.setCallEnded();
-      }
-
-      return;
     }
+  }
 
-    // Send the end reason first because setting the state triggers
-    // call.handleStateChanged, which may look at call.endedReason.
-    call.endedReason = reason;
-    call.state = CallState.Ended;
+  // Called by Rust
+  onCallEnded(
+    remoteUserId: UserId,
+    callId: CallId,
+    reason: CallEndReason,
+    summary: CallSummary
+  ): void {
+    this._callInfoByCallId.delete(this.getCallInfoKey(callId));
+
+    const call = this._call;
+    if (call) {
+      // Set the end reason first because setting the state triggers
+      // call.handleStateChanged, which may look at call.endedReason.
+      call.endedReason = reason;
+      call.summary = summary;
+      call.state = CallState.Ended;
+    }
   }
 
   onRemoteAudioEnabled(remoteUserId: UserId, enabled: boolean): void {
@@ -764,7 +805,11 @@ export class RingRTCType {
     }
   }
 
-  renderVideoFrame(width: number, height: number, buffer: Buffer): void {
+  renderVideoFrame(
+    width: number,
+    height: number,
+    buffer: Uint8Array<ArrayBuffer>
+  ): void {
     const call = this._call;
     if (!call) {
       return;
@@ -782,7 +827,7 @@ export class RingRTCType {
     callId: CallId,
     broadcast: boolean,
     offerType: OfferType,
-    opaque: Buffer
+    opaque: Uint8Array<ArrayBuffer>
   ): void {
     const message = new CallingMessage();
     message.offer = new OfferMessage(callId, offerType, opaque);
@@ -801,7 +846,7 @@ export class RingRTCType {
     remoteDeviceId: DeviceId,
     callId: CallId,
     broadcast: boolean,
-    opaque: Buffer
+    opaque: Uint8Array<ArrayBuffer>
   ): void {
     const message = new CallingMessage();
     message.answer = new AnswerMessage(callId, opaque);
@@ -820,7 +865,7 @@ export class RingRTCType {
     remoteDeviceId: DeviceId,
     callId: CallId,
     broadcast: boolean,
-    candidates: Array<Buffer>
+    candidates: Array<Uint8Array<ArrayBuffer>>
   ): void {
     const message = new CallingMessage();
     message.iceCandidates = [];
@@ -883,6 +928,7 @@ export class RingRTCType {
     message: CallingMessage
   ): void {
     if (!broadcast) {
+      // oxlint-disable-next-line eslint/no-param-reassign
       message.destinationDeviceId = remoteDeviceId;
     }
 
@@ -917,7 +963,7 @@ export class RingRTCType {
    */
   readCallLink(
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
     linkRootKey: CallLinkRootKey
   ): Promise<HttpResult<CallLinkState>> {
     const [requestId, promise] = this._callLinkRequests.add();
@@ -971,10 +1017,10 @@ export class RingRTCType {
    */
   createCallLink(
     sfuUrl: string,
-    createCredentialPresentation: Buffer,
+    createCredentialPresentation: Uint8Array<ArrayBuffer>,
     linkRootKey: CallLinkRootKey,
-    adminPasskey: Buffer,
-    callLinkPublicParams: Buffer,
+    adminPasskey: Uint8Array<ArrayBuffer>,
+    callLinkPublicParams: Uint8Array<ArrayBuffer>,
     restrictions: Exclude<CallLinkRestrictions, CallLinkRestrictions.Unknown>
   ): Promise<HttpResult<CallLinkState>> {
     const [requestId, promise] = this._callLinkRequests.add();
@@ -1010,9 +1056,9 @@ export class RingRTCType {
    */
   updateCallLinkName(
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
     linkRootKey: CallLinkRootKey,
-    adminPasskey: Buffer,
+    adminPasskey: Uint8Array<ArrayBuffer>,
     newName: string
   ): Promise<HttpResult<CallLinkState>> {
     const [requestId, promise] = this._callLinkRequests.add();
@@ -1050,9 +1096,9 @@ export class RingRTCType {
    */
   updateCallLinkRestrictions(
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
     linkRootKey: CallLinkRootKey,
-    adminPasskey: Buffer,
+    adminPasskey: Uint8Array<ArrayBuffer>,
     restrictions: Exclude<CallLinkRestrictions, CallLinkRestrictions.Unknown>
   ): Promise<HttpResult<CallLinkState>> {
     const [requestId, promise] = this._callLinkRequests.add();
@@ -1088,9 +1134,9 @@ export class RingRTCType {
    */
   deleteCallLink(
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
     linkRootKey: CallLinkRootKey,
-    adminPasskey: Buffer
+    adminPasskey: Uint8Array<ArrayBuffer>
   ): Promise<HttpResult<undefined>> {
     const [requestId, promise] = this._emptyRequests.add();
     // Response comes back via handleCallLinkResponse
@@ -1108,7 +1154,11 @@ export class RingRTCType {
 
   // HTTP callbacks
 
-  receivedHttpResponse(requestId: number, status: number, body: Buffer): void {
+  receivedHttpResponse(
+    requestId: number,
+    status: number,
+    body: Uint8Array<ArrayBuffer>
+  ): void {
     sillyDeadlockProtection(() => {
       try {
         this.callManager.receivedHttpResponse(requestId, status, body);
@@ -1134,18 +1184,27 @@ export class RingRTCType {
 
   // Called by UX
   getGroupCall(
-    groupId: Buffer,
+    groupId: GroupId,
     sfuUrl: string,
-    hkdfExtraInfo: Buffer,
+    hkdfExtraInfo: Uint8Array<ArrayBuffer>,
     audioLevelsIntervalMillis: number | undefined,
+    dredDuration: number | undefined,
+    svcConfig: GroupCallSvcConfig | undefined,
     observer: GroupCallObserver
   ): GroupCall | undefined {
     const clientId = this.callManager.createGroupCallClient(
       groupId,
       sfuUrl,
       hkdfExtraInfo,
-      audioLevelsIntervalMillis || 0
+      audioLevelsIntervalMillis ?? 0,
+      dredDuration ?? 0,
+      svcConfig
     );
+    if (clientId === INVALID_CLIENT_ID) {
+      // Return undefined since the group call client creation failed.
+      return undefined;
+    }
+
     const groupCall = new GroupCall(
       GroupCallKind.SignalGroup,
       this.callManager,
@@ -1161,21 +1220,32 @@ export class RingRTCType {
   // Called by UX
   getCallLinkCall(
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
+    endorsementPublicKey: Uint8Array<ArrayBuffer>,
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
     rootKey: CallLinkRootKey,
-    adminPasskey: Buffer | undefined,
-    hkdfExtraInfo: Buffer,
+    adminPasskey: Uint8Array<ArrayBuffer> | undefined,
+    hkdfExtraInfo: Uint8Array<ArrayBuffer>,
     audioLevelsIntervalMillis: number | undefined,
+    dredDuration: number | undefined,
+    svcConfig: GroupCallSvcConfig | undefined,
     observer: GroupCallObserver
   ): GroupCall | undefined {
     const clientId = this.callManager.createCallLinkCallClient(
       sfuUrl,
+      endorsementPublicKey,
       authCredentialPresentation,
       rootKey.bytes,
       adminPasskey,
       hkdfExtraInfo,
-      audioLevelsIntervalMillis || 0
+      audioLevelsIntervalMillis || 0,
+      dredDuration ?? 0,
+      svcConfig
     );
+    if (clientId === INVALID_CLIENT_ID) {
+      // Return undefined since the call link client creation failed.
+      return undefined;
+    }
+
     const groupCall = new GroupCall(
       GroupCallKind.CallLink,
       this.callManager,
@@ -1192,7 +1262,7 @@ export class RingRTCType {
   // Returns a list of user IDs
   peekGroupCall(
     sfuUrl: string,
-    membershipProof: Buffer,
+    membershipProof: Uint8Array<ArrayBuffer>,
     groupMembers: Array<GroupMemberInfo>
   ): Promise<PeekInfo> {
     const [requestId, promise] = this._peekRequests.add();
@@ -1208,22 +1278,28 @@ export class RingRTCType {
     return promise.then(result => {
       if (result.success) {
         return result.value;
-      } else {
-        return {
-          devices: [],
-          deviceCount: 0,
-          deviceCountIncludingPendingDevices: 0,
-          deviceCountExcludingPendingDevices: 0,
-          pendingUsers: [],
-        };
       }
+      return {
+        devices: [],
+        deviceCount: 0,
+        deviceCountIncludingPendingDevices: 0,
+        deviceCountExcludingPendingDevices: 0,
+        pendingUsers: [],
+      };
+    });
+  }
+
+  // Called by UX
+  setMicrophoneWarmupEnabled(warmup: boolean): void {
+    sillyDeadlockProtection(() => {
+      this.callManager.setMicrophoneWarmupEnabled(warmup);
     });
   }
 
   // Called by UX
   peekCallLinkCall(
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
     rootKey: CallLinkRootKey
   ): Promise<HttpResult<PeekInfo>> {
     const [requestId, promise] = this._peekRequests.add();
@@ -1471,7 +1547,11 @@ export class RingRTCType {
   }
 
   // Called by Rust
-  handleEnded(clientId: GroupCallClientId, reason: GroupCallEndReason): void {
+  handleEnded(
+    clientId: GroupCallClientId,
+    reason: CallEndReason,
+    summary: CallSummary
+  ): void {
     sillyDeadlockProtection(() => {
       const groupCall = this._groupCallByClientId.get(clientId);
       if (!groupCall) {
@@ -1481,7 +1561,7 @@ export class RingRTCType {
 
       this._groupCallByClientId.delete(clientId);
 
-      groupCall.handleEnded(reason);
+      groupCall.handleEnded(reason, summary);
     });
   }
 
@@ -1506,6 +1586,58 @@ export class RingRTCType {
     if (this.handleRtcStatsReport) {
       this.handleRtcStatsReport(reportJson);
     }
+  }
+
+  // Called by Rust
+  handleSpeechEvent(clientId: GroupCallClientId, event: SpeechEvent): void {
+    sillyDeadlockProtection(() => {
+      const groupCall = this._groupCallByClientId.get(clientId);
+      if (groupCall) {
+        groupCall.handleSpeechEvent(event);
+      }
+    });
+  }
+
+  // Called by Rust
+  onRemoteMute(clientId: GroupCallClientId, demuxId: number): void {
+    sillyDeadlockProtection(() => {
+      const groupCall = this._groupCallByClientId.get(clientId);
+      if (groupCall) {
+        groupCall.onRemoteMute(demuxId);
+      }
+    });
+  }
+
+  // Called by Rust.
+  onObservedRemoteMute(
+    clientId: GroupCallClientId,
+    sourceDemuxId: number,
+    targetDemuxId: number
+  ): void {
+    sillyDeadlockProtection(() => {
+      const groupCall = this._groupCallByClientId.get(clientId);
+      if (groupCall) {
+        groupCall.onObservedRemoteMute(sourceDemuxId, targetDemuxId);
+      }
+    });
+  }
+
+  // Called by Rust
+  onOutputDeviceChanged(devices: Array<AudioDevice>): void {
+    (async () => {
+      if (this.handleOutputDeviceChanged) {
+        await this.handleOutputDeviceChanged(devices);
+      }
+    })().catch(e => this.logError(e.toString()));
+  }
+
+  // Called by Rust
+  onInputDeviceChanged(devices: Array<AudioDevice>): void {
+    (async () => {
+      if (this.handleInputDeviceChanged) {
+        await this.handleInputDeviceChanged(devices);
+      }
+    })().catch(e => this.logError(e.toString()));
   }
 
   // Called by Rust
@@ -1540,14 +1672,14 @@ export class RingRTCType {
     message: CallingMessage,
     options: {
       remoteUserId: UserId;
-      remoteUuid?: Buffer;
+      remoteUuid?: Uint8Array<ArrayBuffer>;
       remoteDeviceId: DeviceId;
       localDeviceId: DeviceId;
       ageSec: number;
       receivedAtCounter: number;
       receivedAtDate: number;
-      senderIdentityKey: Buffer;
-      receiverIdentityKey: Buffer;
+      senderIdentityKey: Uint8Array<ArrayBuffer>;
+      receiverIdentityKey: Uint8Array<ArrayBuffer>;
     }
   ): void {
     if (
@@ -1560,7 +1692,7 @@ export class RingRTCType {
 
     if (message.offer?.callId) {
       const callId = message.offer.callId;
-      const opaque = toBuffer(message.offer.opaque);
+      const opaque = message.offer.opaque;
 
       // opaque is required. sdp is obsolete, but it might still come with opaque.
       if (!opaque) {
@@ -1595,7 +1727,7 @@ export class RingRTCType {
     }
     if (message.answer?.callId) {
       const callId = message.answer.callId;
-      const opaque = toBuffer(message.answer.opaque);
+      const opaque = message.answer.opaque;
 
       // opaque is required. sdp is obsolete, but it might still come with opaque.
       if (!opaque) {
@@ -1618,10 +1750,9 @@ export class RingRTCType {
     if (message.iceCandidates && message.iceCandidates.length > 0) {
       // We assume they all have the same .callId
       const callId = message.iceCandidates[0].callId;
-      // We have to copy them to do the .toArrayBuffer() thing.
-      const candidates: Array<Buffer> = [];
+      const candidates: Array<Uint8Array<ArrayBuffer>> = [];
       for (const candidate of message.iceCandidates) {
-        const copy = toBuffer(candidate.opaque);
+        const copy = candidate.opaque;
         if (copy) {
           candidates.push(copy);
         } else {
@@ -1679,7 +1810,7 @@ export class RingRTCType {
         );
         return;
       }
-      const data = toBuffer(message.opaque.data);
+      const data = message.opaque.data;
       if (data == undefined) {
         this.logError(
           'handleCallingMessage(): opaque message received without data!'
@@ -1702,7 +1833,7 @@ export class RingRTCType {
     url: string,
     method: HttpMethod,
     headers: { [name: string]: string },
-    body: Buffer | undefined
+    body: Uint8Array<ArrayBuffer> | undefined
   ): void {
     if (this.handleSendHttpRequest) {
       this.handleSendHttpRequest(requestId, url, method, headers, body);
@@ -1713,8 +1844,8 @@ export class RingRTCType {
 
   // Called by Rust
   sendCallMessage(
-    recipientUuid: Buffer,
-    message: Buffer,
+    recipientUuid: Uint8Array<ArrayBuffer>,
+    message: Uint8Array<ArrayBuffer>,
     urgency: CallMessageUrgency
   ): void {
     if (this.handleSendCallMessage) {
@@ -1726,10 +1857,10 @@ export class RingRTCType {
 
   // Called by Rust
   sendCallMessageToGroup(
-    groupId: Buffer,
-    message: Buffer,
+    groupId: GroupId,
+    message: Uint8Array<ArrayBuffer>,
     urgency: CallMessageUrgency,
-    overrideRecipients: Array<Buffer>
+    overrideRecipients: Array<Uint8Array<ArrayBuffer>>
   ): void {
     if (this.handleSendCallMessageToGroup) {
       this.handleSendCallMessageToGroup(
@@ -1743,6 +1874,28 @@ export class RingRTCType {
     }
   }
 
+  // Called by Rust
+  sendCallMessageToAdhocGroup(
+    message: Uint8Array<ArrayBuffer>,
+    urgency: CallMessageUrgency,
+    expiration: Date,
+    recipientsAndEndorsements: Array<{
+      recipientId: Uint8Array<ArrayBuffer>;
+      endorsement: Uint8Array<ArrayBuffer>;
+    }>
+  ): void {
+    if (this.handleSendCallMessageToAdhocGroup) {
+      this.handleSendCallMessageToAdhocGroup(
+        message,
+        urgency,
+        expiration,
+        recipientsAndEndorsements
+      );
+    } else {
+      this.logError('RingRTC.handleSendCallMessageToAdhocGroup is not set!');
+    }
+  }
+
   // These are convenience methods.  One could use the Call class instead.
   get call(): Call | null {
     return this._call;
@@ -1751,25 +1904,19 @@ export class RingRTCType {
   getCall(callId: CallId): Call | null {
     const call = this.call;
 
-    if (
-      call &&
-      call.callId.high === callId.high &&
-      call.callId.low === callId.low
-    ) {
+    if (call && call.callId === callId) {
       return call;
     }
     return null;
   }
 
-  accept(callId: CallId, asVideoCall: boolean): void {
+  accept(callId: CallId): void {
     const call = this.getCall(callId);
     if (!call) {
       return;
     }
 
     call.accept();
-    call.outgoingAudioEnabled = true;
-    call.outgoingVideoEnabled = asVideoCall;
   }
 
   decline(callId: CallId): void {
@@ -1799,51 +1946,6 @@ export class RingRTCType {
     call.hangup();
   }
 
-  setOutgoingAudio(callId: CallId, enabled: boolean): void {
-    const call = this.getCall(callId);
-    if (!call) {
-      return;
-    }
-
-    call.outgoingAudioEnabled = enabled;
-  }
-
-  setOutgoingVideo(callId: CallId, enabled: boolean): void {
-    const call = this.getCall(callId);
-    if (!call) {
-      return;
-    }
-
-    call.outgoingVideoEnabled = enabled;
-  }
-
-  setOutgoingVideoIsScreenShare(callId: CallId, isScreenShare: boolean): void {
-    const call = this.getCall(callId);
-    if (!call) {
-      return;
-    }
-
-    call.outgoingVideoIsScreenShare = isScreenShare;
-  }
-
-  setVideoCapturer(callId: CallId, capturer: VideoCapturer | null): void {
-    const call = this.getCall(callId);
-    if (!call) {
-      return;
-    }
-
-    call.videoCapturer = capturer;
-  }
-
-  setVideoRenderer(callId: CallId, renderer: VideoRenderer | null): void {
-    const call = this.getCall(callId);
-    if (!call) {
-      return;
-    }
-
-    call.videoRenderer = renderer;
-  }
-
   getAudioInputs(): Array<AudioDevice> {
     return this.callManager.getAudioInputs();
   }
@@ -1859,25 +1961,52 @@ export class RingRTCType {
   setAudioOutput(index: number): void {
     this.callManager.setAudioOutput(index);
   }
+
+  /**
+   *  Enables or disables different voice processing techniques including:
+   * - Acoustic Echo Cancellation (AEC)
+   * - Noise Supression (NS)
+   * - Automatic Gain Control (AGC)
+   *
+   * This request is idempotent
+   *
+   * @param enabled - whether to enable voice processing
+   */
+  setVoiceProcessingEnabled(enabled: boolean): void {
+    this.callManager.setVoiceProcessingEnabled(enabled);
+  }
 }
 
-export interface CallSettings {
+type CallConfig = {
+  dataMode: DataMode;
+  dredDuration: number;
+  enableVp9Encode: boolean;
+  enableVp9Decode: boolean;
+  statsIntervalSecs?: number;
+};
+
+export type CallSettings = {
   iceServers: Array<IceServer>;
   hideIp: boolean;
   dataMode: DataMode;
   audioLevelsIntervalMillis?: number;
-}
+  dredDuration?: number;
+  enableVp9Encode?: boolean;
+  enableVp9Decode?: boolean;
+  // If present, sets the stats log interval
+  statsIntervalSecs?: number;
+};
 
-interface IceServer {
+type IceServer = {
   username?: string;
   password?: string;
   /** Provide hostname when urls contain IP addresses instead of hostname */
   hostname?: string;
   urls: Array<string>;
-}
+};
 
 // Describes an audio input or output device.
-export interface AudioDevice {
+export type AudioDevice = {
   // Device name.
   name: string;
   // Index of this device, starting from 0.
@@ -1886,21 +2015,81 @@ export interface AudioDevice {
   uniqueId: string;
   // If present, the identifier of a localized string to substitute for the device name.
   i18nKey?: string;
+};
+
+// Given a weird name to not conflict with WebCodec's VideoPixelFormat
+export enum VideoPixelFormatEnum {
+  I420 = 0,
+  Nv12 = 1,
+  Rgba = 2,
 }
 
-export interface VideoCapturer {
-  enableCapture(): void;
-  enableCaptureAndSend(
-    call: Call,
-    captureOptions?: GumVideoCaptureOptions
+export function videoPixelFormatToEnum(
+  format: VideoPixelFormat
+): VideoPixelFormatEnum | undefined {
+  switch (format) {
+    case 'I420': {
+      return VideoPixelFormatEnum.I420;
+    }
+    case 'NV12': {
+      return VideoPixelFormatEnum.Nv12;
+    }
+    case 'RGBA': {
+      return VideoPixelFormatEnum.Rgba;
+    }
+  }
+}
+
+/**
+ * Interface for sending video frames to the RingRTC library.
+ *
+ * VideoFrameSender is used to transmit video frames (from a camera or screen share) over
+ * RTP via the RingRTC library.
+ */
+export type VideoFrameSender = {
+  /**
+   * Sends a video frame to be transmitted via RingRTC.
+   *
+   * @param width - The width of the video frame in pixels
+   * @param height - The height of the video frame in pixels
+   * @param format - The pixel format of the video data
+   * @param buffer - The raw video frame data
+   */
+  sendVideoFrame(
+    width: number,
+    height: number,
+    format: VideoPixelFormatEnum,
+    buffer: Uint8Array<ArrayBuffer>
   ): void;
-  disable(): void;
-}
+};
 
-export interface VideoRenderer {
-  enable(call: Call): void;
-  disable(): void;
-}
+/**
+ * Interface for retrieving received video frames from the RingRTC library.
+ */
+export type VideoFrameSource = {
+  /**
+   * Copies the latest frame into `buffer`.
+   *
+   * Note that `maxWidth` and `maxHeight` specify maximum dimensions, but allow for rotation,
+   * i.e. a maximum of 1920x1080 will also allow portrait-mode 1080x1920.
+   *
+   * @param buffer - The destination buffer where the frame will be copied
+   * @param maxWidth - Maximum width of the frame to receive
+   * @param maxHeight - Maximum height of the frame to receive
+   * @returns
+   *   A tuple of [width, height] of the received frame, containing:
+   *   - The width in pixels of the received frame
+   *   - The height in pixels of the received frame
+   *
+   *   Returns undefined if no new frame is available
+   */
+  receiveVideoFrame(
+    buffer: Uint8Array<ArrayBuffer>,
+    maxWidth: number,
+    maxHeight: number
+  ): [number, number] | undefined;
+};
+
 export class Call {
   // The calls' info and state.
   private readonly _callManager: CallManager;
@@ -1910,18 +2099,21 @@ export class Call {
   private readonly _isIncoming: boolean;
   private readonly _isVideoCall: boolean;
   private _state: CallState;
+
+  // Media state flags.
+  private _mediaSessionStarted = false;
   private _outgoingAudioEnabled = false;
   private _outgoingVideoEnabled = false;
   private _outgoingVideoIsScreenShare = false;
+
   private _remoteAudioEnabled = false;
   private _remoteVideoEnabled = false;
   outgoingAudioLevel: NormalizedAudioLevel = 0;
   remoteAudioLevel: NormalizedAudioLevel = 0;
   remoteSharingScreen = false;
   networkRoute: NetworkRoute = new NetworkRoute();
-  private _videoCapturer: VideoCapturer | null = null;
-  private _videoRenderer: VideoRenderer | null = null;
-  endedReason?: CallEndedReason;
+  endedReason?: CallEndReason;
+  summary?: CallSummary;
 
   // These callbacks should be set by the UX code.
   handleStateChanged?: () => void;
@@ -1944,7 +2136,11 @@ export class Call {
 
   // This callback should be set by the VideoCapturer,
   // But could also be set by the UX.
-  renderVideoFrame?: (width: number, height: number, buffer: Buffer) => void;
+  renderVideoFrame?: (
+    width: number,
+    height: number,
+    buffer: Uint8Array<ArrayBuffer>
+  ) => void;
 
   constructor(
     callManager: CallManager,
@@ -1983,12 +2179,35 @@ export class Call {
       return;
     }
     this._state = state;
+
     if (state === CallState.Accepted) {
-      // Make sure the status gets sent.
-      this.outgoingAudioEnabled = this._outgoingAudioEnabled;
+      // We might have been in the reconnecting state and already started media.
+      if (!this._mediaSessionStarted) {
+        sillyDeadlockProtection(() => {
+          // Set the audio state to the latest setting from the UX.
+          this._callManager.setOutgoingAudioEnabled(this._outgoingAudioEnabled);
+
+          if (this._outgoingVideoIsScreenShare) {
+            this._callManager.setOutgoingVideoIsScreenShare(true);
+            this._callManager.setOutgoingVideoEnabled(true);
+          } else if (this._outgoingVideoEnabled) {
+            this._callManager.setOutgoingVideoEnabled(true);
+          }
+        });
+        this._mediaSessionStarted = true;
+      }
+    } else if (state === CallState.Ended) {
+      sillyDeadlockProtection(() => {
+        this._callManager.setOutgoingAudioEnabled(false);
+        this._callManager.setOutgoingVideoEnabled(false);
+        this._callManager.setMicrophoneWarmupEnabled(false);
+      });
+      this._outgoingAudioEnabled = false;
+      this._outgoingVideoEnabled = false;
+      this._outgoingVideoIsScreenShare = false;
+      this._mediaSessionStarted = false;
     }
-    this.enableOrDisableCapturer();
-    this.enableOrDisableRenderer();
+
     if (this.handleStateChanged) {
       this.handleStateChanged();
     }
@@ -1996,16 +2215,6 @@ export class Call {
 
   setCallEnded(): void {
     this._state = CallState.Ended;
-  }
-
-  set videoCapturer(capturer: VideoCapturer | null) {
-    this._videoCapturer = capturer;
-    this.enableOrDisableCapturer();
-  }
-
-  set videoRenderer(renderer: VideoRenderer | null) {
-    this._videoRenderer = renderer;
-    this.enableOrDisableRenderer();
   }
 
   accept(): void {
@@ -2021,46 +2230,8 @@ export class Call {
   }
 
   hangup(): void {
-    // This is a little faster than waiting for the
-    // change in call state to come back.
-    if (this._videoCapturer) {
-      this._videoCapturer.disable();
-    }
-    if (this._videoRenderer) {
-      this._videoRenderer.disable();
-    }
-    // This assumes we only have one active call.
     sillyDeadlockProtection(() => {
       this._callManager.hangup();
-    });
-  }
-
-  get outgoingAudioEnabled(): boolean {
-    return this._outgoingAudioEnabled;
-  }
-
-  set outgoingAudioEnabled(enabled: boolean) {
-    this._outgoingAudioEnabled = enabled;
-    // This assumes we only have one active call.
-    sillyDeadlockProtection(() => {
-      this._callManager.setOutgoingAudioEnabled(enabled);
-    });
-  }
-
-  get outgoingVideoEnabled(): boolean {
-    return this._outgoingVideoEnabled;
-  }
-
-  set outgoingVideoEnabled(enabled: boolean) {
-    this._outgoingVideoEnabled = enabled;
-    this.enableOrDisableCapturer();
-  }
-
-  set outgoingVideoIsScreenShare(isScreenShare: boolean) {
-    // This assumes we only have one active call.
-    this._outgoingVideoIsScreenShare = isScreenShare;
-    sillyDeadlockProtection(() => {
-      this._callManager.setOutgoingVideoIsScreenShare(isScreenShare);
     });
   }
 
@@ -2078,7 +2249,46 @@ export class Call {
 
   set remoteVideoEnabled(enabled: boolean) {
     this._remoteVideoEnabled = enabled;
-    this.enableOrDisableRenderer();
+  }
+
+  setOutgoingAudioMuted(muted: boolean): void {
+    const enabled = !muted;
+
+    if (this._mediaSessionStarted && this._outgoingAudioEnabled !== enabled) {
+      this._outgoingAudioEnabled = enabled;
+      sillyDeadlockProtection(() => {
+        this._callManager.setOutgoingAudioEnabled(enabled);
+      });
+    } else {
+      this._outgoingAudioEnabled = enabled;
+    }
+  }
+
+  setOutgoingVideoMuted(muted: boolean): void {
+    const enabled = !muted;
+
+    if (this._mediaSessionStarted && this._outgoingVideoEnabled !== enabled) {
+      this._outgoingVideoEnabled = enabled;
+      sillyDeadlockProtection(() => {
+        this._callManager.setOutgoingVideoEnabled(enabled);
+      });
+    } else {
+      this._outgoingVideoEnabled = enabled;
+    }
+  }
+
+  setOutgoingVideoIsScreenShare(isScreenShare: boolean): void {
+    if (
+      this._mediaSessionStarted &&
+      this._outgoingVideoIsScreenShare !== isScreenShare
+    ) {
+      this._outgoingVideoIsScreenShare = isScreenShare;
+      sillyDeadlockProtection(() => {
+        this._callManager.setOutgoingVideoIsScreenShare(isScreenShare);
+      });
+    } else {
+      this._outgoingVideoIsScreenShare = isScreenShare;
+    }
   }
 
   // With this method, a Call is a VideoFrameSender
@@ -2086,66 +2296,18 @@ export class Call {
     width: number,
     height: number,
     format: VideoPixelFormatEnum,
-    buffer: Buffer
+    buffer: Uint8Array<ArrayBuffer>
   ): void {
-    // This assumes we only have one active call.
     this._callManager.sendVideoFrame(width, height, format, buffer);
   }
 
   // With this method, a Call is a VideoFrameSource
   receiveVideoFrame(
-    buffer: Buffer,
+    buffer: Uint8Array<ArrayBuffer>,
     maxWidth: number,
     maxHeight: number
   ): [number, number] | undefined {
-    // This assumes we only have one active call.
     return this._callManager.receiveVideoFrame(buffer, maxWidth, maxHeight);
-  }
-
-  private enableOrDisableCapturer(): void {
-    if (!this._videoCapturer) {
-      return;
-    }
-    if (!this.outgoingVideoEnabled) {
-      this._videoCapturer.disable();
-      if (this.state === CallState.Accepted) {
-        this.setOutgoingVideoEnabled(false);
-      }
-      return;
-    }
-    switch (this.state) {
-      case CallState.Prering:
-      case CallState.Ringing:
-        this._videoCapturer.enableCapture();
-        break;
-      case CallState.Accepted:
-        this._videoCapturer.enableCaptureAndSend(this);
-        this.setOutgoingVideoEnabled(true);
-        if (this._outgoingVideoIsScreenShare) {
-          // Make sure the status gets sent.
-          this.outgoingVideoIsScreenShare = true;
-        }
-        break;
-      case CallState.Reconnecting:
-        this._videoCapturer.enableCaptureAndSend(this);
-        // Don't send status until we're reconnected.
-        break;
-      case CallState.Ended:
-        this._videoCapturer.disable();
-        break;
-      default:
-    }
-  }
-
-  private setOutgoingVideoEnabled(enabled: boolean) {
-    sillyDeadlockProtection(() => {
-      try {
-        this._callManager.setOutgoingVideoEnabled(enabled);
-      } catch {
-        // We may not have an active connection any more.
-        // In which case it doesn't matter
-      }
-    });
   }
 
   updateDataMode(dataMode: DataMode): void {
@@ -2157,30 +2319,6 @@ export class Call {
         // In which case it doesn't matter
       }
     });
-  }
-
-  private enableOrDisableRenderer(): void {
-    if (!this._videoRenderer) {
-      return;
-    }
-    if (!this.remoteVideoEnabled) {
-      this._videoRenderer.disable();
-      return;
-    }
-    switch (this.state) {
-      case CallState.Prering:
-      case CallState.Ringing:
-        this._videoRenderer.disable();
-        break;
-      case CallState.Accepted:
-      case CallState.Reconnecting:
-        this._videoRenderer.enable(this);
-        break;
-      case CallState.Ended:
-        this._videoRenderer.disable();
-        break;
-      default:
-    }
   }
 }
 
@@ -2204,27 +2342,12 @@ export enum JoinState {
   Joined,
 }
 
-// If not ended purposely by the user, gives the reason why a group call ended.
-export enum GroupCallEndReason {
-  // Normal events
-  DeviceExplicitlyDisconnected = 0,
-  ServerExplicitlyDisconnected,
-  DeniedRequestToJoinCall,
-  RemovedFromCall,
-
-  // Things that can go wrong
-  CallManagerIsBusy,
-  SfuClientFailedToJoin,
-  FailedToCreatePeerConnectionFactory,
-  FailedToNegotiateSrtpKeys,
-  FailedToCreatePeerConnection,
-  FailedToStartPeerConnection,
-  FailedToUpdatePeerConnection,
-  FailedToSetMaxSendBitrate,
-  IceFailedWhileConnecting,
-  IceFailedAfterConnected,
-  ServerChangedDemuxId,
-  HasMaxDevices,
+// Matches SpeechEvent in rust.
+export enum SpeechEvent {
+  // User was speaking but stopped.
+  StoppedSpeaking = 0,
+  // User has been speaking for a while -- maybe lower hand?
+  LowerHandSuggestion,
 }
 
 export enum CallMessageUrgency {
@@ -2286,7 +2409,7 @@ export class LocalDeviceState {
 // All remote devices in a group call and their associated state.
 export class RemoteDeviceState {
   demuxId: number; // UInt32
-  userId: Buffer;
+  userId: Uint8Array<ArrayBuffer>;
   mediaKeysReceived: boolean;
   audioMuted: boolean | undefined;
   videoMuted: boolean | undefined;
@@ -2301,7 +2424,7 @@ export class RemoteDeviceState {
 
   constructor(
     demuxId: number,
-    userId: Buffer,
+    userId: Uint8Array<ArrayBuffer>,
     addedTime: string,
     speakerTime: string,
     mediaKeysReceived: boolean
@@ -2318,10 +2441,13 @@ export class RemoteDeviceState {
 
 // Used to communicate the group membership to RingRTC for a group call.
 export class GroupMemberInfo {
-  userId: Buffer;
-  userIdCipherText: Buffer;
+  userId: Uint8Array<ArrayBuffer>;
+  userIdCipherText: Uint8Array<ArrayBuffer>;
 
-  constructor(userId: Buffer, userIdCipherText: Buffer) {
+  constructor(
+    userId: Uint8Array<ArrayBuffer>,
+    userIdCipherText: Uint8Array<ArrayBuffer>
+  ) {
     this.userId = userId;
     this.userIdCipherText = userIdCipherText;
   }
@@ -2353,7 +2479,7 @@ export enum GroupCallKind {
   CallLink,
 }
 
-export interface GroupCallObserver {
+export type GroupCallObserver = {
   requestMembershipProof(groupCall: GroupCall): void;
   requestGroupMembers(groupCall: GroupCall): void;
   onLocalDeviceStateChanged(groupCall: GroupCall): void;
@@ -2363,8 +2489,25 @@ export interface GroupCallObserver {
   onReactions(groupCall: GroupCall, reactions: Array<Reaction>): void;
   onRaisedHands(groupCall: GroupCall, raisedHands: Array<number>): void;
   onPeekChanged(groupCall: GroupCall): void;
-  onEnded(groupCall: GroupCall, reason: GroupCallEndReason): void;
-}
+  onEnded(
+    groupCall: GroupCall,
+    reason: CallEndReason,
+    summary: CallSummary
+  ): void;
+  onSpeechEvent(groupCall: GroupCall, event: SpeechEvent): void;
+  onRemoteMute(groupCall: GroupCall, demuxId: number): void;
+  onObservedRemoteMute(
+    groupCall: GroupCall,
+    sourceDemuxId: number,
+    targetDemuxId: number
+  ): void;
+};
+
+export type GroupCallSvcConfig = {
+  mode: string;
+  modeForScreenshare: string;
+  maxBitrateBps: number | undefined;
+};
 
 export class GroupCall {
   private readonly _kind: GroupCallKind;
@@ -2377,7 +2520,7 @@ export class GroupCall {
     return this._clientId;
   }
 
-  private _localDeviceState: LocalDeviceState;
+  private readonly _localDeviceState: LocalDeviceState;
   private _remoteDeviceStates: Array<RemoteDeviceState> | undefined;
 
   private _peekInfo: PeekInfo | undefined;
@@ -2436,10 +2579,33 @@ export class GroupCall {
   }
 
   // Called by UI
+  getCallId(): CallId | undefined {
+    const eraId = this._peekInfo?.eraId;
+
+    if (eraId) {
+      return callIdFromEra(eraId);
+    }
+
+    return undefined;
+  }
+
+  // Called by UI
   setOutgoingAudioMuted(muted: boolean): void {
     this._localDeviceState.audioMuted = muted;
     this._callManager.setOutgoingAudioMuted(this._clientId, muted);
     this._observer.onLocalDeviceStateChanged(this);
+  }
+
+  // Called by UI
+  setOutgoingAudioMutedRemotely(source: number): void {
+    this._localDeviceState.audioMuted = true;
+    this._callManager.setOutgoingAudioMutedRemotely(this._clientId, source);
+    this._observer.onLocalDeviceStateChanged(this);
+  }
+
+  // Called by UI
+  sendRemoteMuteRequest(target: number): void {
+    this._callManager.sendRemoteMuteRequest(this._clientId, target);
   }
 
   // Called by UI
@@ -2504,12 +2670,12 @@ export class GroupCall {
   }
 
   // Called by UI
-  approveUser(otherUserId: Buffer): void {
+  approveUser(otherUserId: Uint8Array<ArrayBuffer>): void {
     this._callManager.approveUser(this._clientId, otherUserId);
   }
 
   // Called by UI
-  denyUser(otherUserId: Buffer): void {
+  denyUser(otherUserId: Uint8Array<ArrayBuffer>): void {
     this._callManager.denyUser(this._clientId, otherUserId);
   }
 
@@ -2529,7 +2695,7 @@ export class GroupCall {
   }
 
   // Called by UI
-  setMembershipProof(proof: Buffer): void {
+  setMembershipProof(proof: Uint8Array<ArrayBuffer>): void {
     this._callManager.setMembershipProof(this._clientId, proof);
   }
 
@@ -2610,7 +2776,7 @@ export class GroupCall {
     // We don't get aspect ratios from RingRTC, so make sure to copy them over.
     for (const noo of remoteDeviceStates) {
       const old = this._remoteDeviceStates?.find(
-        old => old.demuxId == noo.demuxId
+        candidate => candidate.demuxId == noo.demuxId
       );
       noo.videoAspectRatio = old?.videoAspectRatio;
     }
@@ -2628,10 +2794,10 @@ export class GroupCall {
   }
 
   // Called by Rust via RingRTC object
-  handleEnded(reason: GroupCallEndReason): void {
-    this._observer.onEnded(this, reason);
-
+  handleEnded(reason: CallEndReason, summary: CallSummary): void {
     this._callManager.deleteGroupCallClient(this._clientId);
+
+    this._observer.onEnded(this, reason, summary);
   }
 
   // With this, a GroupCall is a VideoFrameSender
@@ -2639,9 +2805,8 @@ export class GroupCall {
     width: number,
     height: number,
     format: VideoPixelFormatEnum,
-    buffer: Buffer
+    buffer: Uint8Array<ArrayBuffer>
   ): void {
-    // This assumes we only have one active call.
     this._callManager.sendVideoFrame(width, height, format, buffer);
   }
 
@@ -2668,9 +2833,20 @@ export class GroupCall {
   setRtcStatsInterval(intervalMillis: number): void {
     this._callManager.setRtcStatsInterval(this._clientId, intervalMillis);
   }
+
+  handleSpeechEvent(event: SpeechEvent): void {
+    this._observer.onSpeechEvent(this, event);
+  }
+
+  onRemoteMute(demuxId: number): void {
+    this._observer.onRemoteMute(this, demuxId);
+  }
+
+  onObservedRemoteMute(sourceDemuxId: number, targetDemuxId: number): void {
+    this._observer.onObservedRemoteMute(this, sourceDemuxId, targetDemuxId);
+  }
 }
 
-// Implements VideoSource for use in CanvasVideoRenderer
 class GroupCallVideoFrameSource {
   private readonly _callManager: CallManager;
   private readonly _groupCall: GroupCall;
@@ -2687,11 +2863,10 @@ class GroupCallVideoFrameSource {
   }
 
   receiveVideoFrame(
-    buffer: Buffer,
+    buffer: Uint8Array<ArrayBuffer>,
     maxWidth: number,
     maxHeight: number
   ): [number, number] | undefined {
-    // This assumes we only have one active call.
     const frame = this._callManager.receiveGroupCallVideoFrame(
       this._groupCall.clientId,
       this._remoteDemuxId,
@@ -2707,32 +2882,11 @@ class GroupCallVideoFrameSource {
   }
 }
 
-// When sending, we just set an Buffer.
-// When receiving, we call .toArrayBuffer().
-type ProtobufBuffer = Buffer | { toArrayBuffer: () => ArrayBuffer };
-
-function toBuffer(pbab: ProtobufBuffer | undefined): Buffer | undefined {
-  if (!pbab) {
-    return pbab;
-  }
-  if (pbab instanceof Buffer) {
-    return pbab;
-  }
-  return Buffer.from(pbab.toArrayBuffer());
-}
-
 export type UserId = string;
 
 export type DeviceId = number;
 
-// A stripped-down version of Long.
-export type CallId = {
-  high: number;
-  low: number;
-  // RingRTC always treats call IDs as unsigned internally regardless of what this is set to.
-  // Call IDs produced by RingRTC will always set this to `true`.
-  unsigned: boolean;
-};
+export type CallId = bigint;
 
 export class CallingMessage {
   offer?: OfferMessage;
@@ -2747,9 +2901,13 @@ export class CallingMessage {
 export class OfferMessage {
   callId: CallId;
   type: OfferType;
-  opaque: ProtobufBuffer;
+  opaque: Uint8Array<ArrayBuffer>;
 
-  constructor(callId: CallId, type: OfferType, opaque: ProtobufBuffer) {
+  constructor(
+    callId: CallId,
+    type: OfferType,
+    opaque: Uint8Array<ArrayBuffer>
+  ) {
     this.callId = callId;
     this.type = type;
     this.opaque = opaque;
@@ -2763,9 +2921,9 @@ export enum OfferType {
 
 export class AnswerMessage {
   callId: CallId;
-  opaque: ProtobufBuffer;
+  opaque: Uint8Array<ArrayBuffer>;
 
-  constructor(callId: CallId, opaque: ProtobufBuffer) {
+  constructor(callId: CallId, opaque: Uint8Array<ArrayBuffer>) {
     this.callId = callId;
     this.opaque = opaque;
   }
@@ -2773,9 +2931,9 @@ export class AnswerMessage {
 
 export class IceCandidateMessage {
   callId: CallId;
-  opaque: ProtobufBuffer;
+  opaque: Uint8Array<ArrayBuffer>;
 
-  constructor(callId: CallId, opaque: ProtobufBuffer) {
+  constructor(callId: CallId, opaque: Uint8Array<ArrayBuffer>) {
     this.callId = callId;
     this.opaque = opaque;
   }
@@ -2802,7 +2960,7 @@ export class HangupMessage {
 }
 
 export class OpaqueMessage {
-  data?: ProtobufBuffer;
+  data?: Uint8Array<ArrayBuffer>;
 }
 
 export enum HangupType {
@@ -2826,9 +2984,14 @@ export enum RingCancelReason {
   Busy,
 }
 
-export interface CallManager {
+export type CallManager = {
   setConfig(config: Config): void;
-  setSelfUuid(uuid: Buffer): void;
+  setSelfUuid(uuid: Uint8Array<ArrayBuffer>): void;
+  addAsset(
+    assetGroup: string,
+    filePath: string | null,
+    content: Uint8Array<ArrayBuffer> | null
+  ): void;
   createOutgoingCall(
     remoteUserId: UserId,
     isVideoCall: boolean,
@@ -2838,7 +3001,7 @@ export interface CallManager {
     callId: CallId,
     iceServers: Array<IceServer>,
     hideIp: boolean,
-    dataMode: DataMode,
+    callConfig: CallConfig,
     audioLevelsIntervalMillis: number
   ): void;
   accept(callId: CallId): void;
@@ -2852,6 +3015,7 @@ export interface CallManager {
   signalingMessageSent(callId: CallId): void;
   signalingMessageSendFailed(callId: CallId): void;
   setOutgoingAudioEnabled(enabled: boolean): void;
+  setMicrophoneWarmupEnabled(enabled: boolean): void;
   setOutgoingVideoEnabled(enabled: boolean): void;
   setOutgoingVideoIsScreenShare(enabled: boolean): void;
   updateDataMode(dataMode: DataMode): void;
@@ -2859,10 +3023,10 @@ export interface CallManager {
     width: number,
     height: number,
     format: VideoPixelFormatEnum,
-    buffer: Buffer
+    buffer: Uint8Array<ArrayBuffer>
   ): void;
   receiveVideoFrame(
-    buffer: Buffer,
+    buffer: Uint8Array<ArrayBuffer>,
     maxWidth: number,
     maxHeight: number
   ): [number, number] | undefined;
@@ -2873,23 +3037,23 @@ export interface CallManager {
     messageAgeSec: number,
     callId: CallId,
     offerType: OfferType,
-    opaque: Buffer,
-    senderIdentityKey: Buffer,
-    receiverIdentityKey: Buffer
+    opaque: Uint8Array<ArrayBuffer>,
+    senderIdentityKey: Uint8Array<ArrayBuffer>,
+    receiverIdentityKey: Uint8Array<ArrayBuffer>
   ): void;
   receivedAnswer(
     remoteUserId: UserId,
     remoteDeviceId: DeviceId,
     callId: CallId,
-    opaque: Buffer,
-    senderIdentityKey: Buffer,
-    receiverIdentityKey: Buffer
+    opaque: Uint8Array<ArrayBuffer>,
+    senderIdentityKey: Uint8Array<ArrayBuffer>,
+    receiverIdentityKey: Uint8Array<ArrayBuffer>
   ): void;
   receivedIceCandidates(
     remoteUserId: UserId,
     remoteDeviceId: DeviceId,
     callId: CallId,
-    candidates: Array<Buffer>
+    candidates: Array<Uint8Array<ArrayBuffer>>
   ): void;
   receivedHangup(
     remoteUserId: UserId,
@@ -2904,31 +3068,40 @@ export interface CallManager {
     callId: CallId
   ): void;
   receivedCallMessage(
-    remoteUserId: Buffer,
+    remoteUserId: Uint8Array<ArrayBuffer>,
     remoteDeviceId: DeviceId,
     localDeviceId: DeviceId,
-    data: Buffer,
+    data: Uint8Array<ArrayBuffer>,
     messageAgeSec: number
   ): void;
 
-  receivedHttpResponse(requestId: number, status: number, body: Buffer): void;
+  receivedHttpResponse(
+    requestId: number,
+    status: number,
+    body: Uint8Array<ArrayBuffer>
+  ): void;
   httpRequestFailed(requestId: number, debugInfo: string | undefined): void;
 
   // Group Calls
 
   createGroupCallClient(
-    groupId: Buffer,
+    groupId: GroupId,
     sfuUrl: string,
-    hkdfExtraInfo: Buffer,
-    audioLevelsIntervalMillis: number
+    hkdfExtraInfo: Uint8Array<ArrayBuffer>,
+    audioLevelsIntervalMillis: number,
+    dredDuration: number,
+    svcConfig: GroupCallSvcConfig | undefined
   ): GroupCallClientId;
   createCallLinkCallClient(
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
-    linkRootKey: Buffer,
-    adminPasskey: Buffer | undefined,
-    hkdfExtraInfo: Buffer,
-    audioLevelsIntervalMillis: number
+    endorsementPublicKey: Uint8Array<ArrayBuffer>,
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
+    linkRootKey: Uint8Array<ArrayBuffer>,
+    adminPasskey: Uint8Array<ArrayBuffer> | undefined,
+    hkdfExtraInfo: Uint8Array<ArrayBuffer>,
+    audioLevelsIntervalMillis: number,
+    dredDuration: number,
+    svcConfig: GroupCallSvcConfig | undefined
   ): GroupCallClientId;
   deleteGroupCallClient(clientId: GroupCallClientId): void;
   connect(clientId: GroupCallClientId): void;
@@ -2936,13 +3109,21 @@ export interface CallManager {
   leave(clientId: GroupCallClientId): void;
   disconnect(clientId: GroupCallClientId): void;
   setOutgoingAudioMuted(clientId: GroupCallClientId, muted: boolean): void;
+  setOutgoingAudioMutedRemotely(
+    clientId: GroupCallClientId,
+    source: number
+  ): void;
+  sendRemoteMuteRequest(clientId: GroupCallClientId, target: number): void;
   setOutgoingVideoMuted(clientId: GroupCallClientId, muted: boolean): void;
   setPresenting(clientId: GroupCallClientId, presenting: boolean): void;
   setOutgoingGroupCallVideoIsScreenShare(
     clientId: GroupCallClientId,
     isScreenShare: boolean
   ): void;
-  groupRing(clientId: GroupCallClientId, recipient: Buffer | undefined): void;
+  groupRing(
+    clientId: GroupCallClientId,
+    recipient: Uint8Array<ArrayBuffer> | undefined
+  ): void;
   groupReact(clientId: GroupCallClientId, value: string): void;
   groupRaiseHand(clientId: GroupCallClientId, raise: boolean): void;
   resendMediaKeys(clientId: GroupCallClientId): void;
@@ -2952,20 +3133,29 @@ export interface CallManager {
     resolutions: Array<VideoRequest>,
     activeSpeakerHeight: number
   ): void;
-  approveUser(clientId: GroupCallClientId, otherUserId: Buffer): void;
-  denyUser(clientId: GroupCallClientId, otherUserId: Buffer): void;
+  approveUser(
+    clientId: GroupCallClientId,
+    otherUserId: Uint8Array<ArrayBuffer>
+  ): void;
+  denyUser(
+    clientId: GroupCallClientId,
+    otherUserId: Uint8Array<ArrayBuffer>
+  ): void;
   removeClient(clientId: GroupCallClientId, otherClientDemuxId: number): void;
   blockClient(clientId: GroupCallClientId, otherClientDemuxId: number): void;
   setGroupMembers(
     clientId: GroupCallClientId,
     members: Array<GroupMemberInfo>
   ): void;
-  setMembershipProof(clientId: GroupCallClientId, proof: Buffer): void;
+  setMembershipProof(
+    clientId: GroupCallClientId,
+    proof: Uint8Array<ArrayBuffer>
+  ): void;
   // Same as receiveVideoFrame, but with a specific GroupCallClientId and remoteDemuxId.
   receiveGroupCallVideoFrame(
     clientId: GroupCallClientId,
     remoteDemuxId: number,
-    buffer: Buffer,
+    buffer: Uint8Array<ArrayBuffer>,
     maxWidth: number,
     maxHeight: number
   ): [number, number] | undefined;
@@ -2977,24 +3167,24 @@ export interface CallManager {
   readCallLink(
     requestId: number,
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
-    linkRootKey: Buffer
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
+    linkRootKey: Uint8Array<ArrayBuffer>
   ): void;
   createCallLink(
     requestId: number,
     sfuUrl: string,
-    createCredentialPresentation: Buffer,
-    linkRootKey: Buffer,
-    adminPasskey: Buffer,
-    callLinkPublicParams: Buffer,
+    createCredentialPresentation: Uint8Array<ArrayBuffer>,
+    linkRootKey: Uint8Array<ArrayBuffer>,
+    adminPasskey: Uint8Array<ArrayBuffer>,
+    callLinkPublicParams: Uint8Array<ArrayBuffer>,
     restrictions: number | undefined
   ): void;
   updateCallLink(
     requestId: number,
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
-    linkRootKey: Buffer,
-    adminPasskey: Buffer,
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
+    linkRootKey: Uint8Array<ArrayBuffer>,
+    adminPasskey: Uint8Array<ArrayBuffer>,
     newName: string | undefined,
     newRestrictions: number | undefined,
     newRevoked: boolean | undefined
@@ -3002,32 +3192,33 @@ export interface CallManager {
   deleteCallLink(
     requestId: number,
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
-    linkRootKey: Buffer,
-    adminPasskey: Buffer
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
+    linkRootKey: Uint8Array<ArrayBuffer>,
+    adminPasskey: Uint8Array<ArrayBuffer>
   ): void;
   // Response comes back via handlePeekResponse
   peekGroupCall(
     requestId: number,
     sfu_url: string,
-    membership_proof: Buffer,
+    membership_proof: Uint8Array<ArrayBuffer>,
     group_members: Array<GroupMemberInfo>
   ): void;
   // Response comes back via handlePeekResponse
   peekCallLinkCall(
     requestId: number,
     sfuUrl: string,
-    authCredentialPresentation: Buffer,
-    linkRootKey: Buffer
+    authCredentialPresentation: Uint8Array<ArrayBuffer>,
+    linkRootKey: Uint8Array<ArrayBuffer>
   ): void;
 
   getAudioInputs(): Array<AudioDevice>;
   setAudioInput(index: number): void;
   getAudioOutputs(): Array<AudioDevice>;
   setAudioOutput(index: number): void;
-}
+  setVoiceProcessingEnabled(enabled: boolean): void;
+};
 
-export interface CallManagerCallbacks {
+export type CallManagerCallbacks = {
   onStartOutgoingCall(remoteUserId: UserId, callId: CallId): void;
   onStartIncomingCall(
     remoteUserId: UserId,
@@ -3035,11 +3226,17 @@ export interface CallManagerCallbacks {
     isVideoCall: boolean
   ): void;
   onCallState(remoteUserId: UserId, state: CallState): void;
+  onCallRejected(
+    remoteUserId: UserId,
+    callId: CallId,
+    rejectReason: CallRejectReason,
+    ageSec: number
+  ): void;
   onCallEnded(
     remoteUserId: UserId,
     callId: CallId,
-    endedReason: CallEndedReason,
-    ageSec: number
+    endedReason: CallEndReason,
+    summary: CallSummary
   ): void;
   onRemoteAudioEnabled(remoteUserId: UserId, enabled: boolean): void;
   onRemoteVideoEnabled(remoteUserId: UserId, enabled: boolean): void;
@@ -3050,21 +3247,21 @@ export interface CallManagerCallbacks {
     callId: CallId,
     broadcast: boolean,
     mediaType: number,
-    opaque: Buffer
+    opaque: Uint8Array<ArrayBuffer>
   ): void;
   onSendAnswer(
     remoteUserId: UserId,
     remoteDeviceId: DeviceId,
     callId: CallId,
     broadcast: boolean,
-    opaque: Buffer
+    opaque: Uint8Array<ArrayBuffer>
   ): void;
   onSendIceCandidates(
     remoteUserId: UserId,
     remoteDeviceId: DeviceId,
     callId: CallId,
     broadcast: boolean,
-    candidates: Array<Buffer>
+    candidates: Array<Uint8Array<ArrayBuffer>>
   ): void;
   onSendHangup(
     remoteUserId: UserId,
@@ -3081,22 +3278,31 @@ export interface CallManagerCallbacks {
     broadcast: boolean
   ): void;
   sendCallMessage(
-    recipientUuid: Buffer,
-    message: Buffer,
+    recipientUuid: Uint8Array<ArrayBuffer>,
+    message: Uint8Array<ArrayBuffer>,
     urgency: CallMessageUrgency
   ): void;
   sendCallMessageToGroup(
-    groupId: Buffer,
-    message: Buffer,
+    groupId: GroupId,
+    message: Uint8Array<ArrayBuffer>,
     urgency: CallMessageUrgency,
-    overrideRecipients: Array<Buffer>
+    overrideRecipients: Array<Uint8Array<ArrayBuffer>>
+  ): void;
+  sendCallMessageToAdhocGroup(
+    message: Uint8Array<ArrayBuffer>,
+    urgency: CallMessageUrgency,
+    expiration: Date,
+    recipientsAndEndorsements: Array<{
+      recipientId: Uint8Array<ArrayBuffer>;
+      endorsement: Uint8Array<ArrayBuffer>;
+    }>
   ): void;
   sendHttpRequest(
     requestId: number,
     url: string,
     method: HttpMethod,
     headers: { [name: string]: string },
-    body: Buffer | undefined
+    body: Uint8Array<ArrayBuffer> | undefined
   ): void;
 
   // Group Calls
@@ -3122,7 +3328,11 @@ export interface CallManagerCallbacks {
     statusCode: number,
     rawInfo: RawPeekInfo | undefined
   ): void;
-  handleEnded(clientId: GroupCallClientId, reason: GroupCallEndReason): void;
+  handleEnded(
+    clientId: GroupCallClientId,
+    reason: CallEndReason,
+    summary: CallSummary
+  ): void;
 
   onLogMessage(
     level: number,
@@ -3130,7 +3340,7 @@ export interface CallManagerCallbacks {
     line: number,
     message: string
   ): void;
-}
+};
 
 export enum CallState {
   Prering = 'idle',
@@ -3140,25 +3350,58 @@ export enum CallState {
   Ended = 'ended',
 }
 
-export enum CallEndedReason {
-  LocalHangup = 'LocalHangup',
-  RemoteHangup = 'RemoteHangup',
-  RemoteHangupNeedPermission = 'RemoteHangupNeedPermission',
-  Declined = 'Declined',
-  Busy = 'Busy',
-  Glare = 'Glare',
-  ReCall = 'ReCall',
-  ReceivedOfferExpired = 'ReceivedOfferExpired',
-  ReceivedOfferWhileActive = 'ReceivedOfferWhileActive',
-  ReceivedOfferWithGlare = 'ReceivedOfferWithGlare',
-  SignalingFailure = 'SignalingFailure',
-  GlareFailure = 'GlareFailure',
-  ConnectionFailure = 'ConnectionFailure',
-  InternalFailure = 'InternalFailure',
-  Timeout = 'Timeout',
-  AcceptedOnAnotherDevice = 'AcceptedOnAnotherDevice',
-  DeclinedOnAnotherDevice = 'DeclinedOnAnotherDevice',
-  BusyOnAnotherDevice = 'BusyOnAnotherDevice',
+//
+// NOTE:
+//
+// The ordering of CallEndReason must be kept in sync with the ordering of CallEndReason
+// in <project-root>/src/rust/common/mod.rs.
+//
+
+export enum CallEndReason {
+  LocalHangup = 0,
+  RemoteHangup,
+  RemoteHangupNeedPermission,
+  RemoteHangupAccepted,
+  RemoteHangupDeclined,
+  RemoteHangupBusy,
+  RemoteBusy,
+  RemoteGlare,
+  RemoteReCall,
+  Timeout,
+  InternalFailure,
+  SignalingFailure,
+  ConnectionFailure,
+  AppDroppedCall,
+  DeviceExplicitlyDisconnected,
+  ServerExplicitlyDisconnected,
+  DeniedRequestToJoinCall,
+  RemovedFromCall,
+  CallManagerIsBusy,
+  SfuClientFailedToJoin,
+  FailedToCreatePeerConnectionFactory,
+  FailedToNegotiatedSrtpKeys,
+  FailedToCreatePeerConnection,
+  FailedToStartPeerConnection,
+  FailedToUpdatePeerConnection,
+  FailedToSetMaxSendBitrate,
+  IceFailedWhileConnecting,
+  IceFailedAfterConnected,
+  ServerChangedDemuxId,
+  HasMaxDevices,
+}
+
+//
+// NOTE:
+//
+// The ordering of CallRejectReason must be kept in sync with the ordering of RejectReason
+// in <project-root>/src/rust/src/native.rs.
+//
+
+export enum CallRejectReason {
+  GlareHandlingFailure,
+  ReceivedOfferExpired,
+  ReceivedOfferWhileActive,
+  ReceivedOfferWithGlare,
 }
 
 export enum CallLogLevel {
@@ -3172,9 +3415,8 @@ export enum CallLogLevel {
 
 function sillyDeadlockProtection(f: () => void) {
   void (async () => {
-    // This is a silly way of preventing a deadlock.
-    // eslint-disable-next-line @typescript-eslint/await-thenable
-    await 0;
+    // Yield so f() runs after unwinding the calling stack.
+    await Promise.resolve();
 
     f();
   })();

@@ -5,41 +5,37 @@
 
 //! WebRTC Peer Connection
 
-use anyhow::anyhow;
-#[cfg(all(not(feature = "sim"), feature = "native"))]
+#[cfg(feature = "native")]
 use std::ffi::c_void;
 #[cfg(feature = "native")]
-use std::ffi::CStr;
-use std::ffi::CString;
-use std::os::raw::c_char;
+use std::sync::{Arc, Mutex};
+use std::{ffi::CString, fmt::Formatter, os::raw::c_char};
 
-use crate::common::Result;
-use crate::error::RingRtcError;
-use crate::webrtc;
-#[cfg(all(not(feature = "sim"), feature = "native"))]
-use crate::webrtc::audio_device_module::AudioDeviceModule;
-#[cfg(all(not(feature = "sim"), feature = "native"))]
-use crate::webrtc::ffi::audio_device_module::AUDIO_DEVICE_CBS_PTR;
-#[cfg(feature = "injectable_network")]
-use crate::webrtc::injectable_network::InjectableNetwork;
-use crate::webrtc::media::{AudioTrack, VideoSource, VideoTrack};
-use crate::webrtc::peer_connection::PeerConnection;
-use crate::webrtc::peer_connection_observer::{
-    PeerConnectionObserver, PeerConnectionObserverTrait,
-};
-
-#[cfg(not(feature = "sim"))]
-use crate::webrtc::ffi::peer_connection_factory as pcf;
-
-#[cfg(feature = "sim")]
-use crate::webrtc::sim::peer_connection_factory as pcf;
-
+#[cfg(feature = "native")]
+use anyhow::anyhow;
 pub use pcf::{RffiPeerConnectionFactoryInterface, RffiPeerConnectionFactoryOwner};
 
 #[cfg(feature = "native")]
-const ADM_MAX_DEVICE_NAME_SIZE: usize = 128;
+use crate::webrtc::audio_device_module::AudioDeviceModule;
 #[cfg(feature = "native")]
-const ADM_MAX_DEVICE_UUID_SIZE: usize = 128;
+use crate::webrtc::audio_device_module_callbacks::{AUDIO_DEVICE_CBS_PTR, decrement_adm_ref_count};
+#[cfg(not(feature = "sim"))]
+use crate::webrtc::ffi::peer_connection_factory as pcf;
+#[cfg(feature = "injectable_network")]
+use crate::webrtc::injectable_network::InjectableNetwork;
+#[cfg(feature = "sim")]
+use crate::webrtc::sim::peer_connection_factory as pcf;
+use crate::{
+    common::Result,
+    core::util::truncate_for_logging,
+    error::RingRtcError,
+    webrtc,
+    webrtc::{
+        media::{AudioTrack, VideoSource, VideoTrack},
+        peer_connection::PeerConnection,
+        peer_connection_observer::{PeerConnectionObserver, PeerConnectionObserverTrait},
+    },
+};
 
 #[repr(C)]
 pub struct RffiIceServer {
@@ -118,7 +114,7 @@ pub struct RffiIceServers {
 }
 
 /// Describes an audio input or output device.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AudioDevice {
     /// Name of the device
     pub name: String,
@@ -128,45 +124,39 @@ pub struct AudioDevice {
     pub i18n_key: String,
 }
 
-/// Stays in sync with RffiAudioDeviceModuleType in peer_connection_factory.h.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RffiAudioDeviceModuleType {
-    /// Use the default ADM provided by WebRTC for the platform.
-    #[default]
-    Default,
-    /// Use a file-based ADM for testing and simulation.
-    File,
-    /// Use RingRTC's ADM implementation.
-    RingRtc,
+impl std::fmt::Debug for AudioDevice {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AudioDevice{{ name: {}, unique_id: {} }}",
+            truncate_for_logging(&self.name),
+            truncate_for_logging(&self.unique_id)
+        )
+    }
 }
 
 /// Stays in sync with RffiAudioConfig in peer_connection_factory.h.
 #[repr(C)]
 pub struct RffiAudioConfig {
-    pub audio_device_module_type: RffiAudioDeviceModuleType,
-    pub input_file: webrtc::ptr::Borrowed<c_char>,
-    pub output_file: webrtc::ptr::Borrowed<c_char>,
     pub high_pass_filter_enabled: bool,
     pub aec_enabled: bool,
     pub ns_enabled: bool,
     pub agc_enabled: bool,
-    #[cfg(all(not(feature = "sim"), feature = "native"))]
+    #[cfg(feature = "native")]
     pub adm_borrowed: webrtc::ptr::Borrowed<c_void>,
-    #[cfg(all(not(feature = "sim"), feature = "native"))]
+    #[cfg(feature = "native")]
     pub rust_audio_device_callbacks: webrtc::ptr::Borrowed<c_void>,
+    #[cfg(feature = "native")]
+    pub free_adm_cb: unsafe extern "C" fn(webrtc::ptr::Borrowed<c_void>),
 }
-
-#[derive(Clone, Debug)]
-pub struct FileBasedAdmConfig {
-    pub input_file: CString,
-    pub output_file: CString,
+pub struct RffiAudioConfigWrapper {
+    rffi: RffiAudioConfig,
+    #[cfg(feature = "native")]
+    adm: Option<Arc<Mutex<AudioDeviceModule>>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AudioConfig {
-    pub audio_device_module_type: RffiAudioDeviceModuleType,
-    pub file_based_adm_config: Option<FileBasedAdmConfig>,
     pub high_pass_filter_enabled: bool,
     pub aec_enabled: bool,
     pub ns_enabled: bool,
@@ -176,11 +166,6 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            #[cfg(not(feature = "ringrtc_adm"))]
-            audio_device_module_type: Default::default(),
-            #[cfg(feature = "ringrtc_adm")]
-            audio_device_module_type: RffiAudioDeviceModuleType::RingRtc,
-            file_based_adm_config: None,
             high_pass_filter_enabled: true,
             aec_enabled: true,
             ns_enabled: true,
@@ -189,38 +174,72 @@ impl Default for AudioConfig {
     }
 }
 
-impl AudioConfig {
-    fn rffi(&self) -> Result<RffiAudioConfig> {
-        let (input_file, output_file) =
-            if self.audio_device_module_type == RffiAudioDeviceModuleType::File {
-                if let Some(file_based_adm_config) = &self.file_based_adm_config {
-                    (
-                        file_based_adm_config.input_file.as_ptr(),
-                        file_based_adm_config.output_file.as_ptr(),
-                    )
-                } else {
-                    return Err(anyhow!("no files specified for the file-based ADM!"));
-                }
-            } else {
-                (std::ptr::null(), std::ptr::null())
-            };
+// An observer trait that receives notifications whenever the input or output
+// devices change.
+// These callbacks should run "quickly", as they'll be run from the cubeb worker
+// thread, and any delays will block playout_delay calls, which happen
+// constantly during calls (short blocking is OK, as is passing the
+// event to another thread; calling a client directly is not).
+// Currently only applicable on Desktop
+pub trait AudioDeviceObserver: Send + std::fmt::Debug {
+    fn output_changed(&self, devices: Vec<Option<AudioDevice>>);
+    fn input_changed(&self, devices: Vec<Option<AudioDevice>>);
+}
 
-        Ok(RffiAudioConfig {
-            audio_device_module_type: self.audio_device_module_type,
-            input_file: webrtc::ptr::Borrowed::from_ptr(input_file),
-            output_file: webrtc::ptr::Borrowed::from_ptr(output_file),
-            high_pass_filter_enabled: self.high_pass_filter_enabled,
-            aec_enabled: self.aec_enabled,
-            ns_enabled: self.ns_enabled,
-            agc_enabled: self.agc_enabled,
-            #[cfg(all(not(feature = "sim"), feature = "native"))]
-            adm_borrowed: webrtc::ptr::Borrowed::from_ptr(Box::into_raw(Box::new(
-                AudioDeviceModule::new(),
-            )))
-            .to_void(),
-            #[cfg(all(not(feature = "sim"), feature = "native"))]
-            rust_audio_device_callbacks: webrtc::ptr::Borrowed::from_ptr(AUDIO_DEVICE_CBS_PTR)
-                .to_void(),
+impl AudioConfig {
+    // Return both the RffiAudioConfig as well as the name of the cubeb backend
+    // in use, if any.
+    // Fallible only with `native`, where registering the ADM callback can fail.
+    #[cfg_attr(not(feature = "native"), allow(clippy::unnecessary_wraps))]
+    fn rffi(
+        &self,
+        // iOS and Android won't use this; that's fine.
+        #[cfg_attr(not(feature = "native"), allow(unused_mut, unused_variables))]
+        mut audio_device_observer: Option<Box<dyn AudioDeviceObserver>>,
+    ) -> Result<RffiAudioConfigWrapper> {
+        #[cfg(feature = "native")]
+        let (adm_borrowed, adm_arc) = match AudioDeviceModule::new() {
+            Ok(mut adm) => {
+                if let Some(observer) = audio_device_observer.take() {
+                    adm.register_audio_device_callback(observer)?;
+                }
+                let adm_arc = Arc::new(Mutex::new(adm));
+                (
+                    // This will need to be explicitly destroyed by the
+                    // C++ layer by calling decrement_adm_ref_count to
+                    // turn it back into an Arc.
+                    // We use into_raw(...clone()) here to ensure that
+                    // the ADM stays alive until the C++ layer is done
+                    // using it.
+                    webrtc::ptr::Borrowed::from_ptr(Arc::<Mutex<AudioDeviceModule>>::into_raw(
+                        adm_arc.clone(),
+                    ))
+                    .to_void(),
+                    Some(adm_arc),
+                )
+            }
+            Err(e) => {
+                error!("Failed to initialize adm: {}", e);
+                (webrtc::ptr::Borrowed::null(), None)
+            }
+        };
+
+        Ok(RffiAudioConfigWrapper {
+            rffi: RffiAudioConfig {
+                high_pass_filter_enabled: self.high_pass_filter_enabled,
+                aec_enabled: self.aec_enabled,
+                ns_enabled: self.ns_enabled,
+                agc_enabled: self.agc_enabled,
+                #[cfg(feature = "native")]
+                adm_borrowed,
+                #[cfg(feature = "native")]
+                rust_audio_device_callbacks: webrtc::ptr::Borrowed::from_ptr(AUDIO_DEVICE_CBS_PTR)
+                    .to_void(),
+                #[cfg(feature = "native")]
+                free_adm_cb: decrement_adm_ref_count,
+            },
+            #[cfg(feature = "native")]
+            adm: adm_arc,
         })
     }
 }
@@ -267,8 +286,8 @@ impl AudioJitterBufferConfig {
 #[cfg(feature = "native")]
 #[derive(Clone, Debug, Default)]
 pub struct DeviceCounts {
-    playout: Option<u16>,
-    recording: Option<u16>,
+    playout: Option<usize>,
+    recording: Option<usize>,
 }
 
 /// Rust wrapper around WebRTC C++ PeerConnectionFactory object.
@@ -277,18 +296,31 @@ pub struct PeerConnectionFactory {
     rffi: webrtc::Arc<RffiPeerConnectionFactoryOwner>,
     #[cfg(feature = "native")]
     device_counts: DeviceCounts,
+    // Hold this so we run `drop` on it on shutdown
+    #[cfg(feature = "native")]
+    adm: Option<Arc<Mutex<AudioDeviceModule>>>,
 }
 
 impl PeerConnectionFactory {
     /// Create a new Rust PeerConnectionFactory object from a WebRTC C++
     /// PeerConnectionFactory object.
-    pub fn new(audio_config: &AudioConfig, use_injectable_network: bool) -> Result<Self> {
+    pub fn new(
+        audio_config: &AudioConfig,
+        use_injectable_network: bool,
+        field_trials_string: &str,
+        audio_device_observer: Option<Box<dyn AudioDeviceObserver>>,
+    ) -> Result<Self> {
         debug!("PeerConnectionFactory::new()");
+
+        let audio_config_rffi = audio_config.rffi(audio_device_observer)?;
+
+        let field_trials_cstr = CString::new(field_trials_string)?;
 
         let rffi = unsafe {
             webrtc::Arc::from_owned(pcf::Rust_createPeerConnectionFactory(
-                webrtc::ptr::Borrowed::from_ptr(&audio_config.rffi()?),
+                webrtc::ptr::Borrowed::from_ptr(&audio_config_rffi.rffi),
                 use_injectable_network,
+                field_trials_cstr.as_ptr(),
             ))
         };
         if rffi.is_null() {
@@ -298,6 +330,8 @@ impl PeerConnectionFactory {
             rffi,
             #[cfg(feature = "native")]
             device_counts: Default::default(),
+            #[cfg(feature = "native")]
+            adm: audio_config_rffi.adm,
         })
     }
 
@@ -313,13 +347,17 @@ impl PeerConnectionFactory {
     pub unsafe fn from_native_factory(
         native: webrtc::Arc<RffiPeerConnectionFactoryInterface>,
     ) -> Self {
-        let rffi = webrtc::Arc::from_owned(pcf::Rust_createPeerConnectionFactoryWrapper(
-            native.as_borrowed(),
-        ));
+        let rffi = unsafe {
+            webrtc::Arc::from_owned(pcf::Rust_createPeerConnectionFactoryWrapper(
+                native.as_borrowed(),
+            ))
+        };
         Self {
             rffi,
             #[cfg(feature = "native")]
             device_counts: Default::default(),
+            #[cfg(feature = "native")]
+            adm: None,
         }
     }
 
@@ -352,7 +390,7 @@ impl PeerConnectionFactory {
         // the RffiPeerConnectionObserver is *not* passed as owned
         // by Rust_createPeerConnection, so we need to keep it alive
         // for as long as the native PeerConnection is alive.
-        // we do this by passing a webrtc::ptr::Unique<RffiPeerConnectionObserver> to
+        // We do this by passing a webrtc::ptr::Unique<RffiPeerConnectionObserver> to
         // the Rust-level PeerConnection and let it own it.
         let pc_observer_rffi = pc_observer.into_rffi();
         let servers: Vec<RffiIceServer> = ice_servers.iter().map(|s| s.rffi()).collect();
@@ -429,102 +467,46 @@ impl PeerConnectionFactory {
     }
 
     #[cfg(feature = "native")]
-    fn get_audio_playout_device(&self, index: u16) -> Result<AudioDevice> {
-        let mut name_buf = [0; ADM_MAX_DEVICE_NAME_SIZE];
-        let mut unique_id_buf = [0; ADM_MAX_DEVICE_UUID_SIZE];
-        let rc = unsafe {
-            pcf::Rust_getAudioPlayoutDeviceName(
-                self.rffi.as_borrowed(),
-                index,
-                name_buf.as_mut_ptr(),
-                unique_id_buf.as_mut_ptr(),
-            )
-        };
-        if rc != 0 {
-            error!("getAudioPlayoutDeviceName({}) failed: {}", index, rc);
-            return Err(RingRtcError::QueryAudioDevices.into());
-        }
-        // SAFETY: the buffer pointers will be valid until the end of the scope,
-        // and they should contain valid C strings if the return code indicated success.
-        let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        let unique_id = unsafe { CStr::from_ptr(unique_id_buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        Ok(AudioDevice {
-            name,
-            unique_id,
-            i18n_key: "".to_string(),
-        })
-    }
-
-    #[cfg(feature = "native")]
     pub fn get_audio_playout_devices(&mut self) -> Result<Vec<AudioDevice>> {
-        let device_count = unsafe { pcf::Rust_getAudioPlayoutDevices(self.rffi.as_borrowed()) };
-        if device_count < 0 {
-            error!("getAudioPlayoutDevices() returned {}", device_count);
-            return Err(RingRtcError::QueryAudioDevices.into());
-        }
-        let device_count = device_count as u16;
-        let mut devices = Vec::<AudioDevice>::new();
+        let devices = self
+            .adm
+            .as_ref()
+            .and_then(|adm| adm.lock().ok())
+            .map_or(Err(anyhow!("couldn't access ADM")), |mut adm| {
+                adm.get_audio_playout_devices()
+            })?;
 
-        #[cfg(target_os = "windows")]
-        // If there is at least one real device, add slots for the "default" and
-        // "default communications" device. When setting, the ADM already has them,
-        // but doesn't include them in the count.
-        let device_count = if device_count > 0 {
-            device_count + 2
+        #[allow(unused_mut)] // Only need mut on windows
+        if let Some(mut devices) = devices.into_iter().collect::<Option<Vec<_>>>() {
+            if self.device_counts.playout != Some(devices.len()) {
+                info!(
+                    "PeerConnectionFactory::get_audio_playout_devices(): device_count: {}",
+                    devices.len()
+                );
+                self.device_counts.playout = Some(devices.len());
+            }
+
+            #[cfg(target_os = "windows")]
+            if devices.len() > 1 {
+                // Swap the first two devices, so that the "default communications" device
+                // is first and the "default" device is second. The UI treats the first
+                // index as the default, which for VoIP we prefer communications devices.
+                devices.swap(0, 1);
+
+                // Also, give both of those artificial slots unique ids so that
+                // the UI can manage them correctly.
+                devices[0].unique_id.push_str("-0");
+                devices[1].unique_id.push_str("-1");
+            }
+
+            Ok(devices)
         } else {
-            0
-        };
-
-        if self.device_counts.playout != Some(device_count) {
-            info!(
-                "PeerConnectionFactory::get_audio_playout_devices(): device_count: {}",
-                device_count
-            );
-            self.device_counts.playout = Some(device_count);
+            Err(RingRtcError::QueryAudioDevices.into())
         }
-
-        for i in 0..device_count {
-            match self.get_audio_playout_device(i) {
-                Ok(dev) => devices.push(dev),
-                Err(fail) => {
-                    error!("getAudioPlayoutDevice({}) failed: {}", i, fail);
-                    return Err(fail);
-                }
-            }
-        }
-        // For devices missing unique_id, populate them with name + index
-        for i in 0..devices.len() {
-            if devices[i].unique_id.is_empty() {
-                let same_name_count = devices[..i]
-                    .iter()
-                    .filter(|d| d.name == devices[i].name)
-                    .count() as u16;
-                devices[i].unique_id = format!("{}-{}", devices[i].name, same_name_count);
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        if devices.len() > 1 {
-            // Swap the first two devices, so that the "default communications" device
-            // is first and the "default" device is second. The UI treats the first
-            // index as the default, which for VoIP we prefer communications devices.
-            devices.swap(0, 1);
-
-            // Also, give both of those artificial slots unique ids so that
-            // the UI can manage them correctly.
-            devices[0].unique_id.push_str("-0");
-            devices[1].unique_id.push_str("-1");
-        }
-
-        Ok(devices)
     }
 
     #[cfg(feature = "native")]
-    pub fn set_audio_playout_device(&mut self, index: u16) -> Result<()> {
+    pub fn set_audio_playout_device(&mut self, index: usize) -> Result<()> {
         #[cfg(target_os = "windows")]
         // Swap the first two devices back to ordinal if either are selected.
         let index = match index {
@@ -535,112 +517,83 @@ impl PeerConnectionFactory {
 
         info!("PeerConnectionFactory::set_audio_playout_device({})", index);
 
-        let ok = unsafe { pcf::Rust_setAudioPlayoutDevice(self.rffi.as_borrowed(), index) };
-        if ok {
-            Ok(())
-        } else {
-            error!("setAudioPlayoutDevice({}) failed", index);
-            Err(RingRtcError::SetAudioDevice.into())
-        }
+        self.adm.as_ref().and_then(|adm| adm.lock().ok()).map_or(
+            Err(anyhow!("couldn't access ADM")),
+            |mut adm| {
+                if let Err(e) = adm.set_playout_device(index) {
+                    error!("Failed to set playout device: {}", e);
+                    return Err(RingRtcError::SetAudioDevice.into());
+                }
+                Ok(())
+            },
+        )
     }
 
     #[cfg(feature = "native")]
-    fn get_audio_recording_device(&self, index: u16) -> Result<AudioDevice> {
-        let mut name_buf = [0; ADM_MAX_DEVICE_NAME_SIZE];
-        let mut unique_id_buf = [0; ADM_MAX_DEVICE_UUID_SIZE];
-        let rc = unsafe {
-            pcf::Rust_getAudioRecordingDeviceName(
-                self.rffi.as_borrowed(),
-                index,
-                name_buf.as_mut_ptr(),
-                unique_id_buf.as_mut_ptr(),
-            )
-        };
-        if rc != 0 {
-            error!("getAudioRecordingDeviceName({}) failed: {}", index, rc);
-            return Err(RingRtcError::QueryAudioDevices.into());
-        }
-        // SAFETY: the buffer pointers will be valid until the end of the scope,
-        // and they should contain valid C strings if the return code indicated success.
-        let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        let unique_id = unsafe { CStr::from_ptr(unique_id_buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        Ok(AudioDevice {
-            name,
-            unique_id,
-            i18n_key: "".to_string(),
-        })
+    pub fn set_audio_playout_device_by_id(&mut self, device_id: &str) -> Result<()> {
+        self.adm.as_ref().and_then(|adm| adm.lock().ok()).map_or(
+            Err(anyhow!("couldn't access ADM")),
+            |mut adm| {
+                if let Err(e) = adm.set_playout_device_by_id(device_id) {
+                    error!("Failed to set playout device: {}", e);
+                    return Err(RingRtcError::SetAudioDevice.into());
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(feature = "native")]
+    pub fn set_input_voice_processing_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.adm
+            .as_ref()
+            .and_then(|adm| adm.lock().ok())
+            .map_or(Err(anyhow!("couldn't access ADM")), |mut adm| {
+                adm.set_input_processing_enabled(enabled)
+            })
     }
 
     #[cfg(feature = "native")]
     pub fn get_audio_recording_devices(&mut self) -> Result<Vec<AudioDevice>> {
-        let device_count = unsafe { pcf::Rust_getAudioRecordingDevices(self.rffi.as_borrowed()) };
-        if device_count < 0 {
-            error!("getAudioRecordingDevices() returned {}", device_count);
-            return Err(RingRtcError::QueryAudioDevices.into());
-        }
-        let device_count = device_count as u16;
-        let mut devices = Vec::<AudioDevice>::new();
+        let devices = self
+            .adm
+            .as_ref()
+            .and_then(|adm| adm.lock().ok())
+            .map_or(Err(anyhow!("couldn't access ADM")), |mut adm| {
+                adm.get_audio_recording_devices()
+            })?;
 
-        #[cfg(target_os = "windows")]
-        // If there is at least one real device, add slots for the "default" and
-        // "default communications" device. When setting, the ADM already has them,
-        // but doesn't include them in the count.
-        let device_count = if device_count > 0 {
-            device_count + 2
+        #[allow(unused_mut)] // Only need mut on windows
+        if let Some(mut devices) = devices.into_iter().collect::<Option<Vec<_>>>() {
+            if self.device_counts.recording != Some(devices.len()) {
+                info!(
+                    "PeerConnectionFactory::get_audio_recording_devices(): device_count: {}",
+                    devices.len()
+                );
+                self.device_counts.recording = Some(devices.len());
+            }
+
+            #[cfg(target_os = "windows")]
+            if devices.len() > 1 {
+                // Swap the first two devices, so that the "default communications" device
+                // is first and the "default" device is second. The UI treats the first
+                // index as the default, which for VoIP we prefer communications devices.
+                devices.swap(0, 1);
+
+                // Also, give both of those artificial slots unique ids so that
+                // the UI can manage them correctly.
+                devices[0].unique_id.push_str("-0");
+                devices[1].unique_id.push_str("-1");
+            }
+
+            Ok(devices)
         } else {
-            0
-        };
-
-        if self.device_counts.recording != Some(device_count) {
-            info!(
-                "PeerConnectionFactory::get_audio_recording_devices(): device_count: {}",
-                device_count
-            );
-            self.device_counts.recording = Some(device_count);
+            Err(RingRtcError::QueryAudioDevices.into())
         }
-
-        for i in 0..device_count {
-            match self.get_audio_recording_device(i) {
-                Ok(dev) => devices.push(dev),
-                Err(fail) => {
-                    error!("getAudioRecordingDevice({}) failed: {}", i, fail);
-                    return Err(fail);
-                }
-            }
-        }
-        // For devices missing unique_id, populate them with name + index
-        for i in 0..devices.len() {
-            if devices[i].unique_id.is_empty() {
-                let same_name_count = devices[..i]
-                    .iter()
-                    .filter(|d| d.name == devices[i].name)
-                    .count() as u16;
-                devices[i].unique_id = format!("{}-{}", devices[i].name, same_name_count);
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        if devices.len() > 1 {
-            // Swap the first two devices, so that the "default communications" device
-            // is first and the "default" device is second. The UI treats the first
-            // index as the default, which for VoIP we prefer communications devices.
-            devices.swap(0, 1);
-
-            // Also, give both of those artificial slots unique ids so that
-            // the UI can manage them correctly.
-            devices[0].unique_id.push_str("-0");
-            devices[1].unique_id.push_str("-1");
-        }
-
-        Ok(devices)
     }
 
     #[cfg(feature = "native")]
-    pub fn set_audio_recording_device(&mut self, index: u16) -> Result<()> {
+    pub fn set_audio_recording_device(&mut self, index: usize) -> Result<()> {
         #[cfg(target_os = "windows")]
         // Swap the first two devices back to ordinal if either are selected.
         let index = match index {
@@ -654,12 +607,69 @@ impl PeerConnectionFactory {
             index
         );
 
-        let ok = unsafe { pcf::Rust_setAudioRecordingDevice(self.rffi.as_borrowed(), index) };
-        if ok {
-            Ok(())
-        } else {
-            error!("setAudioRecordingDevice({}) failed", index);
-            Err(RingRtcError::SetAudioDevice.into())
-        }
+        self.adm.as_ref().and_then(|adm| adm.lock().ok()).map_or(
+            Err(anyhow!("couldn't access ADM")),
+            |mut adm| {
+                if let Err(e) = adm.set_recording_device(index) {
+                    error!("Failed to set recording device: {}", e);
+                    return Err(RingRtcError::SetAudioDevice.into());
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(feature = "native")]
+    pub fn set_audio_recording_device_by_id(&mut self, device_id: &str) -> Result<()> {
+        self.adm.as_ref().and_then(|adm| adm.lock().ok()).map_or(
+            Err(anyhow!("couldn't access ADM")),
+            |mut adm| {
+                if let Err(e) = adm.set_recording_device_by_id(device_id) {
+                    error!("Failed to set recording device: {}", e);
+                    return Err(RingRtcError::SetAudioDevice.into());
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(feature = "native")]
+    pub fn audio_backend(&self) -> Option<String> {
+        self.adm
+            .as_ref()
+            .and_then(|adm| adm.lock().ok())
+            .map(|adm| adm.backend_name())
+    }
+
+    #[cfg(feature = "native")]
+    pub fn set_audio_warmup(&mut self, enable: bool) -> Result<()> {
+        if self
+            .adm
+            .as_ref()
+            .and_then(|adm| adm.lock().ok())
+            .and_then(|mut adm| {
+                if enable {
+                    if adm.init_recording() != 0 {
+                        warn!("Failed to init recording for warmup");
+                        return None;
+                    }
+                    adm.warmup_recording().ok()
+                } else {
+                    if adm.stop_recording() != 0 {
+                        warn!("failed to stop recording");
+                        return None;
+                    }
+                    Some(())
+                }
+            })
+            .is_none()
+        {
+            if enable {
+                return Err(anyhow!("Failed to warm up mic"));
+            } else {
+                return Err(anyhow!("Failed to stop warming up mic"));
+            }
+        };
+        Ok(())
     }
 }

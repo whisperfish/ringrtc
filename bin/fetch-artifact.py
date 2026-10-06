@@ -7,26 +7,29 @@
 
 import argparse
 import hashlib
+import json
 import os
 import platform
+import subprocess
 import sys
 import tarfile
-import urllib.request
 
 from typing import BinaryIO
 
 UNVERIFIED_DOWNLOAD_NAME = "unverified.tmp"
 
-PREBUILD_CHECKSUMS = {
-    'android': '4b29072aba3ab26a33ae65e3e5e8ee1a08cbe269a74eca3cecfc1fd8ced7ae7d',
-    'ios': 'ab013e24315f4eaaca37e77b5f40b27348452aaab118f4928ac8cac30cd22944',
-    'linux-arm64': 'cf6b7feb41cf2d9053e363aeed7504b27cbebefcba334759407cb606ae80d649',
-    'linux-x64': 'd5daaef28621f56e0d050f9e2f57109631eadb7096c63bcd7fc902df2ef04b40',
-    'mac-arm64': '6ee4757b93555af4ff86ee5aec7f8d00710e95624d37e06a9f23d25fa51302f5',
-    'mac-x64': '818fda82e677dad07b9017b5cbea85cfe4b9e7a60829242df8738b111be20697',
-    'windows-arm64': 'eb30ffb127ed5acb156c704162eb4fe0590d458c70bbd5026c919f716a21ad66',
-    'windows-x64': '18a219d2318820823ead2a2c40ffe920b05d4d49a7750c758fae7739fcb5aa1f',
-}
+fetch_script_file_path = os.path.realpath(__file__)
+fetch_script_file_dir = os.path.dirname(fetch_script_file_path)
+
+try:
+    with open("{}/../config/webrtc_artifact_checksums.json".format(fetch_script_file_dir), 'r') as file:
+        PREBUILD_CHECKSUMS = json.load(file)
+except FileNotFoundError:
+    print("The artifact checksum file was not found.")
+    exit(1)
+except json.JSONDecodeError:
+    print("The artifact checksum file contains invalid JSON.")
+    exit(1)
 
 
 def resolve_os(os_name: str) -> str:
@@ -99,37 +102,49 @@ def download_if_needed(archive_file: str, url: str, checksum: str, archive_dir: 
     archive_path = os.path.join(archive_dir, archive_file)
 
     try:
-        f = open(archive_path, 'rb')
+        f_check = open(archive_path, 'rb')
         digest = hashlib.sha256()
-        chunk = f.read1()
+        chunk = f_check.read1()
         while chunk:
             digest.update(chunk)
-            chunk = f.read1()
+            chunk = f_check.read1()
         if digest.hexdigest() == checksum.lower():
-            return f
+            return f_check
         print("existing file '{}' has non-matching checksum {}; re-downloading...".format(archive_file, digest.hexdigest()), file=sys.stderr)
     except FileNotFoundError:
         pass
 
-    print("downloading {}...".format(archive_file), file=sys.stderr)
+    print("downloading {} with curl".format(archive_file), file=sys.stderr)
+
+    download_path = os.path.join(archive_dir, UNVERIFIED_DOWNLOAD_NAME)
     try:
-        with urllib.request.urlopen(url) as response:
-            digest = hashlib.sha256()
-            download_path = os.path.join(archive_dir, UNVERIFIED_DOWNLOAD_NAME)
-            f = open(download_path, 'w+b')
-            chunk = response.read1()
-            while chunk:
-                digest.update(chunk)
-                f.write(chunk)
-                chunk = response.read1()
-            assert digest.hexdigest() == checksum.lower(), "expected {}, actual {}".format(checksum.lower(), digest.hexdigest())
-            f.close()
-            os.replace(download_path, archive_path)
-            f = open(archive_path, 'rb')
-            return f
-    except urllib.error.HTTPError as e:
-        print(e, e.filename, file=sys.stderr)
+        subprocess.run(
+            [
+                "curl",
+                "--fail",
+                "--location",
+                "--show-error",
+                "--silent",
+                "--retry", "3",
+                "--output", download_path,
+                url,
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print("curl failed to download {} (exit {})".format(url, e.returncode), file=sys.stderr)
         sys.exit(1)
+
+    digest = hashlib.sha256()
+    with open(download_path, 'rb') as f_download:
+        chunk = f_download.read1()
+        while chunk:
+            digest.update(chunk)
+            chunk = f_download.read1()
+    assert digest.hexdigest() == checksum.lower(), "expected checksum {}, actual {}".format(checksum.lower(), digest.hexdigest())
+
+    os.replace(download_path, archive_path)
+    return open(archive_path, 'rb')
 
 
 def main() -> None:
@@ -143,6 +158,7 @@ def main() -> None:
         if not args.webrtc_version:
             parser.error(message='--platform requires --webrtc-version')
         platform_name = resolve_platform(args.platform)
+
         build_mode = 'debug' if args.debug else 'release'
         url = "https://build-artifacts.signal.org/libraries/webrtc-{}-{}-{}.tar.bz2".format(args.webrtc_version, platform_name, build_mode)
         if not checksum:

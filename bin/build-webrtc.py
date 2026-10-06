@@ -54,7 +54,7 @@ def run_cmd(dry_run, cmd, cwd=None, env=os.environ.copy()):
 
 def verify_build_host_platform(target_platform):
     if target_platform == 'android' or target_platform == 'linux':
-        expected_os_major_version = 'Ubuntu 22'
+        expected_os_major_version = 'Ubuntu 24'
         actual_os = subprocess.check_output(['lsb_release', '--short', '--description']).decode('UTF-8')
         if expected_os_major_version not in actual_os:
             raise Exception(f"Invalid Host OS Major Version. Expected: {expected_os_major_version} Actual: {actual_os}")
@@ -142,7 +142,7 @@ Build type      : {}
             env['TARGET_ARCH'] = "x64"
             for build_type in build_types:
                 run_cmd(args.dry_run,
-                        ['bin/build-electron', '--webrtc-only', '--archive-webrtc', '--' + build_type],
+                        ['bin/build-desktop', '--webrtc-only', '--archive-webrtc', '--' + build_type],
                         env=env)
 
             # Build WebRTC for arm64
@@ -153,16 +153,15 @@ Build type      : {}
             env['OUTPUT_DIR'] = "out_arm"
             for build_type in build_types:
                 run_cmd(args.dry_run,
-                        ['bin/build-electron', '--webrtc-only', '--archive-webrtc', '--' + build_type],
+                        ['bin/build-desktop', '--webrtc-only', '--archive-webrtc', '--' + build_type],
                         env=env)
 
     elif args.target == 'ios' or args.target == 'mac':
         # Get grealpath
         run_cmd(args.dry_run, ['brew', 'install', 'coreutils'])
 
-        # Set up Xcode (https://github.com/XcodesOrg/xcodes)
-        run_cmd(args.dry_run, ['brew', 'install', 'xcodesorg/made/xcodes'])
-        run_cmd(args.dry_run, ['sudo', 'xcodes', 'select', '15.3'])
+        # Assume xcode is already installed
+        run_cmd(args.dry_run, ['sudo', 'xcodes', 'select', '26.1.1'])
 
         # Accept the license
         run_cmd(args.dry_run, ['sudo', 'xcodebuild', '-license', 'accept'])
@@ -189,14 +188,14 @@ Build type      : {}
             env['TARGET_ARCH'] = "x64"
             for build_type in build_types:
                 run_cmd(args.dry_run,
-                        ['bin/build-electron', '--webrtc-only', '--archive-webrtc', '--' + build_type],
+                        ['bin/build-desktop', '--webrtc-only', '--archive-webrtc', '--' + build_type],
                         env=env)
 
             env['TARGET_ARCH'] = "arm64"
             env['OUTPUT_DIR'] = "out_arm"
             for build_type in build_types:
                 run_cmd(args.dry_run,
-                        ['bin/build-electron', '--webrtc-only', '--archive-webrtc', '--' + build_type],
+                        ['bin/build-desktop', '--webrtc-only', '--archive-webrtc', '--' + build_type],
                         env=env)
 
     elif args.target == 'windows':
@@ -208,7 +207,7 @@ Build type      : {}
         env['TARGET_ARCH'] = "x64"
         for build_type in build_types:
             run_cmd(args.dry_run,
-                    [bash, 'bin/build-electron', '--webrtc-only', '--archive-webrtc', '--' + build_type],
+                    [bash, 'bin/build-desktop', '--webrtc-only', '--archive-webrtc', '--' + build_type],
                     env=env)
 
         # Prepare workspace for arm
@@ -218,7 +217,7 @@ Build type      : {}
         env['TARGET_ARCH'] = "arm64"
         for build_type in build_types:
             run_cmd(args.dry_run,
-                    [bash, 'bin/build-electron', '--webrtc-only', '--archive-webrtc', '--' + build_type],
+                    [bash, 'bin/build-desktop', '--webrtc-only', '--archive-webrtc', '--' + build_type],
                     env=env)
 
 

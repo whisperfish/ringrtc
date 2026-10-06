@@ -3,14 +3,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use chrono;
-use log::{debug, info};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+    time::Duration,
+};
 
+use log::{debug, info};
 use ringrtc::{
+    bin::utils::audio::set_default_audio_devices,
     common::{
+        CallConfig, CallId, CallMediaType, DataMode, DeviceId, Result,
         actor::{Actor, Stopper},
         units::DataRate,
-        CallConfig, CallId, CallMediaType, DataMode, DeviceId, Result,
     },
     core::{call_manager::CallManager, group_call, signaling},
     lite::{
@@ -34,11 +39,6 @@ use ringrtc::{
         peer_connection_factory::{self as pcf, IceServer, PeerConnectionFactory},
         peer_connection_observer::NetworkRoute,
     },
-};
-use std::{
-    collections::{HashMap, HashSet},
-    thread,
-    time::Duration,
 };
 
 fn main() {
@@ -263,15 +263,10 @@ impl CallEndpoint {
                     // Option<CallManager> thing that we have to set later.
                     let endpoint = Self::from_actor(peer_id.clone(), device_id, actor.clone());
 
-                    let mut pcf = PeerConnectionFactory::new(&pcf::AudioConfig::default(), true)?; // Set up packet flow
-                    info!(
-                        "Audio playout devices: {:?}",
-                        pcf.get_audio_playout_devices()
-                    );
-                    info!(
-                        "Audio recording devices: {:?}",
-                        pcf.get_audio_recording_devices()
-                    );
+                    let mut pcf =
+                        PeerConnectionFactory::new(&pcf::AudioConfig::default(), true, "", None)?; // Set up packet flow
+
+                    set_default_audio_devices(&mut pcf).unwrap();
 
                     let network = pcf.injectable_network().expect("get Injectable Network");
                     let router_as_sender = router.clone();
@@ -403,25 +398,24 @@ impl CallEndpoint {
         let callee_id = callee_id.clone();
 
         self.actor.send(move |state| {
-            state
-                .call_manager
-                .create_outgoing_call(callee_id, call_id, media_type, local_device_id)
-                .expect("start outgoing call");
+            state.call_manager.create_outgoing_call(
+                callee_id,
+                call_id,
+                media_type,
+                local_device_id,
+            );
         });
     }
 
     pub fn accept_incoming_call(&self, call_id: CallId) {
         self.actor.send(move |state| {
-            state
-                .call_manager
-                .accept_call(call_id)
-                .expect("accept incoming call");
+            state.call_manager.accept_call(call_id);
         });
     }
 
     pub fn hangup(&self) {
         self.actor.send(move |state| {
-            state.call_manager.hangup().expect("hangup");
+            state.call_manager.hangup();
         });
     }
 
@@ -450,15 +444,14 @@ impl CallEndpoint {
                             age: Duration::from_secs(0),
                             sender_device_id,
                             receiver_device_id: state.device_id,
-                            receiver_device_is_primary: (state.device_id == 1),
                             sender_identity_key,
                             receiver_identity_key,
                         },
-                    )
-                    .expect("receive offer");
+                    );
                 }
                 signaling::Message::Answer(answer) => {
                     cm.received_answer(
+                        sender_id,
                         call_id,
                         signaling::ReceivedAnswer {
                             answer,
@@ -466,32 +459,34 @@ impl CallEndpoint {
                             sender_identity_key,
                             receiver_identity_key,
                         },
-                    )
-                    .expect("received answer");
+                    );
                 }
                 signaling::Message::Ice(ice) => {
                     cm.received_ice(
+                        sender_id,
                         call_id,
                         signaling::ReceivedIce {
                             ice,
                             sender_device_id,
                         },
-                    )
-                    .expect("received ice candidates");
+                    );
                 }
                 signaling::Message::Hangup(hangup) => {
                     cm.received_hangup(
+                        sender_id,
                         call_id,
                         signaling::ReceivedHangup {
                             hangup,
                             sender_device_id,
                         },
-                    )
-                    .expect("received hangup");
+                    );
                 }
                 signaling::Message::Busy => {
-                    cm.received_busy(call_id, signaling::ReceivedBusy { sender_device_id })
-                        .expect("received busy");
+                    cm.received_busy(
+                        sender_id,
+                        call_id,
+                        signaling::ReceivedBusy { sender_device_id },
+                    );
                 }
             }
         });
@@ -544,10 +539,7 @@ impl SignalingSender for CallEndpoint {
                 call_id,
                 msg,
             );
-            state
-                .call_manager
-                .message_sent(call_id)
-                .expect("signaling message sent");
+            state.call_manager.message_sent(call_id);
         });
         Ok(())
     }
@@ -570,6 +562,16 @@ impl SignalingSender for CallEndpoint {
     ) -> Result<()> {
         unimplemented!()
     }
+
+    fn send_call_message_to_adhoc_group(
+        &self,
+        _message: Vec<u8>,
+        _urgency: group_call::SignalingMessageUrgency,
+        _expiration: u64,
+        _recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
+    ) -> Result<()> {
+        unimplemented!()
+    }
 }
 
 impl CallStateHandler for CallEndpoint {
@@ -588,15 +590,12 @@ impl CallStateHandler for CallEndpoint {
             if let CallState::Incoming(_call_media_type) | CallState::Outgoing(_call_media_type) =
                 call_state
             {
-                state
-                    .call_manager
-                    .proceed(
-                        call_id,
-                        state.call_context.clone(),
-                        state.call_config.clone(),
-                        None,
-                    )
-                    .expect("proceed with call");
+                state.call_manager.proceed(
+                    call_id,
+                    state.call_context.clone(),
+                    state.call_config.clone(),
+                    None,
+                );
             }
         });
         Ok(())

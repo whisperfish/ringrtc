@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{fmt, path::Path, time::Duration};
+use std::{collections::HashSet, fmt, path::Path, time::Duration};
+
+use derive_builder::Builder;
 
 /// ChartDimension is used for summary reports, to help automate the summary charting and
 /// display of most tracked `dimensions` that are available.
@@ -34,6 +36,9 @@ pub enum ChartDimension {
     AudioReceiveJitter,
     AudioReceiveAudioEnergy,
     AudioReceiveJitterBufferDelay,
+    AudioReceiveJitterBufferTargetDelay,
+    AudioReceiveConcealedSamplesPct,
+    AudioReceiveFecPacketsReceived,
 
     VideoSendPacketsPerSecond,
     VideoSendPacketSize,
@@ -85,6 +90,15 @@ impl ChartDimension {
             ChartDimension::AudioReceiveAudioEnergy => ("Audio Received Energy", "Energy"),
             ChartDimension::AudioReceiveJitterBufferDelay => {
                 ("Audio Received Jitter Buffer Delay", "milliseconds")
+            }
+            ChartDimension::AudioReceiveJitterBufferTargetDelay => {
+                ("Audio Received Jitter Buffer Target Delay", "milliseconds")
+            }
+            ChartDimension::AudioReceiveConcealedSamplesPct => {
+                ("Audio Received Concealed Samples", "%")
+            }
+            ChartDimension::AudioReceiveFecPacketsReceived => {
+                ("Audio Received FEC Packets", "Packets")
             }
             ChartDimension::VideoSendPacketsPerSecond => {
                 ("Video Sent Packet Rate", "Packets/Second")
@@ -138,6 +152,13 @@ impl ChartDimension {
             ChartDimension::AudioReceiveJitter => "audio_receive_jitter",
             ChartDimension::AudioReceiveAudioEnergy => "audio_receive_audio_energy",
             ChartDimension::AudioReceiveJitterBufferDelay => "audio_receive_jitter_buffer_delay",
+            ChartDimension::AudioReceiveJitterBufferTargetDelay => {
+                "audio_receive_jitter_buffer_target_delay"
+            }
+            ChartDimension::AudioReceiveConcealedSamplesPct => {
+                "audio_receive_concealed_samples_pct"
+            }
+            ChartDimension::AudioReceiveFecPacketsReceived => "audio_receive_fec_packets_received",
             ChartDimension::VideoSendPacketsPerSecond => "video_send_pps",
             ChartDimension::VideoSendPacketSize => "video_send_packet_size",
             ChartDimension::VideoSendBitrate => "video_send_bitrate",
@@ -164,11 +185,14 @@ impl ChartDimension {
 pub struct SummaryReportColumns {
     pub show_visqol_mos_speech: bool,
     pub show_visqol_mos_audio: bool,
-    pub show_visqol_mos_average: bool,
     pub show_pesq_mos: bool,
     pub show_plc_mos: bool,
     /// A general flag to control video columns.
     pub show_video: bool,
+    /// Show client send stats columns in the summary.
+    pub show_send_stats: bool,
+    /// Show client receive stats columns in the summary.
+    pub show_receive_stats: bool,
 }
 
 impl Default for SummaryReportColumns {
@@ -176,10 +200,25 @@ impl Default for SummaryReportColumns {
         Self {
             show_visqol_mos_speech: true,
             show_visqol_mos_audio: true,
-            show_visqol_mos_average: false,
             show_pesq_mos: false,
             show_plc_mos: false,
             show_video: true,
+            show_send_stats: true,
+            show_receive_stats: true,
+        }
+    }
+}
+
+impl SummaryReportColumns {
+    pub fn none() -> Self {
+        Self {
+            show_visqol_mos_speech: false,
+            show_visqol_mos_audio: false,
+            show_pesq_mos: false,
+            show_plc_mos: false,
+            show_video: false,
+            show_send_stats: true,
+            show_receive_stats: true,
         }
     }
 }
@@ -202,18 +241,50 @@ pub struct TestCaseConfig {
     pub test_case_name: String,
     /// The amount of time that the test should consume (once client instances have started).
     pub length_seconds: u16,
-    /// The overall configuration specific to client A.
-    pub client_a_config: CallConfig,
-    /// The overall configuration specific to client B.
-    pub client_b_config: CallConfig,
-    /// A flag to control recording of packet capture. Enabling this results in a `tcpdump.pcap`
-    /// file among the generated artifacts for the test.
-    pub tcp_dump: bool,
+    /// The overall configuration of different clients
+    /// Requires a minimum of 1 client for group calls, 2 for 1:1 calls
+    /// Only uses the first 2 configs for 1:1
+    pub client_configs: Vec<CallConfig>,
     /// The number of times to run the test case.
     pub iterations: u16,
     /// Whether to create charts for reports. This takes time and is sometimes not needed
     /// when running large test sets.
     pub create_charts: bool,
+    /// Whether to save media files in the output. This takes time and disk space and is sometimes
+    /// not needed.
+    pub save_media_files: bool,
+    /// The number of analysis operations to run at once. Use 1 to keep analysis serial.
+    pub analysis_concurrency: u16,
+    /// Whether or not this test case should be a group call
+    pub is_group_call: bool,
+}
+
+impl TestCaseConfig {
+    /// Gets the first config in `client_configs`
+    /// Panics if does not exist
+    pub fn client_a_config(&self) -> &CallConfig {
+        self.client_configs.first().unwrap()
+    }
+
+    /// Gets the first config in `client_configs`
+    /// Panics if does not exist
+    pub fn client_b_config(&self) -> &CallConfig {
+        self.client_configs.get(1).unwrap()
+    }
+
+    pub fn usable_client_configs(&self) -> Vec<&CallConfig> {
+        if self.is_group_call {
+            self.client_configs.iter().collect()
+        } else {
+            self.client_configs.iter().take(2).collect()
+        }
+    }
+
+    pub fn needs_turn_server(&self) -> bool {
+        self.usable_client_configs()
+            .iter()
+            .any(|config| config.start_turn_server)
+    }
 }
 
 impl Default for TestCaseConfig {
@@ -221,11 +292,12 @@ impl Default for TestCaseConfig {
         Self {
             test_case_name: "default".to_string(),
             length_seconds: 30,
-            client_a_config: Default::default(),
-            client_b_config: Default::default(),
-            tcp_dump: false,
+            client_configs: vec![Default::default(), Default::default()],
             iterations: 1,
             create_charts: true,
+            save_media_files: true,
+            analysis_concurrency: 16,
+            is_group_call: false,
         }
     }
 }
@@ -240,6 +312,33 @@ pub enum CallProfile {
     DeterministicLoss(u8),
 }
 
+#[derive(Clone, Debug)]
+pub struct RelayServerConfig {
+    /// Relay server username. Applies to all relay servers.
+    pub username: String,
+    /// Relay server password. Applies to all relay servers.
+    pub password: String,
+    /// FQDNs for STUN and TURN servers.
+    pub urls: Vec<String>,
+    /// IP addresses of STUN and TURN servers.
+    pub urls_with_ips: Vec<String>,
+    /// Relay server hostname. Applies to all relay servers to resolve certs when using IPs.
+    pub hostname: Option<String>,
+}
+
+impl Default for RelayServerConfig {
+    fn default() -> Self {
+        Self {
+            // Set our basic credentials, they aren't used if there are no relay servers.
+            username: "".to_string(),
+            password: "".to_string(),
+            urls: vec![],
+            urls_with_ips: vec![],
+            hostname: None,
+        }
+    }
+}
+
 /// General structure for configuration settings to send to the cli.
 #[derive(Debug, Clone)]
 pub struct CallConfig {
@@ -249,15 +348,12 @@ pub struct CallConfig {
     pub audio: AudioConfig,
     /// The video-specific configuration.
     pub video: VideoConfig,
-    /// Relay server configuration, a vector of STUN/TURN server(s) that the client can use.
-    /// If this is empty, the test TURN server will not even be started.
-    pub relay_servers: Vec<String>,
-    /// Relay server username. Applies to all relay servers.
-    pub relay_username: String,
-    /// Relay server password. Applies to all relay servers.
-    pub relay_password: String,
+    /// The configuration to use if testing with relay servers.
+    pub relay_servers: RelayServerConfig,
     /// If using relay servers, whether or not to force their use.
     pub force_relay: bool,
+    /// If true, starts a local TURN server to support STUN/TURN requests.
+    pub start_turn_server: bool,
     /// The WebRTC field trial string and associated settings (i.e. "WebRTC-Something/Enabled").
     pub field_trials: Vec<String>,
     /// For quick-and-dirty testing.
@@ -268,6 +364,9 @@ pub struct CallConfig {
     pub stats_initial_offset_secs: u16,
     /// Application of a profile for the call, to be set in the client.
     pub profile: CallProfile,
+    /// A flag to control packet capture. Enabling results in a `client_x.pcap` file
+    /// among the generated artifacts for the test.
+    pub tcpdump: bool,
 }
 
 impl CallConfig {
@@ -289,11 +388,9 @@ impl Default for CallConfig {
             allowed_bitrate_kbps: 2000,
             audio: AudioConfig::default(),
             video: VideoConfig::default(),
-            relay_servers: vec![],
-            // Set our basic credentials, but they aren't used if there are no relay servers.
-            relay_username: "test".to_string(),
-            relay_password: "test".to_string(),
+            relay_servers: Default::default(),
             force_relay: false,
+            start_turn_server: false,
             // By default, all tests will disable the ANY port allocator setting.
             field_trials: vec![
                 "RingRTC-AnyAddressPortsKillSwitch/Enabled".to_string(),
@@ -303,6 +400,7 @@ impl Default for CallConfig {
             stats_interval_secs: 1,
             stats_initial_offset_secs: 0,
             profile: CallProfile::None,
+            tcpdump: false,
         }
     }
 }
@@ -368,7 +466,7 @@ pub struct AudioConfig {
     /// The Opus bandwidth value to use (Auto is the default).
     pub bandwidth: AudioBandwidth,
     /// The Opus complexity value to use.
-    pub complexity: i32,
+    pub complexity: u8,
     /// The adaptation method to use. 0 means no adaptation (the default).
     pub adaptation: i32,
     /// Flag to enable the Opus constant bitrate mode.
@@ -377,10 +475,17 @@ pub struct AudioConfig {
     pub enable_dtx: bool,
     /// Flag to enable the Opus in-band FEC.
     pub enable_fec: bool,
+    /// The duration of DRED to use in 10ms units. Set to 0 to disable.
+    pub dred_duration: u8,
+    /// Minimum packet loss percentage reported to the encoder (0-100).
+    pub min_packet_loss_percent: u8,
+    /// None when using NetEq PLC, 0 use Opus PLC, 5 use Opus Deep PLC (if compiled),
+    /// 6 use Opus Deep PLC + LACE (if compiled), 7 use Opus Deep PLC + NoLACE (if compiled).
+    pub decoder_complexity: Option<u8>,
+    /// The name of the Opus DNN weights file to load from the data directory.
+    pub dnn_weights_name: String,
     /// Flag to enable transport-wide congestion control for audio.
     pub enable_tcc: bool,
-    /// Flag to enabled redundant packets to be sent for audio.
-    pub enable_red: bool,
     /// Flag to enable WebRTC's high pass filter.
     pub enable_high_pass_filter: bool,
     /// Flag to enable WebRTC's acoustic echo cancellation.
@@ -429,23 +534,26 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             input_name: "silence".to_string(),
-            initial_packet_size_ms: 20,
-            min_packet_size_ms: 20,
-            max_packet_size_ms: 20,
+            initial_packet_size_ms: 60,
+            min_packet_size_ms: 60,
+            max_packet_size_ms: 60,
             initial_bitrate_bps: 32000,
-            min_bitrate_bps: 16000,
+            min_bitrate_bps: 32000,
             max_bitrate_bps: 32000,
             bandwidth: AudioBandwidth::Auto,
             complexity: 9,
             adaptation: 0,
             enable_cbr: true,
             enable_dtx: true,
-            enable_fec: true,
+            enable_fec: false,
+            dred_duration: 100,
+            min_packet_loss_percent: 0,
+            decoder_complexity: Some(0),
+            dnn_weights_name: "deep_plc-dred-weights.bin".to_string(),
             enable_tcc: false,
-            enable_red: false,
             enable_high_pass_filter: true,
-            // Default tests now disable AEC in order to prevent random timing delays
-            // from causing double-talk and thus attenuating valid audio.
+            // Disable AEC by default to prevent random timing delays from
+            // causing double-talk and thus attenuating valid audio.
             enable_aec: false,
             enable_ns: true,
             enable_agc: true,
@@ -647,44 +755,41 @@ pub enum Loss {
     State(MarkovLossModel),
 }
 
-/// This struct can be used to form Simple Gilbert loss models based on "Mean Loss Burst Size"
-/// from here: https://ntnuopen.ntnu.no/ntnu-xmlui/bitstream/handle/11250/2409900/15147_FULLTEXT.pdf
+/// Mean Loss Burst Size (MLBS) describes the correlation of packet loss by explaining
+/// how many consecutive packets are lost on average each time one is lost.
+/// Based on "Quality of Experience of WebRTC-based Video Communication" from:
+/// https://ntnuopen.ntnu.no/ntnu-xmlui/bitstream/handle/11250/2409900/15147_FULLTEXT.pdf
 #[allow(dead_code)]
-struct MlbsData {
-    loss: u8,
-    mlbs: f32,
-    r: u8,
-    p: u8,
+#[derive(Clone, Copy, Debug)]
+pub enum BurstLength {
+    /// Short bursts: ~1.5 consecutive packets lost per loss event
+    Short,
+    /// Medium bursts: ~2 consecutive packets lost per loss event
+    Medium,
+    /// Long bursts: ~3 consecutive packets lost per loss event
+    Long,
+    /// Very long bursts: ~4 consecutive packets lost per loss event
+    VeryLong,
 }
 
-#[allow(dead_code)]
-#[rustfmt::skip]
-const MLBS_DATA: [MlbsData; 24] = [
-    MlbsData { loss: 5, mlbs: 1.5, r: 65, p: 3 },
-    MlbsData { loss: 5, mlbs: 2.0, r: 50, p: 3 },
-    MlbsData { loss: 5, mlbs: 3.0, r: 35, p: 2 },
-    MlbsData { loss: 5, mlbs: 4.0, r: 25, p: 1 },
-    MlbsData { loss: 10, mlbs: 1.5, r: 65, p: 7 },
-    MlbsData { loss: 10, mlbs: 2.0, r: 50, p: 6 },
-    MlbsData { loss: 10, mlbs: 3.0, r: 35, p: 4 },
-    MlbsData { loss: 10, mlbs: 4.0, r: 25, p: 3 },
-    MlbsData { loss: 20, mlbs: 1.5, r: 65, p: 16 },
-    MlbsData { loss: 20, mlbs: 2.0, r: 50, p: 13 },
-    MlbsData { loss: 20, mlbs: 3.0, r: 35, p: 9 },
-    MlbsData { loss: 20, mlbs: 4.0, r: 25, p: 6 },
-    MlbsData { loss: 30, mlbs: 1.5, r: 65, p: 28 },
-    MlbsData { loss: 30, mlbs: 2.0, r: 50, p: 21 },
-    MlbsData { loss: 30, mlbs: 3.0, r: 35, p: 15 },
-    MlbsData { loss: 30, mlbs: 4.0, r: 25, p: 11 },
-    MlbsData { loss: 40, mlbs: 1.5, r: 65, p: 43 },
-    MlbsData { loss: 40, mlbs: 2.0, r: 50, p: 33 },
-    MlbsData { loss: 40, mlbs: 3.0, r: 35, p: 23 },
-    MlbsData { loss: 40, mlbs: 4.0, r: 25, p: 17 },
-    MlbsData { loss: 50, mlbs: 1.5, r: 65, p: 65 },
-    MlbsData { loss: 50, mlbs: 2.0, r: 50, p: 50 },
-    MlbsData { loss: 50, mlbs: 3.0, r: 35, p: 35 },
-    MlbsData { loss: 50, mlbs: 4.0, r: 25, p: 25 },
-];
+impl BurstLength {
+    /// Computes SimpleGilbert model parameters (p, r) for the given loss percentage.
+    /// Returns (p, r) where:
+    /// - r: Bad to Good transition probability (based on MLBS)
+    /// - p: Good to Bad transition probability (based on loss percentage and r)
+    pub fn compute_simple_gilbert_params(&self, loss_percent: u8) -> (u8, u8) {
+        // Use r values from the paper (with slight adjustments for stability).
+        let r = match self {
+            BurstLength::Short => 65,
+            BurstLength::Medium => 50,
+            BurstLength::Long => 35,
+            BurstLength::VeryLong => 30, // 25
+        };
+        let loss = loss_percent.min(99); // Make sure loss is < 100.
+        let p = (((loss as f32) * (r as f32)) / (100.0 - (loss as f32))).round() as u8;
+        (p, r)
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -701,8 +806,8 @@ pub enum NetworkProfile {
     International,
     /// Good network for 10 seconds, bad loss (30%) for 10 seconds, good for 10 seconds.
     SpikyLoss,
-    /// Bursty loss model using pre-calculated mean loss burst size (may fail test if no match).
-    //BurstyLoss { loss: u8, mlbs: u8 },
+    /// Bursty loss using SimpleGilbert model with specified loss percentage and burst length.
+    BurstyLoss(u8, BurstLength),
     /// Sets a simple uniform loss percentage.
     SimpleLoss(u8),
     /// Sets a bandwidth limitation (kbps).
@@ -718,6 +823,9 @@ impl NetworkProfile {
             NetworkProfile::Moderate => "moderate".to_string(),
             NetworkProfile::International => "international".to_string(),
             NetworkProfile::SpikyLoss => "spiky_loss".to_string(),
+            NetworkProfile::BurstyLoss(loss, burst) => {
+                format!("bursty_loss_{}_{:?}", loss, burst)
+            }
             NetworkProfile::SimpleLoss(loss) => {
                 format!("simple_loss_{}", loss)
             }
@@ -767,7 +875,7 @@ impl NetworkProfile {
                         reorder_correlation: 50,
                         reorder_gap: 0,
                         rate: 300,
-                        limit: 250,
+                        limit: 30,
                         slot: 0,
                     },
                 }]
@@ -806,6 +914,17 @@ impl NetworkProfile {
                     },
                 ]
             }
+            NetworkProfile::BurstyLoss(loss, burst) => {
+                let (p, r) = burst.compute_simple_gilbert_params(*loss);
+
+                vec![NetworkConfigWithOffset {
+                    offset: Duration::from_secs(2),
+                    network_config: NetworkConfig {
+                        loss: Some(Loss::GeModel(GeLossModel::SimpleGilbert { p, r })),
+                        ..Default::default()
+                    },
+                }]
+            }
             NetworkProfile::SimpleLoss(loss) => {
                 vec![NetworkConfigWithOffset {
                     offset: Duration::from_secs(2),
@@ -820,11 +939,85 @@ impl NetworkProfile {
                     offset: Duration::from_secs(2),
                     network_config: NetworkConfig {
                         rate: *rate,
-                        limit: 16,
+                        limit: ((*rate * 100) / 12000).max(4), // ~100ms buffering (typical consumer network)
                         ..Default::default()
                     },
                 }]
             }
         }
+    }
+}
+
+#[derive(Clone, Builder, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[builder(derive(Debug), setter(into))]
+pub struct ClientProfile {
+    pub user_id: String,
+    pub device_id: String,
+    pub groups: Vec<Group>,
+}
+
+#[derive(Clone, Builder, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[builder(derive(Debug), setter(into))]
+pub struct GroupMetadata {
+    // friendly name for group, expected to be unique
+    pub name: String,
+    pub id_base64: String,
+    pub members: HashSet<GroupMember>,
+}
+
+#[derive(Clone, Builder, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[builder(derive(Debug), setter(into))]
+pub struct Group {
+    pub metadata: GroupMetadata,
+    pub membership_proof: String,
+}
+
+#[derive(Clone, Builder, Debug, Hash, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[builder(derive(Debug), setter(into))]
+pub struct GroupMember {
+    pub user_id: String,
+    pub member_id: String,
+}
+
+#[derive(Default)]
+pub struct AToZIterator {
+    idx: u8,
+}
+
+impl Iterator for AToZIterator {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx > 25 {
+            return None;
+        }
+
+        let result = Some((b'a' + self.idx) as char);
+        self.idx += 1;
+        result
+    }
+}
+
+/// Starts the iterator at 172.28.0.2 and increments by up to 172.28.0.130
+#[derive(Clone, Default)]
+pub struct ClientIpIterator {
+    idx: u8,
+}
+
+impl Iterator for ClientIpIterator {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx == 128 {
+            return None;
+        }
+
+        let result = Some(format!("172.28.0.{}", 2 + self.idx));
+        self.idx += 1;
+        result
     }
 }

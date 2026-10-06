@@ -46,6 +46,30 @@ pub mod ios {
         }
     }
 
+    /// Swift "Float32?"
+    #[repr(C)]
+    #[derive(Debug, Default)]
+    pub struct rtc_OptionalF32 {
+        pub value: f32,
+        pub valid: bool,
+    }
+
+    impl From<f32> for rtc_OptionalF32 {
+        fn from(value: f32) -> Self {
+            Self { value, valid: true }
+        }
+    }
+
+    impl From<Option<f32>> for rtc_OptionalF32 {
+        fn from(value: Option<f32>) -> Self {
+            if let Some(value) = value {
+                Self { value, valid: true }
+            } else {
+                Self::default()
+            }
+        }
+    }
+
     /// Swift Data/[UInt8]/UnsafeBufferPointer<UInt8>
     #[repr(C)]
     #[derive(Debug)]
@@ -55,7 +79,7 @@ pub mod ios {
         phantom: std::marker::PhantomData<&'a u8>,
     }
 
-    impl<'a> Default for rtc_Bytes<'a> {
+    impl Default for rtc_Bytes<'_> {
         fn default() -> Self {
             Self {
                 ptr: std::ptr::null(),
@@ -76,7 +100,7 @@ pub mod ios {
         }
     }
 
-    impl<'a> rtc_Bytes<'a> {
+    impl rtc_Bytes<'_> {
         pub fn as_slice(&self) -> &[u8] {
             if self.ptr.is_null() {
                 return &[];
@@ -98,7 +122,7 @@ pub mod ios {
         phantom: std::marker::PhantomData<&'a u8>,
     }
 
-    impl<'a> Default for rtc_String<'a> {
+    impl Default for rtc_String<'_> {
         fn default() -> Self {
             Self {
                 ptr: std::ptr::null(),
@@ -119,7 +143,7 @@ pub mod ios {
         }
     }
 
-    impl<'a> rtc_String<'a> {
+    impl rtc_String<'_> {
         pub fn as_str(&self) -> Option<&str> {
             if self.ptr.is_null() {
                 return None;

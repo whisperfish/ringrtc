@@ -5,12 +5,19 @@
 package org.signal.ringrtc;
 
 import androidx.annotation.NonNull;
+import android.media.MediaCodecInfo;
+
+import org.webrtc.EglBase;
+import org.webrtc.HardwareVideoDecoderFactory;
+import org.webrtc.HardwareVideoEncoderFactory;
 
 import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.UUID;
 
 public final class Util {
+    private static final String  TAG = "RingRtcUtil";
+
     // Based on https://gist.github.com/jeffjohnson9046/c663dd22bbe6bb0b3f5e.
     public static byte[] getBytesFromUuid(UUID uuid) {
         ByteBuffer bytes = ByteBuffer.wrap(new byte[16]);
@@ -50,5 +57,48 @@ public final class Util {
             // Return an empty array.
             return new byte[0];
         }
+    }
+
+    private static boolean supportsVp9(MediaCodecInfo info) {
+        for (String mimeType : info.getSupportedTypes()) {
+            if (mimeType.equals("video/x-vnd.on2.vp9")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static boolean deviceSupportsVp9HardwareEncoder(EglBase eglBase) {
+      if (eglBase == null) {
+        return false;
+      }
+
+      HardwareVideoEncoderFactory hwFactory = new HardwareVideoEncoderFactory(eglBase.getEglBaseContext(), true, true, Util::supportsVp9);
+
+      if (hwFactory.getSupportedCodecs().length == 0) {
+        Log.w(TAG, "No supported VP9 hardware encoder found");
+        return false;
+      }
+
+      return true;
+    }
+
+    public static boolean deviceSupportsVp9HardwareDecoder(EglBase eglBase) {
+        if (eglBase == null) {
+            return false;
+        }
+
+        HardwareVideoDecoderFactory hwFactory = new HardwareVideoDecoderFactory(eglBase.getEglBaseContext(), Util::supportsVp9);
+
+        if (hwFactory.getSupportedCodecs().length == 0) {
+            Log.w(TAG, "No supported VP9 hardware decoder found");
+            return false;
+        }
+
+        return true;
+    }
+
+    public static boolean filterVp9Support(MediaCodecInfo info) {
+      return !supportsVp9(info);
     }
 }

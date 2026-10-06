@@ -7,16 +7,22 @@
 
 use std::os::raw::c_char;
 
-use crate::webrtc;
-use crate::webrtc::ffi::ice_gatherer::RffiIceGatherer;
-use crate::webrtc::media::RffiAudioEncoderConfig;
-use crate::webrtc::network::{RffiIp, RffiIpPort};
-use crate::webrtc::peer_connection::{RffiAudioLevel, RffiReceivedAudioLevel};
-use crate::webrtc::rtp;
-use crate::webrtc::sdp_observer::{
-    RffiCreateSessionDescriptionObserver, RffiSessionDescription, RffiSetSessionDescriptionObserver,
+use crate::{
+    webrtc,
+    webrtc::{
+        ffi::ice_gatherer::RffiIceGatherer,
+        media::{RffiAudioDecoderConfig, RffiAudioEncoderConfig},
+        network::{RffiIp, RffiIpPort},
+        peer_connection::{RffiAudioLevel, RffiReceivedAudioLevel},
+        rtp,
+        rtp_observer::RffiRtpObserver,
+        sdp_observer::{
+            RffiCreateSessionDescriptionObserver, RffiSessionDescription,
+            RffiSetSessionDescriptionObserver,
+        },
+        stats_observer::RffiStatsObserver,
+    },
 };
-use crate::webrtc::stats_observer::RffiStatsObserver;
 
 /// Incomplete type for C++ PeerConnection.
 #[repr(C)]
@@ -28,7 +34,13 @@ pub struct RffiPeerConnection {
 // in webrtc/api/peer_connection_interface.h
 impl webrtc::RefCounted for RffiPeerConnection {}
 
-extern "C" {
+unsafe extern "C" {
+    pub fn Rust_setScalabilityMode(
+        peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+        scalability_mode: webrtc::ptr::Borrowed<c_char>,
+        max_bitrate_bps: i32,
+    ) -> bool;
+
     pub fn Rust_updateTransceivers(
         peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
         remote_demux_ids_data: webrtc::ptr::Borrowed<u32>,
@@ -39,6 +51,10 @@ extern "C" {
         peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
         csd_observer: webrtc::ptr::BorrowedRc<RffiCreateSessionDescriptionObserver>,
     );
+
+    pub fn Rust_createSendOnlyTransceiver(
+        peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+    ) -> bool;
 
     pub fn Rust_setLocalDescription(
         peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
@@ -87,12 +103,16 @@ extern "C" {
         ip: RffiIp,
         port: u16,
         tcp: bool,
+        hostname: webrtc::ptr::Borrowed<c_char>,
     ) -> bool;
 
     pub fn Rust_removeIceCandidates(
         peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
         removed_addresses_data: webrtc::ptr::Borrowed<RffiIpPort>,
         removed_addresses_len: usize,
+        group: bool,
+        tcp: bool,
+        hostname: webrtc::ptr::Borrowed<c_char>,
     ) -> bool;
 
     pub fn Rust_createSharedIceGatherer(
@@ -138,6 +158,11 @@ extern "C" {
         config: webrtc::ptr::Borrowed<RffiAudioEncoderConfig>,
     );
 
+    pub fn Rust_configureAudioDecoders(
+        peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+        config: webrtc::ptr::Borrowed<RffiAudioDecoderConfig>,
+    );
+
     pub fn Rust_getAudioLevels(
         peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
         captured_out: webrtc::ptr::Borrowed<RffiAudioLevel>,
@@ -150,5 +175,12 @@ extern "C" {
         peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
     ) -> u32;
 
+    pub fn Rust_setRtpPacketObserver(
+        peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>,
+        rtp_observer: webrtc::ptr::Borrowed<RffiRtpObserver>,
+    );
+
     pub fn Rust_closePeerConnection(peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>);
+
+    pub fn Rust_regatherOnAllNetworks(peer_connection: webrtc::ptr::BorrowedRc<RffiPeerConnection>);
 }

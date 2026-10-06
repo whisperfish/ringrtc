@@ -5,29 +5,41 @@
 
 //! Simulation CallPlatform Interface.
 
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+#![allow(clippy::disallowed_macros)]
 
-use crate::common::{
-    ApplicationEvent, CallConfig, CallDirection, CallId, CallMediaType, DeviceId, Result,
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
-use crate::core::call::Call;
-use crate::core::call_manager::CallManager;
-use crate::core::connection::{Connection, ConnectionType};
-use crate::core::platform::{Platform, PlatformItem};
-use crate::core::{group_call, signaling};
-use crate::lite::{
-    sfu,
-    sfu::{DemuxId, PeekInfo, PeekResult, UserId},
+
+use crate::{
+    common::{
+        ApplicationEvent, CallConfig, CallDirection, CallEndReason, CallId, CallMediaType,
+        DeviceId, Result,
+    },
+    core::{
+        call::Call,
+        call_manager::CallManager,
+        call_summary::CallSummary,
+        connection::{Connection, ConnectionType},
+        group_call,
+        platform::{Platform, PlatformItem},
+        signaling,
+    },
+    lite::sfu::{self, DemuxId, PeekInfo, PeekResult, UserId},
+    sim::error::SimError,
+    webrtc::{
+        media::{MediaStream, VideoTrack},
+        peer_connection::{AudioLevel, PeerConnection, ReceivedAudioLevel},
+        peer_connection_observer::NetworkRoute,
+        sim::peer_connection::RffiPeerConnection,
+    },
 };
-use crate::sim::error::SimError;
-use crate::webrtc::media::{MediaStream, VideoTrack};
-use crate::webrtc::peer_connection::{AudioLevel, PeerConnection, ReceivedAudioLevel};
-use crate::webrtc::peer_connection_observer::NetworkRoute;
-use crate::webrtc::sim::peer_connection::RffiPeerConnection;
 
 /// Simulation implementation for platform::Platform::{AppIncomingMedia,
 /// AppRemotePeer, AppCallContext}
@@ -36,23 +48,23 @@ impl PlatformItem for SimPlatformItem {}
 
 #[derive(Default)]
 struct SimStats {
-    /// Number of offers sent
+    /// Number of offers sent to the client
     offers_sent: AtomicUsize,
-    /// Number of answers sent
+    /// Number of answers sent to the client
     answers_sent: AtomicUsize,
-    /// Number of ICE candidates sent
+    /// Number of ICE candidates sent to the client
     ice_candidates_sent: AtomicUsize,
-    /// Number of normal hangups sent
+    /// Number of normal hangups sent to the client
     normal_hangups_sent: AtomicUsize,
-    /// Number of accepted hangups sent
+    /// Number of accepted hangups sent to the client
     accepted_hangups_sent: AtomicUsize,
-    /// Number of declined hangups sent
+    /// Number of declined hangups sent to the client
     declined_hangups_sent: AtomicUsize,
-    /// Number of busy hangups sent
+    /// Number of busy hangups sent to the client
     busy_hangups_sent: AtomicUsize,
-    /// Number of need permission hangups sent
+    /// Number of need permission hangups sent to the client
     need_permission_hangups_sent: AtomicUsize,
-    /// Number of busy messages sent
+    /// Number of busy messages sent to the client
     busys_sent: AtomicUsize,
     /// Number of start outgoing call events
     start_outgoing: AtomicUsize,
@@ -90,9 +102,13 @@ pub struct SimPlatform {
     force_internal_fault: Arc<AtomicBool>,
     /// True if the signaling functions should indicate a signaling
     /// failure to the call manager.
-    force_signaling_fault: Arc<AtomicBool>,
+    force_signaling_failure: Arc<AtomicBool>,
+    /// True if on_call_ended should simulate a failure.
+    force_call_ended_failure: Arc<AtomicBool>,
     /// Track event frequencies
     event_map: Arc<Mutex<HashMap<ApplicationEvent, usize>>>,
+    /// Track call end reason frequencies
+    call_end_reason_map: Arc<Mutex<HashMap<CallEndReason, usize>>>,
     /// Track whether disconnecting of incoming media happened
     incoming_media_disconnected: Arc<AtomicBool>,
     /// Track group call ring updates
@@ -105,6 +121,8 @@ pub struct SimPlatform {
     no_auto_message_sent_for_ice: Arc<AtomicBool>,
     /// Last sent message from on_send_ice
     last_ice_sent: Arc<Mutex<Option<signaling::SendIce>>>,
+    /// Notified each time a call concludes.
+    call_concluded_signal: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl fmt::Display for SimPlatform {
@@ -190,6 +208,25 @@ impl Platform for SimPlatform {
         }
     }
 
+    fn on_call_ended(
+        &self,
+        remote_peer: &Self::AppRemotePeer,
+        _call_id: CallId,
+        reason: CallEndReason,
+        _summary: CallSummary,
+    ) -> Result<()> {
+        info!("on_call_ended(): {}, remote_peer: {}", reason, remote_peer);
+
+        if self.force_call_ended_failure.load(Ordering::Acquire) {
+            return Err(SimError::CallEndedError.into());
+        }
+
+        let mut map = self.call_end_reason_map.lock().unwrap();
+        map.entry(reason).and_modify(|e| *e += 1).or_insert(1);
+
+        Ok(())
+    }
+
     fn on_event(
         &self,
         remote_peer: &Self::AppRemotePeer,
@@ -249,10 +286,10 @@ impl Platform for SimPlatform {
             Err(SimError::SendOfferError.into())
         } else {
             let _ = self.stats.offers_sent.fetch_add(1, Ordering::AcqRel);
-            if self.force_internal_fault.load(Ordering::Acquire) {
-                self.message_send_failure(call_id).unwrap();
+            if self.force_signaling_failure.load(Ordering::Acquire) {
+                self.message_send_failure(call_id);
             } else {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -276,10 +313,10 @@ impl Platform for SimPlatform {
             Err(SimError::SendAnswerError.into())
         } else {
             let _ = self.stats.answers_sent.fetch_add(1, Ordering::AcqRel);
-            if self.force_internal_fault.load(Ordering::Acquire) {
-                self.message_send_failure(call_id).unwrap();
+            if self.force_signaling_failure.load(Ordering::Acquire) {
+                self.message_send_failure(call_id);
             } else {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -311,12 +348,12 @@ impl Platform for SimPlatform {
                 .stats
                 .ice_candidates_sent
                 .fetch_add(send.ice.candidates.len(), Ordering::AcqRel);
-            if self.force_internal_fault.load(Ordering::Acquire) {
+            if self.force_signaling_failure.load(Ordering::Acquire) {
                 if !self.no_auto_message_sent_for_ice.load(Ordering::Acquire) {
-                    self.message_send_failure(call_id).unwrap();
+                    self.message_send_failure(call_id);
                 }
             } else if !self.no_auto_message_sent_for_ice.load(Ordering::Acquire) {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -365,10 +402,10 @@ impl Platform for SimPlatform {
                         .fetch_add(1, Ordering::AcqRel);
                 }
             }
-            if self.force_internal_fault.load(Ordering::Acquire) {
-                self.message_send_failure(call_id).unwrap();
+            if self.force_signaling_failure.load(Ordering::Acquire) {
+                self.message_send_failure(call_id);
             } else {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -384,10 +421,10 @@ impl Platform for SimPlatform {
             Err(SimError::SendBusyError.into())
         } else {
             let _ = self.stats.busys_sent.fetch_add(1, Ordering::AcqRel);
-            if self.force_internal_fault.load(Ordering::Acquire) {
-                self.message_send_failure(call_id).unwrap();
+            if self.force_signaling_failure.load(Ordering::Acquire) {
+                self.message_send_failure(call_id);
             } else {
-                self.message_sent(call_id).unwrap();
+                self.message_sent(call_id);
             }
             Ok(())
         }
@@ -418,6 +455,19 @@ impl Platform for SimPlatform {
         recipients_override: HashSet<UserId>,
     ) -> Result<()> {
         for recipient_id in recipients_override {
+            let _ = self.send_call_message(recipient_id, message.clone(), urgency);
+        }
+        Ok(())
+    }
+
+    fn send_call_message_to_adhoc_group(
+        &self,
+        message: Vec<u8>,
+        urgency: group_call::SignalingMessageUrgency,
+        _expiration: u64,
+        recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
+    ) -> Result<()> {
+        for recipient_id in recipients_to_endorsements.into_keys() {
             let _ = self.send_call_message(recipient_id, message.clone(), urgency);
         }
         Ok(())
@@ -499,6 +549,9 @@ impl Platform for SimPlatform {
             Err(SimError::CallConcludedError.into())
         } else {
             let _ = self.stats.call_concluded.fetch_add(1, Ordering::AcqRel);
+            let (mutex, condvar) = &*self.call_concluded_signal;
+            let _guard = mutex.lock().unwrap();
+            condvar.notify_all();
             Ok(())
         }
     }
@@ -529,6 +582,14 @@ impl Platform for SimPlatform {
         info!("handle_network_route_changed(): {:?}", network_route);
     }
 
+    fn handle_speaking_notification(
+        &self,
+        _client_id: group_call::ClientId,
+        event: group_call::SpeechEvent,
+    ) {
+        info!("handle_speaking_notification(): {:?}", event,);
+    }
+
     fn handle_audio_levels(
         &self,
         _client_id: group_call::ClientId,
@@ -537,8 +598,7 @@ impl Platform for SimPlatform {
     ) {
         trace!(
             "handle_audio_levels(): {:?}, {:?}",
-            captured_level,
-            received_levels
+            captured_level, received_levels
         );
     }
 
@@ -591,7 +651,12 @@ impl Platform for SimPlatform {
         unimplemented!()
     }
 
-    fn handle_ended(&self, _client_id: group_call::ClientId, _reason: group_call::EndReason) {
+    fn handle_ended(
+        &self,
+        _client_id: group_call::ClientId,
+        _reason: CallEndReason,
+        _summary: CallSummary,
+    ) {
         unimplemented!()
     }
 
@@ -611,6 +676,22 @@ impl Platform for SimPlatform {
                 sender_id,
                 update,
             });
+    }
+
+    fn handle_remote_mute_request(&self, client_id: group_call::ClientId, mute_source: DemuxId) {
+        info!("handle_remote_mute_request({}, {})", client_id, mute_source);
+    }
+
+    fn handle_observed_remote_mute(
+        &self,
+        client_id: group_call::ClientId,
+        mute_source: DemuxId,
+        mute_target: DemuxId,
+    ) {
+        info!(
+            "handle_observed_remote_mute({}, {}, {})",
+            client_id, mute_source, mute_target
+        );
     }
 }
 
@@ -637,29 +718,44 @@ impl SimPlatform {
         *cm = Some(call_manager);
     }
 
-    fn message_sent(&self, call_id: CallId) -> Result<()> {
+    fn message_sent(&self, call_id: CallId) {
         let mut cm = self.call_manager.lock().unwrap();
-        cm.as_mut().unwrap().message_sent(call_id).unwrap();
-        Ok(())
+        cm.as_mut().unwrap().message_sent(call_id);
     }
 
-    fn message_send_failure(&self, call_id: CallId) -> Result<()> {
+    fn message_send_failure(&self, call_id: CallId) {
         let mut cm = self.call_manager.lock().unwrap();
-        cm.as_mut().unwrap().message_send_failure(call_id).unwrap();
-        Ok(())
+        cm.as_mut().unwrap().message_send_failure(call_id);
     }
 
     pub fn force_internal_fault(&mut self, enable: bool) {
         self.force_internal_fault.store(enable, Ordering::Release);
     }
 
-    pub fn force_signaling_fault(&mut self, enable: bool) {
-        self.force_signaling_fault.store(enable, Ordering::Release);
+    pub fn force_signaling_failure(&mut self, enable: bool) {
+        self.force_signaling_failure
+            .store(enable, Ordering::Release);
+    }
+
+    pub fn force_call_ended_failure(&mut self, enable: bool) {
+        self.force_call_ended_failure
+            .store(enable, Ordering::Release);
     }
 
     pub fn no_auto_message_sent_for_ice(&mut self, enable: bool) {
         self.no_auto_message_sent_for_ice
             .store(enable, Ordering::Release);
+    }
+
+    pub fn end_reason_count(&self, reason: CallEndReason) -> usize {
+        let mut count = 0;
+        let map = self.call_end_reason_map.lock().unwrap();
+
+        if let Some(entry) = map.get(&reason) {
+            count += entry;
+        }
+
+        count
     }
 
     pub fn event_count(&self, event: ApplicationEvent) -> usize {
@@ -674,32 +770,17 @@ impl SimPlatform {
     }
 
     pub fn error_count(&self) -> usize {
-        self.event_count(ApplicationEvent::EndedInternalFailure)
+        self.end_reason_count(CallEndReason::InternalFailure)
     }
 
     pub fn clear_error_count(&self) {
-        let mut map = self.event_map.lock().unwrap();
-        let _ = map.remove(&ApplicationEvent::EndedInternalFailure);
+        let mut map = self.call_end_reason_map.lock().unwrap();
+        let _ = map.remove(&CallEndReason::InternalFailure);
     }
 
     pub fn ended_count(&self) -> usize {
-        let mut ends = 0;
-
-        let ended_events = vec![
-            ApplicationEvent::EndedLocalHangup,
-            ApplicationEvent::EndedRemoteHangup,
-            ApplicationEvent::EndedRemoteBusy,
-            ApplicationEvent::EndedTimeout,
-            ApplicationEvent::EndedInternalFailure,
-            ApplicationEvent::EndedSignalingFailure,
-            ApplicationEvent::EndedConnectionFailure,
-            ApplicationEvent::EndedAppDroppedCall,
-        ];
-        for event in ended_events {
-            ends += self.event_count(event);
-        }
-
-        ends
+        let map = self.call_end_reason_map.lock().unwrap();
+        map.len()
     }
 
     pub fn offers_sent(&self) -> usize {
@@ -766,6 +847,16 @@ impl SimPlatform {
 
     pub fn call_concluded_count(&self) -> usize {
         self.stats.call_concluded.load(Ordering::Acquire)
+    }
+
+    /// Block until at least `count` calls have concluded, or the timeout elapses.
+    pub fn wait_for_call_concluded(&self, count: usize, timeout: Duration) -> bool {
+        let (mutex, condvar) = &*self.call_concluded_signal;
+        let guard = mutex.lock().unwrap();
+        let (_guard, result) = condvar
+            .wait_timeout_while(guard, timeout, |_| self.call_concluded_count() < count)
+            .unwrap();
+        !result.timed_out()
     }
 
     pub fn take_group_call_ring_updates(&self) -> Vec<GroupCallRingUpdate> {

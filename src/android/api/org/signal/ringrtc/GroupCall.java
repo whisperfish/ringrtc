@@ -38,6 +38,16 @@ public final class GroupCall {
         CALL_LINK;
     }
 
+             public  static final int    INVALID_CLIENT_ID = 0;
+
+             public  static final int    CAMERA_MAX_WIDTH  = 640;
+
+             public  static final int    CAMERA_MAX_HEIGHT = 360;
+
+             public  static final int    CAMERA_MAX_FPS    = 30;
+
+             public  static final int    SCREENSHARE_MAX_FPS    = 30;
+
     @NonNull private static final String TAG = GroupCall.class.getSimpleName();
 
     @NonNull  private Kind                               kind;
@@ -76,7 +86,7 @@ public final class GroupCall {
         this.nativeCallManager = nativeCallManager;
         this.factory = factory;
         this.observer = observer;
-        this.clientId = 0;
+        this.clientId = INVALID_CLIENT_ID;
 
         this.handleEndedCalled = false;
         this.disconnectCalled = false;
@@ -99,7 +109,7 @@ public final class GroupCall {
             this.outgoingAudioTrack.setEnabled(false);
         }
 
-        this.outgoingVideoSource = factory.createVideoSource(false);
+        this.outgoingVideoSource = factory.createVideoSource(/* isScreencast */false);
         if (this.outgoingVideoSource == null) {
             return;
         }
@@ -112,14 +122,17 @@ public final class GroupCall {
             this.outgoingVideoTrack.setEnabled(false);
         }
 
-        // Define maximum output video format for group calls.
-        this.outgoingVideoSource.adaptOutputFormat(640, 360, 30);
+        // Define maximum camera video format for group calls.
+        this.outgoingVideoSource.adaptOutputFormat(CAMERA_MAX_WIDTH, CAMERA_MAX_HEIGHT, CAMERA_MAX_FPS);
 
         this.incomingVideoTracks = new ArrayList<>();
     }
 
     /**
-     * Creates a GroupCall object.
+     * Creates a GroupCall object. Defaults call to:
+     * - videoEnabled == false
+     * - audioEnabled == false
+     * - isScreenshare == false
      *
      * Will return null on failure. Should only be accessed via the CallManager.createGroupCall().
      */
@@ -128,6 +141,8 @@ public final class GroupCall {
                             @NonNull  String                sfuUrl,
                             @NonNull  byte[]                hkdfExtraInfo,
                             @Nullable Integer               audioLevelsIntervalMs,
+                            @Nullable Byte                  dredDuration,
+                            @Nullable SvcConfig             svcConfig,
                             @NonNull  PeerConnectionFactory factory,
                             @NonNull  Observer              observer) {
         Log.i(TAG, "create():");
@@ -135,6 +150,7 @@ public final class GroupCall {
         GroupCall call = new GroupCall(Kind.SIGNAL_GROUP, nativeCallManager, factory, observer);
 
         int audioLevelsIntervalMillis = audioLevelsIntervalMs == null ? 0 : audioLevelsIntervalMs.intValue();
+        byte dredDurationByte = dredDuration == null ? 0 : dredDuration.byteValue();
         try {
             call.clientId = ringrtcCreateGroupCallClient(
                 nativeCallManager,
@@ -142,14 +158,15 @@ public final class GroupCall {
                 sfuUrl,
                 hkdfExtraInfo,
                 audioLevelsIntervalMillis,
+                dredDurationByte,
+                svcConfig,
                 // Returns a borrowed RC.
                 factory.getNativePeerConnectionFactory(),
                 // Returns a borrowed RC.
                 call.outgoingAudioTrack.getNativeAudioTrack(),
                 // Returns a borrowed RC.
                 call.outgoingVideoTrack.getNativeVideoTrack());
-
-            if (call.clientId == 0) {
+            if (call.clientId == INVALID_CLIENT_ID) {
                 call.dispose();
                 return null;
             }
@@ -168,11 +185,14 @@ public final class GroupCall {
      */
     static GroupCall create(          long                  nativeCallManager,
                             @NonNull  String                sfuUrl,
+                            @NonNull  byte[]                endorsementPublicKey,
                             @NonNull  byte[]                authCredentialPresentation,
                             @NonNull  CallLinkRootKey       rootKey,
                             @Nullable byte[]                adminPasskey,
                             @NonNull  byte[]                hkdfExtraInfo,
                             @Nullable Integer               audioLevelsIntervalMs,
+                            @Nullable Byte                  dredDuration,
+                            @Nullable SvcConfig             svcConfig,
                             @NonNull  PeerConnectionFactory factory,
                             @NonNull  Observer              observer) {
         Log.i(TAG, "create():");
@@ -180,23 +200,26 @@ public final class GroupCall {
         GroupCall call = new GroupCall(Kind.CALL_LINK, nativeCallManager, factory, observer);
 
         int audioLevelsIntervalMillis = audioLevelsIntervalMs == null ? 0 : audioLevelsIntervalMs.intValue();
+        byte dredDurationByte = dredDuration == null ? 0 : dredDuration.byteValue();
         try {
             call.clientId = ringrtcCreateCallLinkCallClient(
                 nativeCallManager,
                 sfuUrl,
+                endorsementPublicKey,
                 authCredentialPresentation,
                 rootKey.getKeyBytes(),
                 adminPasskey,
                 hkdfExtraInfo,
                 audioLevelsIntervalMillis,
+                dredDurationByte,
+                svcConfig,
                 // Returns a borrowed RC.
                 factory.getNativePeerConnectionFactory(),
                 // Returns a borrowed RC.
                 call.outgoingAudioTrack.getNativeAudioTrack(),
                 // Returns a borrowed RC.
                 call.outgoingVideoTrack.getNativeVideoTrack());
-
-            if (call.clientId == 0) {
+            if (call.clientId == INVALID_CLIENT_ID) {
                 call.dispose();
                 return null;
             }
@@ -216,9 +239,9 @@ public final class GroupCall {
     {
         Log.i(TAG, "dispose():");
 
-        if (this.clientId != 0) {
+        if (this.clientId != INVALID_CLIENT_ID) {
             ringrtcDeleteGroupCallClient(nativeCallManager, this.clientId);
-            this.clientId = 0;
+            this.clientId = INVALID_CLIENT_ID;
         }
 
         if (this.outgoingAudioTrack != null) {
@@ -381,6 +404,44 @@ public final class GroupCall {
 
     /**
      *
+     * Mute outgoing audio due to a request from another user.
+     * This adjusts the outgoing audio track and sends the status to the SFU.
+     *
+     * @param sourceDemuxId      the demux ID of the user that sent the request
+     *
+     * @throws CallException for native code failures
+     *
+     */
+    public void setOutgoingAudioMutedRemotely(long sourceDemuxId)
+            throws CallException
+    {
+        Log.i(TAG, "setOutgoingAudioMutedRemotely():");
+
+        this.localDeviceState.audioMuted = true;
+        this.outgoingAudioTrack.setEnabled(false);
+
+        ringrtcSetOutgoingAudioMutedRemotely(nativeCallManager, this.clientId, sourceDemuxId);
+    }
+
+    /**
+     *
+     * Request that the given user mute their audio.
+     *
+     * @param targetDemuxId      the demux ID of the user we want to mute.
+     *
+     * @throws CallException for native code failures
+     *
+     */
+    public void sendRemoteMuteRequest(long targetDemuxId)
+            throws CallException
+    {
+        Log.i(TAG, "sendRemoteMuteRequest():");
+
+        ringrtcSendRemoteMuteRequest(nativeCallManager, this.clientId, targetDemuxId);
+    }
+
+    /**
+     *
      * Mute (or unmute) outgoing video. This adjusts the outgoing video
      * track and sends the status to the SFU. The camera capture state
      * is not affected and should be set accordingly by the application.
@@ -390,29 +451,74 @@ public final class GroupCall {
      * @throws CallException for native code failures
      *
      */
-    public void setOutgoingVideoMuted(boolean muted)
+    public void setOutgoingVideoMuted(boolean muted, boolean isScreenShare)
         throws CallException
     {
         Log.i(TAG, "setOutgoingVideoMuted():");
 
         this.localDeviceState.videoMuted = muted;
         this.outgoingVideoTrack.setEnabled(!this.localDeviceState.videoMuted);
+        this.setOutgoingVideoIsScreenShare(isScreenShare);
 
         ringrtcSetOutgoingVideoMuted(nativeCallManager, this.clientId, muted);
     }
 
-    /**	
+    /**
+     *
+     * Indicates whether the outgoing video is a screen share.
+     * This updates the local device state and sends the status to the SFU.
+     *
+     * @param isScreenShare  true if the outgoing video is a screen share
+     *
+     * @throws CallException for native code failures
+     *
+     */
+    public void setOutgoingVideoIsScreenShare(boolean isScreenShare)
+        throws CallException
+    {
+        Log.i(TAG, String.format("setOutgoingVideoIsScreenShare(): %b", isScreenShare));
+
+        this.outgoingVideoSource.setIsScreencast(isScreenShare);
+        if (isScreenShare) {
+          this.outgoingVideoSource.adaptOutputFormat(VideoSource.AspectRatio.UNDEFINED, null, VideoSource.AspectRatio.UNDEFINED, null, SCREENSHARE_MAX_FPS);
+        } else {
+          this.outgoingVideoSource.adaptOutputFormat(CAMERA_MAX_WIDTH, CAMERA_MAX_HEIGHT, CAMERA_MAX_FPS);
+        }
+
+        this.localDeviceState.sharingScreen = isScreenShare;
+        ringrtcSetOutgoingVideoIsScreenShare(nativeCallManager, this.clientId, isScreenShare);
+    }
+
+    /**
+     *
+     * Indicates whether the user is presenting.
+     * This updates the local device state and sends the status to the SFU.
+     *
+     * @param isPresenting  true if the outgoing video is a screen share
+     *
+     * @throws CallException for native code failures
+     *
+     */
+    public void setPresenting(boolean isPresenting)
+        throws CallException
+    {
+        Log.i(TAG, "setPresenting():");
+        this.localDeviceState.presenting = isPresenting;
+        ringrtcSetPresenting(nativeCallManager, this.clientId, isPresenting);
+    }
+
+    /**
      *
      * Links the camera to the outgoing video track.
      *
      * @param localSink      the sink to associate with the video track
      * @param cameraControl  the camera that will be used to capture video
      *
-     */	
+     */
     public void setOutgoingVideoSource(@NonNull VideoSink     localSink,
                                        @NonNull CameraControl cameraControl)
-    {	
-        Log.i(TAG, "setOutgoingVideoSource():");	
+    {
+        Log.i(TAG, "setOutgoingVideoSource():");
 
         if (cameraControl.hasCapturer()) {
             // Connect camera as the local video source.
@@ -712,6 +818,18 @@ public final class GroupCall {
 
     /**
      *
+     * Callback from RingRTC with details about a speech event.
+     * @param event The speech event.
+     *
+     */
+    void handleSpeakingNotification(SpeechEvent event) {
+        Log.i(TAG, "handleSpeakingNotification():");
+
+        this.observer.onSpeakingNotification(this, event);
+    }
+
+    /**
+     *
      * Callback from RingRTC with details about audio levels.
      *
      */
@@ -820,7 +938,7 @@ public final class GroupCall {
      * CallManager.
      *
      */
-    void handleEnded(GroupCallEndReason reason) {
+    void handleEnded(CallManager.CallEndReason reason, CallSummary summary) {
         Log.i(TAG, "handleEnded():");
 
         // This check is not strictly necessary since RingRTC should only be
@@ -828,7 +946,7 @@ public final class GroupCall {
         if (!this.handleEndedCalled) {
             this.handleEndedCalled = true;
 
-            this.observer.onEnded(this, reason);
+            this.observer.onEnded(this, reason, summary);
 
             try {
                 if (this.disconnectCalled) {
@@ -840,6 +958,29 @@ public final class GroupCall {
                 Log.w(TAG, "Unable to delete group call clientId: " + this.clientId, e);
             }
         }
+    }
+
+    /**
+     * Callback from RingRTC when we receive a remote mute request. Called via
+     * the CallManager.
+     *
+     * @param sourceDemuxId the demux ID from which the mute request originated.
+     */
+    void handleRemoteMuteRequest(long sourceDemuxId) {
+        Log.i(TAG, "handleRemoteMuteRequest():");
+        this.observer.onRemoteMuteRequest(this, sourceDemuxId);
+    }
+
+    /**
+     * Callback from RingRTC when we observe a remote mute request from `sourceDemuxId` to
+     * `targetDemuxId`. Called via the CallManager.
+     *
+     * @param sourceDemuxId the demux ID from which the mute request originated.
+     * @param targetDemuxId the demux ID to which the mute request went.
+     */
+    void handleObservedRemoteMute(long sourceDemuxId, long targetDemuxId) {
+        Log.i(TAG, "handleObservedRemoteMute():");
+        this.observer.onObservedRemoteMute(this, sourceDemuxId, targetDemuxId);
     }
 
     /**
@@ -889,66 +1030,16 @@ public final class GroupCall {
     }
 
     /**
-     * A set of reasons why the group call has ended.
+     * Enumeration of the type of speech durations we notify the client for.
      */
-    public enum GroupCallEndReason {
-
-        // Normal events
-
-        /** The client disconnected by calling the disconnect() API. */
-        DEVICE_EXPLICITLY_DISCONNECTED,
-
-        /** The server disconnected due to policy or some other controlled reason. */
-        SERVER_EXPLICITLY_DISCONNECTED,
-
-        /** An admin denied your request to join the call. */
-        DENIED_REQUEST_TO_JOIN_CALL,
-
-        /** An admin removed you from the call. */
-        REMOVED_FROM_CALL,
-
-        // Things that can go wrong
-
-        /** Another direct call or group call is currently in progress and using media resources. */
-        CALL_MANAGER_IS_BUSY,
-
-        /** Could not join the group call. */
-        SFU_CLIENT_FAILED_TO_JOIN,
-
-        /** Could not create a usable peer connection factory for media. */
-        FAILED_TO_CREATE_PEER_CONNECTION_FACTORY,
-
-        /** Could not negotiate SRTP keys with a DHE. */
-        FAILED_TO_NEGOTIATE_SRTP_KEYS,
-
-        /** Could not create a peer connection for media. */
-        FAILED_TO_CREATE_PEER_CONNECTION,
-
-        /** Could not start the peer connection for media. */
-        FAILED_TO_START_PEER_CONNECTION,
-
-        /** Could not update the peer connection for media. */
-        FAILED_TO_UPDATE_PEER_CONNECTION,
-
-        /** Could not set the requested bitrate for media. */
-        FAILED_TO_SET_MAX_SEND_BITRATE,
-
-        /** Could not connect successfully. */
-        ICE_FAILED_WHILE_CONNECTING,
-
-        /** Lost a connection and retries were unsuccessful. */
-        ICE_FAILED_AFTER_CONNECTED,
-
-        /** Unexpected change in demuxId requiring a new group call. */
-        SERVER_CHANGED_DEMUXID,
-
-        /** The SFU reported that the group call is full. */
-        HAS_MAX_DEVICES;
+    public enum SpeechEvent {
+        /** The user was speaking, and is not anymore. */
+        STOPPED_SPEAKING,
+        /** The user has been speaking for long enough that they may want to lower their hand. */
+        LOWER_HAND_SUGGESTION;
 
         @CalledByNative
-        static GroupCallEndReason fromNativeIndex(int nativeIndex) {
-            return values()[nativeIndex];
-        }
+        static SpeechEvent fromNativeIndex(int nativeIndex) { return values()[nativeIndex]; }
     }
 
     /**
@@ -959,6 +1050,8 @@ public final class GroupCall {
                   JoinState       joinState;
                   boolean         audioMuted;
                   boolean         videoMuted;
+                  boolean         presenting;
+                  boolean         sharingScreen;
                   NetworkRoute    networkRoute;
                   int             audioLevel;
         @Nullable Long            demuxId;
@@ -968,6 +1061,8 @@ public final class GroupCall {
             this.joinState = JoinState.NOT_JOINED;
             this.audioMuted = true;
             this.videoMuted = true;
+            this.presenting = false;
+            this.sharingScreen = false;
             this.networkRoute = new NetworkRoute();
             this.audioLevel = 0;
         }
@@ -977,6 +1072,8 @@ public final class GroupCall {
             this.joinState = localDeviceState.joinState;
             this.audioMuted = localDeviceState.audioMuted;
             this.videoMuted = localDeviceState.videoMuted;
+            this.presenting = localDeviceState.presenting;
+            this.sharingScreen = localDeviceState.sharingScreen;
             this.networkRoute = localDeviceState.networkRoute;
             this.audioLevel = localDeviceState.audioLevel;
             this.demuxId = localDeviceState.demuxId;
@@ -996,6 +1093,14 @@ public final class GroupCall {
 
         public boolean getVideoMuted() {
             return videoMuted;
+        }
+
+        public boolean getPresenting() {
+            return presenting;
+        }
+
+        public boolean getSharingScreen() {
+            return sharingScreen;
         }
 
         public NetworkRoute getNetworkRoute() {
@@ -1205,6 +1310,11 @@ public final class GroupCall {
         void onLocalDeviceStateChanged(GroupCall groupCall);
 
         /**
+         * Notification that speech state has changed.
+         */
+        void onSpeakingNotification(GroupCall groupCall, SpeechEvent event);
+
+        /**
          * Notification of audio levels.
          */
         void onAudioLevels(GroupCall groupCall);
@@ -1248,7 +1358,17 @@ public final class GroupCall {
         /**
          * Notification that the group call has ended.
          */
-        void onEnded(GroupCall groupCall, GroupCallEndReason reason);
+        void onEnded(GroupCall groupCall, @NonNull CallManager.CallEndReason reason, @NonNull CallSummary summary);
+
+        /**
+         * Notification that the local client received a remote mute request.
+         */
+        void onRemoteMuteRequest(GroupCall groupCall, long sourceDemuxId);
+
+        /**
+         * Notification that the local client observed one client remotely mute another.
+         */
+        void onObservedRemoteMute(GroupCall groupCall, long sourceDemuxId, long targetDemuxId);
     }
 
     /* Native methods below here. */
@@ -1259,6 +1379,8 @@ public final class GroupCall {
                                           String sfuUrl,
                                           byte[] hkdfExtraInfo,
                                           int audioLevelsIntervalMillis,
+                                          byte dredDuration,
+                                          SvcConfig svcConfig,
                                           long nativePeerConnectionFactory,
                                           long nativeAudioTrack,
                                           long nativeVideoTrack)
@@ -1267,11 +1389,14 @@ public final class GroupCall {
     private static native
         long ringrtcCreateCallLinkCallClient(long nativeCallManager,
                                              String sfuUrl,
+                                             byte[] endorsementPublicKey,
                                              byte[] authCredentialPresentation,
                                              byte[] rootKeyBytes,
                                              byte[] adminPasskey,
                                              byte[] hkdfExtraInfo,
                                              int audioLevelsIntervalMillis,
+                                             byte dredDuration,
+                                             SvcConfig svcConfig,
                                              long nativePeerConnectionFactory,
                                              long nativeAudioTrack,
                                              long nativeVideoTrack)
@@ -1309,9 +1434,33 @@ public final class GroupCall {
         throws CallException;
 
     private native
+    void ringrtcSetOutgoingAudioMutedRemotely(long nativeCallManager,
+                                              long clientId,
+                                              long sourceDemuxId)
+            throws CallException;
+
+    private native
+    void ringrtcSendRemoteMuteRequest(long nativeCallManager,
+                                      long clientId,
+                                      long targetDemuxId)
+        throws CallException;
+
+    private native
         void ringrtcSetOutgoingVideoMuted(long nativeCallManager,
                                           long clientId,
                                           boolean muted)
+        throws CallException;
+
+    private native
+        void ringrtcSetPresenting(long nativeCallManager,
+                                  long clientId,
+                                  boolean isPresenting)
+        throws CallException;
+
+    private native
+        void ringrtcSetOutgoingVideoIsScreenShare(long nativeCallManager,
+                                                  long clientId,
+                                                  boolean isScreenShare)
         throws CallException;
 
     private native

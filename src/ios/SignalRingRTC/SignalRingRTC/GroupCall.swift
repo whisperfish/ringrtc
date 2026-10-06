@@ -48,6 +48,13 @@ public enum GroupCallEndReason: Int32 {
     case hasMaxDevices
 }
 
+/// The inferred state of user speech (e.g. to suggest lowering hand)
+@available(iOSApplicationExtension, unavailable)
+public enum SpeechEvent: Int32 {
+    case StoppedSpeaking = 0
+    case LowerHandSuggestion
+}
+
 /// The local device state for a group call.
 @available(iOSApplicationExtension, unavailable)
 public class LocalDeviceState {
@@ -157,6 +164,44 @@ public struct VideoRequest {
     }
 }
 
+/// Used by the application to provide SVC parameters at group/ad-hoc creation time.
+@available(iOSApplicationExtension, unavailable)
+public struct SvcConfig {
+    let mode: String
+    let modeForScreenshare: String
+    let maxBitrateBps: UInt32?
+    
+    public init(mode: String, modeForScreenshare: String, maxBitrateBps: UInt32?) {
+        self.mode = mode
+        self.modeForScreenshare = modeForScreenshare
+        self.maxBitrateBps = maxBitrateBps
+    }
+}
+
+@available(iOSApplicationExtension, unavailable)
+fileprivate func makeAppOptionalSvcConfig(_ config: SvcConfig?) -> AppOptionalSvcConfig {
+    if let config = config {
+        let maxBitrateBps = if let maxBitrateBps = config.maxBitrateBps {
+            AppOptionalUInt32(value: maxBitrateBps, valid: true)
+        } else {
+            AppOptionalUInt32(value: 0, valid: false)
+        }
+        return AppOptionalSvcConfig(valid: true, config: AppSvcConfig(mode: allocatedAppByteSliceFromString(maybe_string: config.mode), modeForScreenshare: allocatedAppByteSliceFromString(maybe_string: config.modeForScreenshare), maxBitrateBps: maxBitrateBps))
+    } else {
+        return AppOptionalSvcConfig(valid: false, config: AppSvcConfig(mode: allocatedAppByteSliceFromString(maybe_string: nil), modeForScreenshare: allocatedAppByteSliceFromString(maybe_string: nil), maxBitrateBps: AppOptionalUInt32(value: 0, valid: false)))
+    }
+}
+
+@available(iOSApplicationExtension, unavailable)
+fileprivate func destroyAppOptionalSvcConfig(_ appOptionalSvcConfig: AppOptionalSvcConfig) {
+    if appOptionalSvcConfig.config.mode.bytes != nil {
+        appOptionalSvcConfig.config.mode.bytes.deallocate()
+    }
+    if appOptionalSvcConfig.config.modeForScreenshare.bytes != nil {
+        appOptionalSvcConfig.config.modeForScreenshare.bytes.deallocate()
+    }
+}
+
 public func callIdFromEra(_ era: String) -> UInt64 {
     // Necessary because withUTF8 might reallocate to get a contiguous UTF-8 string.
     var era = era
@@ -176,29 +221,34 @@ public protocol GroupCallDelegate: AnyObject {
      * Indication that the application should provide an updated proof of membership
      * for the group call.
      */
+    @MainActor
     func groupCall(requestMembershipProof groupCall: GroupCall)
 
     /**
      * Indication that the application should provide the list of group members that
      * belong to the group for the purposes of the group call.
      */
+    @MainActor
     func groupCall(requestGroupMembers groupCall: GroupCall)
 
     /**
      * Indication that the application should retrieve the latest local device
      * state from the group call and refresh the presentation.
      */
+    @MainActor
     func groupCall(onLocalDeviceStateChanged groupCall: GroupCall)
 
     /**
      * Indication that the application should retrieve the latest remote device
      * states from the group call and refresh the presentation.
      */
+    @MainActor
     func groupCall(onRemoteDeviceStatesChanged groupCall: GroupCall)
 
     /**
      * Indication that the application should draw audio levels.
      */
+    @MainActor
     func groupCall(onAudioLevels groupCall: GroupCall)
 
     /**
@@ -209,35 +259,61 @@ public protocol GroupCallDelegate: AnyObject {
      * any) will have recovered set to true and will be called when the upload
      * bandwidth is high enough to send video reliably.
      */
+    @MainActor
     func groupCall(onLowBandwidthForVideo groupCall: GroupCall, recovered: Bool)
 
     /**
      * Indication that the application should notify the user that one or more reactions
      * were received.
      */
+    @MainActor
     func groupCall(onReactions groupCall: GroupCall, reactions: [Reaction])
 
     /**
      * Indication that the application should notify the user that raised hands
      * changed.
      */
+    @MainActor
     func groupCall(onRaisedHands groupCall: GroupCall, raisedHands: [UInt32])
 
     /**
      * Indication that the application can retrieve an updated PeekInfo which
      * includes a list of users that are actively in the group call.
      */
+    @MainActor
     func groupCall(onPeekChanged groupCall: GroupCall)
 
     /**
      * Indication that group call ended due to a reason other than the user choosing
      * to disconnect from it.
      */
-    func groupCall(onEnded groupCall: GroupCall, reason: GroupCallEndReason)
+    @MainActor
+    func groupCall(onEnded groupCall: GroupCall, reason: CallEndReason, summary: CallSummary)
+
+    /**
+     * Indication that the user may have been speaking for a certain amount of time -- or stopped speaking.
+     */
+    @MainActor
+    func groupCall(onSpeakingNotification groupCall: GroupCall, event: SpeechEvent)
+
+    /**
+     * Indication that the user has been remotely muted by the `muteSource` demuxId
+     */
+    @MainActor
+    func groupCall(onRemoteMuteRequest groupCall: GroupCall, muteSource: UInt32)
+
+    /**
+     * Indication that the user has observed demuxId `muteSource` issue a remote mute to `muteTarget`, who is not the local user.
+     * (`muteSource`, on the other hand, might be the local user)
+     */
+    @MainActor
+    func groupCall(onObservedRemoteMute groupCall: GroupCall, muteSource: UInt32, muteTarget: UInt32)
 }
 
 @available(iOSApplicationExtension, unavailable)
 public class GroupCall {
+    public static let invalidClientId: Int = 0
+
     public enum Kind {
         case signalGroup
         case callLink
@@ -253,8 +329,11 @@ public class GroupCall {
     var groupCallByClientId: GroupCallByClientId
     private let connectInfo: ConnectInfo
     let sfuUrl: String
+    let endorsementPublicKey: Data?
     let hkdfExtraInfo: Data
     let audioLevelsIntervalMillis: UInt64?
+    let dredDuration: UInt8
+    let svcConfig: SvcConfig?
 
     public weak var delegate: GroupCallDelegate?
 
@@ -271,9 +350,8 @@ public class GroupCall {
     var audioTrack: RTCAudioTrack?
     var videoTrack: RTCVideoTrack?
 
-    internal init(ringRtcCallManager: UnsafeMutableRawPointer, factory: RTCPeerConnectionFactory, groupCallByClientId: GroupCallByClientId, groupId: Data, sfuUrl: String, hkdfExtraInfo: Data, audioLevelsIntervalMillis: UInt64?, videoCaptureController: VideoCaptureController) {
-        AssertIsOnMainThread()
-
+    @MainActor
+    internal init(ringRtcCallManager: UnsafeMutableRawPointer, factory: RTCPeerConnectionFactory, groupCallByClientId: GroupCallByClientId, groupId: Data, sfuUrl: String, hkdfExtraInfo: Data, audioLevelsIntervalMillis: UInt64?, dredDuration: UInt8 = 0, svcConfig: SvcConfig? = nil, videoCaptureController: VideoCaptureController) {
         self.ringRtcCallManager = ringRtcCallManager
         self.factory = factory
         self.groupCallByClientId = groupCallByClientId
@@ -281,7 +359,10 @@ public class GroupCall {
         self.sfuUrl = sfuUrl
         self.hkdfExtraInfo = hkdfExtraInfo
         self.audioLevelsIntervalMillis = audioLevelsIntervalMillis
+        self.dredDuration = dredDuration
+        self.svcConfig = svcConfig
 
+        self.endorsementPublicKey = nil
         self.localDeviceState = LocalDeviceState()
         self.remoteDeviceStates = [:]
 
@@ -290,17 +371,19 @@ public class GroupCall {
         Logger.debug("object! GroupCall created... \(ObjectIdentifier(self))")
     }
 
-    internal init(ringRtcCallManager: UnsafeMutableRawPointer, factory: RTCPeerConnectionFactory, groupCallByClientId: GroupCallByClientId, sfuUrl: String, authCredentialPresentation: [UInt8], linkRootKey: CallLinkRootKey, adminPasskey: Data?, hkdfExtraInfo: Data, audioLevelsIntervalMillis: UInt64?, videoCaptureController: VideoCaptureController) {
-        AssertIsOnMainThread()
-
+    @MainActor
+    internal init(ringRtcCallManager: UnsafeMutableRawPointer, factory: RTCPeerConnectionFactory, groupCallByClientId: GroupCallByClientId, sfuUrl: String, endorsementPublicKey: Data, authCredentialPresentation: [UInt8], linkRootKey: CallLinkRootKey, adminPasskey: Data?, hkdfExtraInfo: Data, audioLevelsIntervalMillis: UInt64?, dredDuration: UInt8 = 0, svcConfig: SvcConfig? = nil, videoCaptureController: VideoCaptureController) {
         self.ringRtcCallManager = ringRtcCallManager
         self.factory = factory
         self.groupCallByClientId = groupCallByClientId
         self.connectInfo = .callLink(authCredentialPresentation: authCredentialPresentation, rootKey: linkRootKey, adminPasskey: adminPasskey)
         self.sfuUrl = sfuUrl
+        self.endorsementPublicKey = endorsementPublicKey;
         self.hkdfExtraInfo = hkdfExtraInfo
         self.audioLevelsIntervalMillis = audioLevelsIntervalMillis
-
+        self.dredDuration = dredDuration
+        self.svcConfig = svcConfig
+        
         self.localDeviceState = LocalDeviceState()
         self.remoteDeviceStates = [:]
 
@@ -324,8 +407,8 @@ public class GroupCall {
 
     /// Connect to a group call, creating a client if one does not already exist.
     /// Return true if successful.
+    @MainActor
     public func connect() -> Bool {
-        AssertIsOnMainThread()
         Logger.debug("connect")
 
         if self.clientId == nil {
@@ -334,6 +417,7 @@ public class GroupCall {
             let sfuUrlSlice = allocatedAppByteSliceFromString(maybe_string: self.sfuUrl)
             let hkdfExtraInfoSlice = allocatedAppByteSliceFromData(maybe_data: self.hkdfExtraInfo)
             let audioLevelsIntervalMillis = self.audioLevelsIntervalMillis ?? 0;
+            let appOptionalSvcConfig = makeAppOptionalSvcConfig(self.svcConfig)
 
             // Make sure to release the allocated memory when the function exists,
             // to ensure that the pointers are still valid when used in the RingRTC
@@ -345,6 +429,7 @@ public class GroupCall {
                 if hkdfExtraInfoSlice.bytes != nil {
                     hkdfExtraInfoSlice.bytes.deallocate()
                 }
+                destroyAppOptionalSvcConfig(appOptionalSvcConfig)
             }
 
             let audioConstraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
@@ -377,23 +462,25 @@ public class GroupCall {
                 // Note: getOwnedNativeAudioTrack/getOwnedNativeVideoTrack/getOwnedNativeFactory
                 // return owned RCs the first time they are called, and null after that.
                 // TODO: Consider renaming getOwnedNativeX to takeNative.
-                clientId = ringrtcCreateGroupCallClient(self.ringRtcCallManager, groupIdSlice, sfuUrlSlice, hkdfExtraInfoSlice, audioLevelsIntervalMillis, self.factory.getOwnedNativeFactory(), audioTrack.getOwnedNativeTrack(), videoTrack.getOwnedNativeTrack())
+                clientId = ringrtcCreateGroupCallClient(self.ringRtcCallManager, groupIdSlice, sfuUrlSlice, hkdfExtraInfoSlice, audioLevelsIntervalMillis, self.dredDuration, appOptionalSvcConfig, self.factory.getOwnedNativeFactory(), audioTrack.getOwnedNativeTrack(), videoTrack.getOwnedNativeTrack())
 
             case .callLink(let authCredentialPresentation, let rootKey, let adminPasskey):
                 let authCredentialPresentationSlice = allocatedAppByteSliceFromArray(maybe_bytes: authCredentialPresentation)
                 let rootKeySlice = allocatedAppByteSliceFromData(maybe_data: rootKey.bytes)
                 let adminPasskeySlice = allocatedAppByteSliceFromData(maybe_data: adminPasskey)
+                let endorsementPublicKeySlice = allocatedAppByteSliceFromData(maybe_data: self.endorsementPublicKey)
                 defer {
                     authCredentialPresentationSlice.bytes?.deallocate()
                     rootKeySlice.bytes?.deallocate()
                     adminPasskeySlice.bytes?.deallocate()
+                    endorsementPublicKeySlice.bytes?.deallocate()
                 }
                 // Note: getOwnedNativeAudioTrack/getOwnedNativeVideoTrack/getOwnedNativeFactory
                 // return owned RCs the first time they are called, and null after that.
                 // TODO: Consider renaming getOwnedNativeX to takeNative.
-                clientId = ringrtcCreateCallLinkCallClient(self.ringRtcCallManager, sfuUrlSlice, authCredentialPresentationSlice, rootKeySlice, adminPasskeySlice, hkdfExtraInfoSlice, audioLevelsIntervalMillis, self.factory.getOwnedNativeFactory(), audioTrack.getOwnedNativeTrack(), videoTrack.getOwnedNativeTrack())
+                clientId = ringrtcCreateCallLinkCallClient(self.ringRtcCallManager, sfuUrlSlice, endorsementPublicKeySlice, authCredentialPresentationSlice, rootKeySlice, adminPasskeySlice, hkdfExtraInfoSlice, audioLevelsIntervalMillis, self.dredDuration, appOptionalSvcConfig, self.factory.getOwnedNativeFactory(), audioTrack.getOwnedNativeTrack(), videoTrack.getOwnedNativeTrack())
             }
-            if clientId != 0 {
+            if clientId != GroupCall.invalidClientId {
                 // Add this instance to the shared dictionary.
                 self.groupCallByClientId[clientId] = self
                 self.clientId = clientId
@@ -417,8 +504,8 @@ public class GroupCall {
         return true
     }
 
+    @MainActor
     public func join() {
-        AssertIsOnMainThread()
         Logger.debug("join")
 
         guard let clientId = self.clientId else {
@@ -429,8 +516,8 @@ public class GroupCall {
         ringrtcJoin(self.ringRtcCallManager, clientId)
     }
 
+    @MainActor
     public func leave() {
-        AssertIsOnMainThread()
         Logger.debug("leave")
 
         guard let clientId = self.clientId else {
@@ -445,8 +532,8 @@ public class GroupCall {
         ringrtcLeave(self.ringRtcCallManager, clientId)
     }
 
+    @MainActor
     public func disconnect() {
-        AssertIsOnMainThread()
         Logger.debug("disconnect")
 
         guard let clientId = self.clientId else {
@@ -461,8 +548,8 @@ public class GroupCall {
         ringrtcDisconnect(self.ringRtcCallManager, clientId)
     }
 
+    @MainActor
     public func react(value: String) {
-        AssertIsOnMainThread()
         Logger.debug("react")
 
         guard let clientId = self.clientId else {
@@ -476,8 +563,8 @@ public class GroupCall {
         ringrtcReact(self.ringRtcCallManager, clientId, valueSlice)
     }
 
+    @MainActor
     public func raiseHand(raise: Bool) {
-        AssertIsOnMainThread()
         Logger.debug("raiseHand")
 
         guard let clientId = self.clientId else {
@@ -489,13 +576,12 @@ public class GroupCall {
     }
 
     private var _isOutgoingAudioMuted = false
+    @MainActor
     public var isOutgoingAudioMuted: Bool {
         get {
-            AssertIsOnMainThread()
             return _isOutgoingAudioMuted
         }
         set {
-            AssertIsOnMainThread()
             Logger.debug("setOutgoingAudioMuted")
 
             _isOutgoingAudioMuted = newValue
@@ -510,14 +596,40 @@ public class GroupCall {
         }
     }
 
+    @MainActor
+    public func setOutgoingAudioRemotelyMuted(_ source: DemuxId) {
+        Logger.debug("setOutgoingAudioRemotelyMuted")
+
+        _isOutgoingAudioMuted = true
+        self.audioTrack?.isEnabled = false
+
+        guard let clientId = self.clientId else {
+            Logger.warn("no clientId defined for groupCall")
+            return
+        }
+
+        ringrtcSetOutgoingAudioMutedRemotely(self.ringRtcCallManager, clientId, source)
+    }
+
+    @MainActor
+    public func sendRemoteMuteRequest(_ target: DemuxId) {
+        Logger.debug("sendRemoteMuteRequest")
+
+        guard let clientId = self.clientId else {
+            Logger.warn("no clientId defined for groupCall")
+            return
+        }
+
+        ringrtcSendRemoteMuteRequest(self.ringRtcCallManager, clientId, target)
+    }
+
     private var _isOutgoingVideoMuted = false
+    @MainActor
     public var isOutgoingVideoMuted: Bool {
         get {
-            AssertIsOnMainThread()
             return _isOutgoingVideoMuted
         }
         set {
-            AssertIsOnMainThread()
             Logger.debug("setOutgoingVideoMuted")
 
             _isOutgoingVideoMuted = newValue
@@ -532,8 +644,8 @@ public class GroupCall {
         }
     }
 
+    @MainActor
     public func ringAll() {
-        AssertIsOnMainThread()
         Logger.debug("ring")
 
         guard let clientId = self.clientId else {
@@ -544,8 +656,8 @@ public class GroupCall {
         ringrtcGroupRing(self.ringRtcCallManager, clientId, AppByteSlice(bytes: nil, len: 0))
     }
 
+    @MainActor
     public func resendMediaKeys() {
-        AssertIsOnMainThread()
         Logger.debug("resendMediaKeys")
 
         guard let clientId = self.clientId else {
@@ -557,8 +669,8 @@ public class GroupCall {
     }
 
     /// Sets a data mode, allowing the client to limit the media bandwidth used.
+    @MainActor
     public func updateDataMode(dataMode: DataMode) {
-        AssertIsOnMainThread()
         Logger.debug("updateDataMode")
 
         guard let clientId = self.clientId else {
@@ -576,8 +688,8 @@ public class GroupCall {
     ///
     /// - parameter resolutions: the VideoRequest objects for each user rendered on the screen
     /// - parameter activeSpeakerHeight: the height of the view for the active speaker, in pixels
+    @MainActor
     public func updateVideoRequests(resolutions: [VideoRequest], activeSpeakerHeight: UInt16) {
-        AssertIsOnMainThread()
         Logger.debug("updateVideoRequests")
 
         guard let clientId = self.clientId else {
@@ -596,18 +708,17 @@ public class GroupCall {
             return AppVideoRequest(demux_id: resolution.demuxId, width: resolution.width, height: resolution.height, framerate: appFramerate)
         }
 
-        var appResolutionArray = appResolutions.withUnsafeBufferPointer { appResolutionBytes in
-            return AppVideoRequestArray(
+        appResolutions.withUnsafeBufferPointer { appResolutionBytes in
+            var appResolutionArray = AppVideoRequestArray(
                 resolutions: appResolutionBytes.baseAddress,
                 count: resolutions.count
             )
+            ringrtcRequestVideo(self.ringRtcCallManager, clientId, &appResolutionArray, activeSpeakerHeight)
         }
-
-        ringrtcRequestVideo(self.ringRtcCallManager, clientId, &appResolutionArray, activeSpeakerHeight)
     }
 
+    @MainActor
     public func approveUser(_ userId: UUID) {
-        AssertIsOnMainThread()
         Logger.debug("approveUser")
 
         guard let clientId = self.clientId else {
@@ -621,8 +732,8 @@ public class GroupCall {
         ringrtcApproveUser(self.ringRtcCallManager, clientId, userIdSlice)
     }
 
+    @MainActor
     public func denyUser(_ userId: UUID) {
-        AssertIsOnMainThread()
         Logger.debug("denyUser")
 
         guard let clientId = self.clientId else {
@@ -636,8 +747,8 @@ public class GroupCall {
         ringrtcDenyUser(self.ringRtcCallManager, clientId, userIdSlice)
     }
 
+    @MainActor
     public func removeClient(demuxId otherClientDemuxId: UInt32) {
-        AssertIsOnMainThread()
         Logger.debug("removeClient")
 
         guard let clientId = self.clientId else {
@@ -648,8 +759,8 @@ public class GroupCall {
         ringrtcRemoveClient(self.ringRtcCallManager, clientId, otherClientDemuxId)
     }
 
+    @MainActor
     public func blockClient(demuxId otherClientDemuxId: UInt32) {
-        AssertIsOnMainThread()
         Logger.debug("blockClient")
 
         guard let clientId = self.clientId else {
@@ -660,8 +771,8 @@ public class GroupCall {
         ringrtcBlockClient(self.ringRtcCallManager, clientId, otherClientDemuxId)
     }
 
+    @MainActor
     public func updateGroupMembers(members: [GroupMember]) {
-        AssertIsOnMainThread()
         Logger.debug("updateGroupMembers")
 
         guard let clientId = self.clientId else {
@@ -690,18 +801,17 @@ public class GroupCall {
             }
         }
 
-        var appGroupMemberInfoArray = appMembers.withUnsafeBufferPointer { appMembersBytes in
-            return AppGroupMemberInfoArray(
+        appMembers.withUnsafeBufferPointer { appMembersBytes in
+            var appGroupMemberInfoArray = AppGroupMemberInfoArray(
                 members: appMembersBytes.baseAddress,
                 count: members.count
             )
+            ringrtcSetGroupMembers(self.ringRtcCallManager, clientId, &appGroupMemberInfoArray)
         }
-
-        ringrtcSetGroupMembers(self.ringRtcCallManager, clientId, &appGroupMemberInfoArray)
     }
 
+    @MainActor
     public func updateMembershipProof(proof: Data) {
-        AssertIsOnMainThread()
         Logger.debug("updateMembershipProof")
 
         guard let clientId = self.clientId else {
@@ -725,37 +835,32 @@ public class GroupCall {
 
     // MARK: - Internal Callback Handlers
 
+    @MainActor
     func requestMembershipProof() {
-        AssertIsOnMainThread()
-
         self.delegate?.groupCall(requestMembershipProof: self)
     }
 
+    @MainActor
     func requestGroupMembers() {
-        AssertIsOnMainThread()
-
         self.delegate?.groupCall(requestGroupMembers: self)
     }
 
+    @MainActor
     func handleConnectionStateChanged(connectionState: ConnectionState) {
-        AssertIsOnMainThread()
-
         self.localDeviceState.connectionState = connectionState
 
         self.delegate?.groupCall(onLocalDeviceStateChanged: self)
     }
 
+    @MainActor
     func handleNetworkRouteChanged(networkRoute: NetworkRoute) {
-        AssertIsOnMainThread()
-
         self.localDeviceState.networkRoute = networkRoute;
 
         self.delegate?.groupCall(onLocalDeviceStateChanged: self)
     }
 
+    @MainActor
     func handleAudioLevels(capturedLevel: UInt16, receivedLevels: [ReceivedAudioLevel]) {
-        AssertIsOnMainThread()
-
         self.localDeviceState.audioLevel = capturedLevel;
         for received in receivedLevels {
             let remoteDeviceState = self.remoteDeviceStates[received.demuxId]
@@ -767,35 +872,31 @@ public class GroupCall {
         self.delegate?.groupCall(onAudioLevels: self)
     }
 
+    @MainActor
     func handleLowBandwidthForVideo(recovered: Bool) {
-        AssertIsOnMainThread()
-
         self.delegate?.groupCall(onLowBandwidthForVideo: self, recovered: recovered)
     }
 
+    @MainActor
     func handleReactions(reactions: [Reaction]) {
-        AssertIsOnMainThread()
-
         self.delegate?.groupCall(onReactions: self, reactions: reactions)
     }
 
+    @MainActor
     func handleRaisedHands(raisedHands: [UInt32]) {
-        AssertIsOnMainThread()
-
         self.delegate?.groupCall(onRaisedHands: self, raisedHands: raisedHands)
     }
 
+    @MainActor
     func handleJoinStateChanged(joinState: JoinState, demuxId: UInt32?) {
-       AssertIsOnMainThread()
-
        self.localDeviceState.joinState = joinState
        self.localDeviceState.demuxId = demuxId
 
        self.delegate?.groupCall(onLocalDeviceStateChanged: self)
     }
 
+    @MainActor
     func handleRemoteDevicesChanged(remoteDeviceStates: [RemoteDeviceState]) {
-        AssertIsOnMainThread()
         Logger.debug("handleRemoteDevicesChanged() count: \(remoteDeviceStates.count)")
 
         var remoteDeviceByDemuxId: [UInt32: RemoteDeviceState] = [:]
@@ -816,8 +917,8 @@ public class GroupCall {
         self.delegate?.groupCall(onRemoteDeviceStatesChanged: self)
     }
 
+    @MainActor
     func handleIncomingVideoTrack(remoteDemuxId: UInt32, videoTrack: RTCVideoTrack) {
-        AssertIsOnMainThread()
         Logger.debug("handleIncomingVideoTrack() for remoteDemuxId: 0x\(String(remoteDemuxId, radix: 16))")
 
         guard let remoteDeviceState = self.remoteDeviceStates[remoteDemuxId] else {
@@ -830,17 +931,15 @@ public class GroupCall {
         self.delegate?.groupCall(onRemoteDeviceStatesChanged: self)
     }
 
+    @MainActor
     func handlePeekChanged(peekInfo: PeekInfo) {
-        AssertIsOnMainThread()
-
         self.peekInfo = peekInfo
 
         self.delegate?.groupCall(onPeekChanged: self)
     }
 
-    func handleEnded(reason: GroupCallEndReason) {
-        AssertIsOnMainThread()
-
+    @MainActor
+    func handleEnded(reason: CallEndReason, summary: CallSummary) {
         guard let clientId = self.clientId else {
             Logger.error("no clientId defined for groupCall")
             return
@@ -860,6 +959,21 @@ public class GroupCall {
 
         ringrtcDeleteGroupCallClient(self.ringRtcCallManager, clientId)
 
-        self.delegate?.groupCall(onEnded: self, reason: reason)
+        self.delegate?.groupCall(onEnded: self, reason: reason, summary: summary)
+    }
+
+    @MainActor
+    func handleSpeakingNotification(event: SpeechEvent) {
+        self.delegate?.groupCall(onSpeakingNotification: self, event: event)
+    }
+
+    @MainActor
+    func handleRemoteMuteRequest(muteSource: UInt32) {
+        self.delegate?.groupCall(onRemoteMuteRequest: self, muteSource: muteSource)
+    }
+
+    @MainActor
+    func handleObservedRemoteMute(muteSource: UInt32, muteTarget: UInt32) {
+        self.delegate?.groupCall(onObservedRemoteMute: self, muteSource: muteSource, muteTarget: muteTarget)
     }
 }

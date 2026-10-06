@@ -5,14 +5,14 @@
 
 //! Foreign Function Interface utility helpers and types.
 
-use std::borrow::Cow;
-use std::collections::VecDeque;
-use std::mem;
-use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Condvar, Mutex};
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    mem,
+    sync::{Arc, Condvar, Mutex, mpsc::Receiver},
+};
 
-use crate::common::Result;
-use crate::error::RingRtcError;
+use crate::{common::Result, error::RingRtcError};
 
 /// Generic Mutex/Condvar pair for signaling async event completion.
 pub type FutureResult<T> = Arc<(Mutex<(bool, T)>, Condvar)>;
@@ -28,7 +28,7 @@ pub unsafe fn ptr_as_arc_mutex<T>(ptr: *mut T) -> Result<Arc<Mutex<T>>> {
         )
         .into());
     }
-    let arc = Arc::from_raw(ptr as *mut Mutex<T>);
+    let arc = unsafe { Arc::from_raw(ptr as *mut Mutex<T>) };
     Ok(arc)
 }
 
@@ -48,8 +48,10 @@ impl<T> ArcPtr<T> {
     ///
     /// Creates a new ArcPtr<T>.
     pub unsafe fn new(ptr: *mut T) -> Self {
-        ArcPtr {
-            arc: Some(Arc::<Mutex<T>>::from_raw(ptr as *mut Mutex<T>)),
+        unsafe {
+            ArcPtr {
+                arc: Some(Arc::<Mutex<T>>::from_raw(ptr as *mut Mutex<T>)),
+            }
         }
     }
 
@@ -83,7 +85,7 @@ pub unsafe fn ptr_as_arc_ptr<T>(ptr: *mut T) -> Result<ArcPtr<T>> {
         )
         .into());
     }
-    Ok(ArcPtr::<T>::new(ptr))
+    unsafe { Ok(ArcPtr::<T>::new(ptr)) }
 }
 
 /// # Safety
@@ -96,7 +98,7 @@ pub unsafe fn ptr_as_mut<T>(ptr: *mut T) -> Result<&'static mut T> {
         );
     }
 
-    let object = &mut *ptr;
+    let object = unsafe { &mut *ptr };
     Ok(object)
 }
 
@@ -110,17 +112,13 @@ pub unsafe fn ptr_as_box<T>(ptr: *mut T) -> Result<Box<T>> {
         );
     }
 
-    let object = Box::from_raw(ptr);
+    let object = unsafe { Box::from_raw(ptr) };
     Ok(object)
 }
 
 /// Given two values `a` and `b`, returns them in sorted order.
 pub fn minmax<T: Ord>(a: T, b: T) -> (T, T) {
-    if a <= b {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 #[cfg(any(not(debug_assertions), test))]
@@ -233,15 +231,23 @@ fn redact_ipv4(text: Cow<'_, str>) -> Cow<'_, str> {
     replace_all(text, re, "[REDACTED ipv4]")
 }
 
+#[cfg(any(not(debug_assertions), test))]
+fn redact_foundation(text: Cow<'_, str>) -> Cow<'_, str> {
+    let re = regex_aot::regex!("candidate:[0-9]+");
+    replace_all(text, re, "candidate:******")
+}
+
 /// Scrubs off sensitive information from the string for public
 /// logging purposes, including:
 /// - ICE passwords
 /// - IPv4 and IPv6 addresses
+/// - ICE candidate foundations
 #[cfg(not(debug_assertions))]
 pub fn redact_string<'a>(text: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
     let mut string = redact_ice_password(text.into());
     string = redact_ipv6(string);
-    redact_ipv4(string)
+    string = redact_ipv4(string);
+    redact_foundation(string)
 }
 
 /// For debug builds, redacting won't do anything.
@@ -313,6 +319,38 @@ impl<T> EventStream<T> {
 impl<T> From<Receiver<T>> for EventStream<T> {
     fn from(receiver: Receiver<T>) -> Self {
         Self::Active(receiver)
+    }
+}
+
+/// Truncate the given string |s| by retaining only a brief prefix and suffix, to match
+/// Desktop's truncateForLogging format.
+/// If the string contains unicode, only output one character.
+pub fn truncate_for_logging(s: &str) -> String {
+    if cfg!(debug_assertions) && !cfg!(test) {
+        // For debug testing/local builds only, allow the full string.
+        s.to_string()
+    } else {
+        // Take a small number of characters, but fewer if they are non-ascii unicode, as
+        // unicode provides a substantially higher amount of information per char.
+        // (e.g. four mandarin characters could be a full name)
+        let out: String = if s.is_ascii() {
+            let n = s.chars().by_ref().count();
+            if n <= 4 {
+                return s.to_string();
+            }
+            let mut chars = s.chars();
+            let mut out: String = chars.by_ref().take(2).collect();
+            out.push_str("...");
+            // n - 4 because we're reusing the iterator we took 2 from
+            out.extend(chars.skip(n - 4));
+            out
+        } else {
+            if s.chars().count() <= 1 {
+                return s.to_string();
+            }
+            s.chars().take(1).chain("...".chars()).collect()
+        };
+        out
     }
 }
 
@@ -486,5 +524,33 @@ mod tests {
             "abc\na=ice-pwd:[ REDACTED ]\ndef\na=ice-pwd:[ REDACTED ]\nghi",
             result,
         );
+    }
+
+    #[test]
+    fn check_foundation() {
+        let test_str = "candidate:123456789 1 udp 2122270975 92.168.122.250 12345 typ host generation 0 ufrag abcd network-id 5 network-cost 900";
+        let result = redact_foundation(test_str.into());
+        assert_eq!(
+            "candidate:****** 1 udp 2122270975 92.168.122.250 12345 typ host generation 0 ufrag abcd network-id 5 network-cost 900",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_logging() {
+        assert_eq!(truncate_for_logging("0123456789"), "01...89");
+        assert_eq!(truncate_for_logging("0123"), "0123");
+        assert_eq!(truncate_for_logging("0"), "0");
+        assert_eq!(truncate_for_logging("你好"), "你..."); // ni hao (hello)
+        assert_eq!(truncate_for_logging("你"), "你");
+        // This is not necessarily behavior we want to enforce, but the test is here for
+        // documentation of the limitations of this implementation:
+        // the string y̆, which looks like one character to humans, is represented as
+        // two Unicode Scalar Values: y and \u{0306}.
+        // Rust's standard library does not provide functionality to iterate by "grapheme clusters."
+        //
+        // While we could get such a library from crates.io, it would require us to build in a
+        // (large) unicode table to the compiled library.
+        assert_eq!(truncate_for_logging("y̆ is from rust str docs"), "y...");
     }
 }

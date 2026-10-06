@@ -9,6 +9,7 @@ import WebRTC
 @available(iOSApplicationExtension, unavailable)
 protocol CallManagerInterfaceDelegate: AnyObject {
     func onStartCall(remote: UnsafeRawPointer, callId: UInt64, isOutgoing: Bool, callMediaType: CallMediaType)
+    func onCallEnded(remote: UnsafeRawPointer, callId: UInt64, reason: CallEndReason, summary: CallSummary)
     func onEvent(remote: UnsafeRawPointer, event: CallManagerEvent)
     func onNetworkRouteChangedFor(remote: UnsafeRawPointer, networkRoute: NetworkRoute)
     func onAudioLevelsFor(remote: UnsafeRawPointer, capturedLevel: UInt16, receivedLevel: UInt16)
@@ -20,9 +21,9 @@ protocol CallManagerInterfaceDelegate: AnyObject {
     func onSendBusy(callId: UInt64, remote: UnsafeRawPointer, destinationDeviceId: UInt32?)
     func sendCallMessage(recipientUuid: UUID, message: Data, urgency: CallMessageUrgency)
     func sendCallMessageToGroup(groupId: Data, message: Data, urgency: CallMessageUrgency, overrideRecipients: [UUID])
+    func sendCallMessageToAdhocGroup(message: Data, urgency: CallMessageUrgency, expiration: Date, recipientsToEndorsements: [UUID: Data])
     func onCreateConnection(pcObserverOwned: UnsafeMutableRawPointer?, deviceId: UInt32, appCallContext: CallContext, audioJitterBufferMaxPackets: Int32, audioJitterBufferMaxTargetDelayMs: Int32) -> (connection: Connection, pc: UnsafeMutableRawPointer?)
     func onConnectMedia(remote: UnsafeRawPointer, appCallContext: CallContext, stream: RTCMediaStream)
-    func onCompareRemotes(remote1: UnsafeRawPointer, remote2: UnsafeRawPointer) -> Bool
     func onCallConcluded(remote: UnsafeRawPointer)
 
     // Group Calls
@@ -41,7 +42,10 @@ protocol CallManagerInterfaceDelegate: AnyObject {
     func handleRemoteDevicesChanged(clientId: UInt32, remoteDeviceStates: [RemoteDeviceState])
     func handleIncomingVideoTrack(clientId: UInt32, remoteDemuxId: UInt32, nativeVideoTrackBorrowedRc: UnsafeMutableRawPointer?)
     func handlePeekChanged(clientId: UInt32, peekInfo: PeekInfo)
-    func handleEnded(clientId: UInt32, reason: GroupCallEndReason)
+    func handleEnded(clientId: UInt32, reason: CallEndReason, summary: CallSummary)
+    func handleSpeakingNotification(clientId: UInt32, event: SpeechEvent)
+    func handleRemoteMuteRequest(clientId: UInt32, muteSource: UInt32)
+    func handleObservedRemoteMute(clientId: UInt32, muteSource: UInt32, muteTarget: UInt32)
 }
 
 @available(iOSApplicationExtension, unavailable)
@@ -66,6 +70,7 @@ class CallManagerInterface {
             object: UnsafeMutableRawPointer(Unmanaged.passRetained(self).toOpaque()),
             destroy: callManagerInterfaceDestroy,
             onStartCall: callManagerInterfaceOnStartCall,
+            onCallEnded: callManagerInterfaceOnCallEnded,
             onEvent: callManagerInterfaceOnCallEvent,
             onNetworkRouteChanged: callManagerInterfaceOnNetworkRouteChanged,
             onAudioLevels: callManagerInterfaceOnAudioLevels,
@@ -77,10 +82,10 @@ class CallManagerInterface {
             onSendBusy: callManagerInterfaceOnSendBusy,
             sendCallMessage: callManagerInterfaceSendCallMessage,
             sendCallMessageToGroup: callManagerInterfaceSendCallMessageToGroup,
+            sendCallMessageToAdhocGroup: callManagerInterfaceSendCallMessageToAdhocGroup,
             onCreateConnectionInterface: callManagerInterfaceOnCreateConnectionInterface,
             onCreateMediaStreamInterface: callManagerInterfaceOnCreateMediaStreamInterface,
             onConnectMedia: callManagerInterfaceOnConnectMedia,
-            onCompareRemotes: callManagerInterfaceOnCompareRemotes,
             onCallConcluded: callManagerInterfaceOnCallConcluded,
 
             // Group Calls
@@ -99,7 +104,10 @@ class CallManagerInterface {
             handleRemoteDevicesChanged: callManagerInterfaceHandleRemoteDevicesChanged,
             handleIncomingVideoTrack: callManagerInterfaceHandleIncomingVideoTrack,
             handlePeekChanged: callManagerInterfaceHandlePeekChanged,
-            handleEnded: callManagerInterfaceHandleEnded
+            handleEnded: callManagerInterfaceHandleEnded,
+            handleSpeakingNotification: callManagerInterfaceHandleSpeakingNotification,
+            handleRemoteMuteRequest: callManagerInterfaceHandleRemoteMuteRequest,
+            handleObservedRemoteMute: callManagerInterfaceHandleObservedRemoteMute
         )
     }
 
@@ -111,6 +119,14 @@ class CallManagerInterface {
         }
 
         delegate.onStartCall(remote: remote, callId: callId, isOutgoing: isOutgoing, callMediaType: callMediaType)
+    }
+    
+    func onCallEnded(remote: UnsafeRawPointer, callId: UInt64, reason: CallEndReason, summary: CallSummary) {
+        guard let delegate = self.callManagerObserverDelegate else {
+            return
+        }
+        
+        delegate.onCallEnded(remote: remote, callId: callId, reason: reason, summary: summary)
     }
 
     func onEvent(remote: UnsafeRawPointer, event: Int32) {
@@ -211,6 +227,14 @@ class CallManagerInterface {
         delegate.sendCallMessageToGroup(groupId: groupId, message: message, urgency: urgency, overrideRecipients: overrideRecipients)
     }
 
+    func sendCallMessageToAdhocGroup(message: Data, urgency: CallMessageUrgency, expiration: Date, recipientsToEndorsements: [UUID: Data]) {
+        guard let delegate = self.callManagerObserverDelegate else {
+            return
+        }
+
+        delegate.sendCallMessageToAdhocGroup(message: message, urgency: urgency, expiration: expiration, recipientsToEndorsements: recipientsToEndorsements)
+    }
+
     func onCreateConnection(pcObserverOwned: UnsafeMutableRawPointer?, deviceId: UInt32, appCallContext: CallContext, audioJitterBufferMaxPackets: Int32, audioJitterBufferMaxTargetDelayMs: Int32) -> (connection: Connection, pc: UnsafeMutableRawPointer?)? {
         guard let delegate = self.callManagerObserverDelegate else {
             return nil
@@ -225,14 +249,6 @@ class CallManagerInterface {
         }
 
         delegate.onConnectMedia(remote: remote, appCallContext: appCallContext, stream: stream)
-    }
-
-    func onCompareRemotes(remote1: UnsafeRawPointer, remote2: UnsafeRawPointer) -> Bool {
-        guard let delegate = self.callManagerObserverDelegate else {
-            return false
-        }
-
-        return delegate.onCompareRemotes(remote1: remote1, remote2: remote2)
     }
 
     func onCallConcluded(remote: UnsafeRawPointer) {
@@ -349,12 +365,36 @@ class CallManagerInterface {
         delegate.handlePeekChanged(clientId: clientId, peekInfo: peekInfo)
     }
 
-    func handleEnded(clientId: UInt32, reason: GroupCallEndReason) {
+    func handleEnded(clientId: UInt32, reason: CallEndReason, summary: CallSummary) {
         guard let delegate = self.callManagerObserverDelegate else {
             return
         }
 
-        delegate.handleEnded(clientId: clientId, reason: reason)
+        delegate.handleEnded(clientId: clientId, reason: reason, summary: summary)
+    }
+
+    func handleSpeakingNotification(clientId: UInt32, event: SpeechEvent) {
+        guard let delegate = self.callManagerObserverDelegate else {
+            return
+        }
+
+        delegate.handleSpeakingNotification(clientId: clientId, event: event)
+    }
+
+    func handleRemoteMuteRequest(clientId: UInt32, muteSource: UInt32) {
+        guard let delegate = self.callManagerObserverDelegate else {
+             return
+        }
+
+        delegate.handleRemoteMuteRequest(clientId: clientId, muteSource: muteSource)
+    }
+
+    func handleObservedRemoteMute(clientId: UInt32, muteSource: UInt32, muteTarget: UInt32) {
+        guard let delegate = self.callManagerObserverDelegate else {
+            return
+        }
+
+        delegate.handleObservedRemoteMute(clientId: clientId, muteSource: muteSource, muteTarget: muteTarget)
     }
 }
 
@@ -392,6 +432,33 @@ func callManagerInterfaceOnStartCall(object: UnsafeMutableRawPointer?, remote: U
     }
 
     obj.onStartCall(remote: remote, callId: callId, isOutgoing: isOutgoing, callMediaType: callMediaType)
+}
+
+@available(iOSApplicationExtension, unavailable)
+func callManagerInterfaceOnCallEnded(object: UnsafeMutableRawPointer?, remote: UnsafeRawPointer?, callId: UInt64, rawReason: Int32, rawSummary: UnsafePointer<rtc_callsummary_CallSummary>?) {
+    guard let object = object else {
+        failDebug("object was unexpectedly nil")
+        return
+    }
+    let obj: CallManagerInterface = Unmanaged.fromOpaque(object).takeUnretainedValue()
+
+    guard let remote = remote else {
+        failDebug("remote was unexpectedly nil")
+        return
+    }
+
+    guard let reason = CallEndReason(rawValue: rawReason) else {
+        failDebug("unexpected end reason")
+        return
+    }
+
+    guard let rawSummary = rawSummary else {
+        failDebug("call summary was unexpectedly nil")
+        return
+    }
+    let summary = CallSummary.fromRtc(rawSummary)
+
+    obj.onCallEnded(remote: remote, callId: callId, reason: reason, summary: summary)
 }
 
 @available(iOSApplicationExtension, unavailable)
@@ -670,6 +737,43 @@ func callManagerInterfaceSendCallMessageToGroup(object: UnsafeMutableRawPointer?
 }
 
 @available(iOSApplicationExtension, unavailable)
+func callManagerInterfaceSendCallMessageToAdhocGroup(object: UnsafeMutableRawPointer?, message: AppByteSlice, urgency: Int32, expiration: UInt64, recipients: AppUuidArray, endorsements: AppByteSliceArray) {
+    guard let object = object else {
+        failDebug("object was unexpectedly nil")
+        return
+    }
+    let obj: CallManagerInterface = Unmanaged.fromOpaque(object).takeUnretainedValue()
+
+    guard let message = message.asData() else {
+        return
+    }
+
+    guard let urgency = CallMessageUrgency(rawValue: urgency) else {
+        failDebug("unexpected urgency")
+        return
+    }
+
+    let expiration = Date(timeIntervalSince1970: TimeInterval(expiration))
+
+    guard recipients.count == endorsements.count else {
+        failDebug("mismatched recipient and endorsement array length")
+        return
+    }
+
+    var recipientsToEndorsements: [UUID: Data] = [:]
+    for index in 0..<recipients.count {
+        guard let userId = recipients.uuids[index].toUUID() else {
+            Logger.error("missing userId")
+            continue
+        }
+
+        recipientsToEndorsements[userId] = endorsements.slices[index].asData()
+    }
+
+    obj.sendCallMessageToAdhocGroup(message: message, urgency: urgency, expiration: expiration, recipientsToEndorsements: recipientsToEndorsements)
+}
+
+@available(iOSApplicationExtension, unavailable)
 func callManagerInterfaceOnCreateConnectionInterface(object: UnsafeMutableRawPointer?, pcObserverOwned: UnsafeMutableRawPointer?, deviceId: UInt32, context: UnsafeMutableRawPointer?, audioJitterBufferMaxPackets: Int32, audioJitterBufferMaxTargetDelayMs: Int32) -> AppConnectionInterface {
     guard let object = object else {
         failDebug("object was unexpectedly nil")
@@ -773,27 +877,6 @@ func callManagerInterfaceOnConnectMedia(object: UnsafeMutableRawPointer?, remote
     let mediaStream: RTCMediaStream = Unmanaged.fromOpaque(stream).takeUnretainedValue()
 
     obj.onConnectedMedia(remote: remote, appCallContext: appCallContext, stream: mediaStream)
-}
-
-@available(iOSApplicationExtension, unavailable)
-func callManagerInterfaceOnCompareRemotes(object: UnsafeMutableRawPointer?, remote1: UnsafeRawPointer?, remote2: UnsafeRawPointer?) -> Bool {
-    guard let object = object else {
-        failDebug("object was unexpectedly nil")
-        return false
-    }
-    let obj: CallManagerInterface = Unmanaged.fromOpaque(object).takeUnretainedValue()
-
-    guard let remote1 = remote1 else {
-        failDebug("remote1 was unexpectedly nil")
-        return false
-    }
-
-    guard let remote2 = remote2 else {
-        failDebug("remote2 was unexpectedly nil")
-        return false
-    }
-
-    return obj.onCompareRemotes(remote1: remote1, remote2: remote2)
 }
 
 @available(iOSApplicationExtension, unavailable)
@@ -1093,20 +1176,61 @@ func callManagerInterfaceHandlePeekChanged(object: UnsafeMutableRawPointer?, cli
 }
 
 @available(iOSApplicationExtension, unavailable)
-func callManagerInterfaceHandleEnded(object: UnsafeMutableRawPointer?, clientId: UInt32, reason: Int32) {
+func callManagerInterfaceHandleEnded(object: UnsafeMutableRawPointer?, clientId: UInt32, rawReason: Int32, rawSummary: UnsafePointer<rtc_callsummary_CallSummary>?) {
     guard let object = object else {
         failDebug("object was unexpectedly nil")
         return
     }
     let obj: CallManagerInterface = Unmanaged.fromOpaque(object).takeUnretainedValue()
 
-    let _reason: GroupCallEndReason
-    if let validReason = GroupCallEndReason(rawValue: reason) {
-        _reason = validReason
-    } else {
+    guard let reason = CallEndReason(rawValue: rawReason) else {
         failDebug("unexpected end reason")
         return
     }
+    
+    guard let rawSummary = rawSummary else {
+        failDebug("summary was unexpectedly nil")
+        return
+    }
+    let summary = CallSummary.fromRtc(rawSummary)
 
-    obj.handleEnded(clientId: clientId, reason: _reason)
+    obj.handleEnded(clientId: clientId, reason: reason, summary: summary)
+}
+
+@available(iOSApplicationExtension, unavailable)
+func callManagerInterfaceHandleSpeakingNotification(object: UnsafeMutableRawPointer?, clientId: UInt32, rawEvent: Int32) {
+    guard let object = object else {
+        failDebug("object was unexpectedly nil")
+        return
+    }
+    let obj: CallManagerInterface = Unmanaged.fromOpaque(object).takeUnretainedValue()
+
+    guard let event = SpeechEvent(rawValue: rawEvent) else {
+        failDebug("unexpected speech event")
+        return
+    }
+
+    obj.handleSpeakingNotification(clientId: clientId, event: event)
+}
+
+@available(iOSApplicationExtension, unavailable)
+func callManagerInterfaceHandleRemoteMuteRequest(object: UnsafeMutableRawPointer?, clientId: UInt32, muteSource: UInt32) {
+    guard let object = object else {
+        failDebug("object was unexpectedly nil")
+        return
+    }
+    let obj: CallManagerInterface = Unmanaged.fromOpaque(object).takeUnretainedValue()
+
+    obj.handleRemoteMuteRequest(clientId: clientId, muteSource: muteSource)
+}
+
+@available(iOSApplicationExtension, unavailable)
+func callManagerInterfaceHandleObservedRemoteMute(object: UnsafeMutableRawPointer?, clientId: UInt32, muteSource: UInt32, muteTarget: UInt32) {
+    guard let object = object else {
+        failDebug("object was unexpectedly nil")
+        return
+    }
+    let obj: CallManagerInterface = Unmanaged.fromOpaque(object).takeUnretainedValue()
+
+    obj.handleObservedRemoteMute(clientId: clientId, muteSource: muteSource, muteTarget: muteTarget)
 }

@@ -4,9 +4,11 @@
 //
 
 use core::panic;
-use std::env::{self, VarError};
-use std::fs;
-use std::process::Command;
+use std::{
+    env::{self, VarError},
+    fs,
+    process::Command,
+};
 
 // corresponds to PROJECT_DIR in bin/env.sh
 fn project_dir() -> String {
@@ -54,17 +56,22 @@ fn main() {
     // Explicitly state that by depending on build.rs itself, as recommended.
     println!("cargo:rerun-if-changed=build.rs");
 
+    if cfg!(feature = "prebuilt_webrtc") && cfg!(feature = "prebuilt_webrtc_sim") {
+        panic!("Cannot enable both prebuilt_webrtc and prebuilt_webrtc_sim features");
+    }
+
     if cfg!(feature = "native") {
-        let webrtc_dir = if cfg!(feature = "prebuilt_webrtc") {
-            if let Err(e) = fs::create_dir_all(&out_dir) {
-                panic!("Failed to create webrtc out directory: {:?}", e);
-            }
-            fetch_webrtc_artifact(&target_os, &target_arch, &out_dir).unwrap();
-            // Ignore build type since we only have release prebuilts
-            format!("{}/release/obj/", out_dir)
-        } else {
-            format!("{}/{}/obj", out_dir, build_type)
-        };
+        let webrtc_dir =
+            if cfg!(feature = "prebuilt_webrtc") || cfg!(feature = "prebuilt_webrtc_sim") {
+                if let Err(e) = fs::create_dir_all(&out_dir) {
+                    panic!("Failed to create webrtc out directory: {:?}", e);
+                }
+                fetch_webrtc_artifact(&target_os, &target_arch, &out_dir).unwrap();
+                // Ignore build type since we only have release prebuilts
+                format!("{}/release/obj/", out_dir)
+            } else {
+                format!("{}/{}/obj", out_dir, build_type)
+            };
         println!("cargo:rerun-if-changed={}", webrtc_dir);
         println!("cargo:rerun-if-changed={}", config_dir());
         println!("cargo:rustc-link-search=native={}", webrtc_dir);
@@ -146,11 +153,30 @@ fn fetch_webrtc_artifact(
         platform, artifact_out_dir
     );
 
-    let output = Command::new(fetch_script)
+    let mut command = if cfg!(target_os = "windows") {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C");
+
+        // Prefer Git bash if available.
+        let bash_path = r"C:\Program Files\Git\bin\bash.exe";
+        if std::path::Path::new(bash_path).exists() {
+            cmd.arg(bash_path);
+        } else {
+            eprintln!("Git bash not found, falling back to just 'bash'.");
+            cmd.arg("bash");
+        }
+        cmd
+    } else {
+        Command::new("bash")
+    };
+
+    command
         .current_dir(project_dir())
         .env("OUTPUT_DIR", artifact_out_dir)
+        .arg(fetch_script)
         .arg("--platform")
-        .arg(platform)
+        .arg(platform);
+    let output = command
         .output()
         .expect("bin/fetch-artifact failed to complete");
 

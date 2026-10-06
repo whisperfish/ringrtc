@@ -3,25 +3,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use ringrtc::lite::http::sim as sim_http;
+#![allow(clippy::disallowed_macros)]
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
 
 use log::info;
-
-use ringrtc::core::group_call::Reaction;
 use ringrtc::{
-    common::units::DataRate,
+    bin::utils::audio::set_default_audio_devices,
+    common::{CallEndReason, units::DataRate},
     core::{
+        assets::AssetRegistry,
         call_mutex::CallMutex,
+        call_summary::CallSummary,
+        endorsements::EndorsementUpdateResultRef,
         group_call::{
-            self, ClientId, ConnectionState, EndReason, HttpSfuClient, JoinState,
-            RemoteDeviceState, RemoteDevicesChangedReason,
+            self, ClientId, ConnectionState, HttpSfuClient, JoinState, Reaction, RemoteDeviceState,
+            RemoteDevicesChangedReason, SignalingMessageUrgency, SpeechEvent,
         },
     },
-    lite::sfu::{DemuxId, PeekInfo, UserId},
-    protobuf,
+    lite::{
+        http::sim as sim_http,
+        sfu::{DemuxId, MemberMap, ObfuscatedResolver, PeekInfo, UserId},
+    },
+    protobuf::{self, signaling::CallMessage},
     webrtc::{
         media::{VideoFrame, VideoFrameMetadata, VideoPixelFormat, VideoSink, VideoTrack},
         peer_connection::{AudioLevel, ReceivedAudioLevel, SendRates},
@@ -101,6 +108,16 @@ impl group_call::Observer for Observer {
         unimplemented!()
     }
 
+    fn send_signaling_message_to_adhoc_group(
+        &mut self,
+        _call_message: CallMessage,
+        _urgency: SignalingMessageUrgency,
+        _expiration: u64,
+        _recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
+    ) {
+        unimplemented!()
+    }
+
     fn handle_incoming_video_track(
         &mut self,
         _client_id: ClientId,
@@ -110,8 +127,8 @@ impl group_call::Observer for Observer {
         info!("Got a video track for {}", sender_demux_id);
     }
 
-    fn handle_ended(&self, _client_id: ClientId, reason: EndReason) {
-        info!("Ended with reason {:?}", reason);
+    fn handle_ended(&self, _client_id: ClientId, reason: CallEndReason, summary: CallSummary) {
+        info!("Ended with reason {:?}, summary: {:?}", reason, summary);
     }
 
     fn handle_network_route_changed(
@@ -120,6 +137,14 @@ impl group_call::Observer for Observer {
         _network_route: ringrtc::webrtc::peer_connection_observer::NetworkRoute,
     ) {
         // ignore
+    }
+
+    fn handle_send_rates_changed(&self, _client_id: ClientId, _send_rates: SendRates) {
+        todo!()
+    }
+
+    fn handle_speaking_notification(&mut self, _client_id: ClientId, event: SpeechEvent) {
+        info!("Speaking {:?}", event);
     }
 
     fn handle_audio_levels(
@@ -145,6 +170,23 @@ impl group_call::Observer for Observer {
 
     fn handle_rtc_stats_report(&self, _report_json: String) {
         // ignore
+    }
+
+    fn handle_remote_mute_request(&self, _client_id: ClientId, _mute_source: DemuxId) {
+        // ignore
+    }
+
+    fn handle_observed_remote_mute(
+        &self,
+        _client_id: ClientId,
+        _mute_source: DemuxId,
+        _mute_target: DemuxId,
+    ) {
+        // ignore
+    }
+
+    fn handle_endorsements_update(&self, _client_id: ClientId, update: EndorsementUpdateResultRef) {
+        info!("Received Endorsement Update {:?}", update);
     }
 }
 
@@ -202,12 +244,20 @@ fn main() {
         url.to_string(),
         None,
         None,
+        None,
         hkdf_extra_info,
     ));
     let observer = Observer::default();
-    let peer_connection_factory =
-        PeerConnectionFactory::new(&peer_connection_factory::AudioConfig::default(), false)
-            .unwrap();
+    let mut peer_connection_factory = PeerConnectionFactory::new(
+        &peer_connection_factory::AudioConfig::default(),
+        false,
+        "",
+        None,
+    )
+    .unwrap();
+
+    set_default_audio_devices(&mut peer_connection_factory).unwrap();
+
     let outgoing_audio_track = peer_connection_factory
         .create_outgoing_audio_track()
         .unwrap();
@@ -219,21 +269,28 @@ fn main() {
         .unwrap();
     let busy = Arc::new(CallMutex::new(false, "busy"));
     let self_uuid = Arc::new(CallMutex::new(None, "self_uuid"));
-    let client = group_call::Client::start(
+    let obfuscated_resolver = ObfuscatedResolver::new(Arc::new(MemberMap::new(&[])), None, None);
+
+    let client = group_call::Client::start(group_call::ClientStartParams {
         group_id,
-        1,
-        group_call::GroupCallKind::SignalGroup,
+        client_id: 1,
+        kind: group_call::GroupCallKind::SignalGroup,
         sfu_client,
-        Box::new(observer.clone()),
+        obfuscated_resolver,
+        observer: Box::new(observer.clone()),
         busy,
         self_uuid,
-        None,
+        peer_connection_factory: None,
         outgoing_audio_track,
-        Some(outgoing_video_track.clone()),
-        Some(Box::new(observer.clone())),
-        None,
-        None,
-    )
+        outgoing_video_track: Some(outgoing_video_track.clone()),
+        incoming_video_sink: Some(Box::new(observer.clone())),
+        ring_id: None,
+        audio_levels_interval: None,
+        dred_duration: 0,
+        group_send_endorsement_cache: None,
+        asset_registry: AssetRegistry::default(),
+        svc_config: None,
+    })
     .unwrap();
 
     let send_rate_override = DataRate::from_mbps(10);

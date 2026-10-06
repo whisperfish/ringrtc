@@ -5,26 +5,26 @@
 
 //! WebRTC Peer Connection Observer
 
-use libc::size_t;
-use std::ffi::CStr;
-use std::marker::PhantomData;
-use std::net::SocketAddr;
-use std::os::raw::c_char;
-use std::slice;
-use std::time::SystemTime;
-
-use crate::common::{Result, RingBench};
-use crate::core::signaling;
-use crate::core::util::redact_string;
-use crate::error::RingRtcError;
-use crate::lite::sfu::DemuxId;
-use crate::webrtc;
-use crate::webrtc::media::{
-    AudioTrack, MediaStream, RffiAudioTrack, RffiMediaStream, RffiVideoFrameBuffer, RffiVideoTrack,
-    VideoFrame, VideoFrameMetadata, VideoTrack,
+use std::{
+    ffi::CStr, marker::PhantomData, net::SocketAddr, os::raw::c_char, slice, time::SystemTime,
 };
-use crate::webrtc::network::RffiIpPort;
-use crate::webrtc::rtp;
+
+use libc::size_t;
+
+use crate::{
+    common::{Result, RingBench},
+    core::{signaling, util::redact_string},
+    error::RingRtcError,
+    lite::sfu::DemuxId,
+    webrtc,
+    webrtc::{
+        media::{
+            AudioTrack, MediaStream, RffiAudioTrack, RffiMediaStream, RffiVideoFrameBuffer,
+            RffiVideoTrack, VideoFrame, VideoFrameMetadata, VideoTrack,
+        },
+        network::RffiIpPort,
+    },
+};
 
 /// Rust version of WebRTC RTCIceConnectionState enum
 ///
@@ -92,6 +92,19 @@ pub enum NetworkAdapterType {
     Cellular5G = 1 << 9,
 }
 
+impl NetworkAdapterType {
+    pub fn is_cellular(&self) -> bool {
+        matches!(
+            self,
+            Self::Cellular
+                | Self::Cellular2G
+                | Self::Cellular3G
+                | Self::Cellular4G
+                | Self::Cellular5G
+        )
+    }
+}
+
 /// Ice Network Route structure passed between Rust and C++.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -104,7 +117,6 @@ pub struct NetworkRoute {
 }
 
 /// The callbacks from C++ will ultimately go to an impl of this.
-/// I can't think of a better name :).
 pub trait PeerConnectionObserverTrait {
     fn log_id(&self) -> &dyn std::fmt::Display;
 
@@ -115,7 +127,7 @@ pub trait PeerConnectionObserverTrait {
         sdp_for_logging: &str,
         relay_protocol: Option<webrtc::peer_connection_observer::TransportProtocol>,
     ) -> Result<()>;
-    fn handle_ice_candidates_removed(&mut self, removed_addresses: Vec<SocketAddr>) -> Result<()>;
+    fn handle_ice_candidate_removed(&mut self, removed_address: SocketAddr) -> Result<()>;
     fn handle_ice_connection_state_changed(&mut self, new_state: IceConnectionState) -> Result<()>;
     fn handle_ice_network_route_changed(&mut self, network_route: NetworkRoute) -> Result<()>;
 
@@ -144,12 +156,6 @@ pub trait PeerConnectionObserverTrait {
         Ok(())
     }
 
-    // RTP data events
-    // Warning: this runs on the WebRTC network thread, so doing anything that
-    // would block is dangerous, especially taking a lock that is also taken
-    // while calling something that blocks on the network thread.
-    fn handle_rtp_received(&mut self, header: rtp::Header, data: &[u8]);
-
     // Frame encryption
     // Defaults allow an impl to not support E2EE
     fn get_media_ciphertext_buffer_size(
@@ -159,12 +165,7 @@ pub trait PeerConnectionObserverTrait {
     ) -> usize {
         0
     }
-    fn encrypt_media(
-        &mut self,
-        _is_audio: bool,
-        _plaintext: &[u8],
-        _ciphertext_buffer: &mut [u8],
-    ) -> Result<usize> {
+    fn encrypt_media(&mut self, _plaintext: &[u8], _ciphertext_buffer: &mut [u8]) -> Result<usize> {
         Err(RingRtcError::FailedToEncrypt.into())
     }
     fn get_media_plaintext_buffer_size(
@@ -178,10 +179,8 @@ pub trait PeerConnectionObserverTrait {
     fn decrypt_media(
         &mut self,
         _track_id: u32,
-        _is_audio: bool,
         _ciphertext: &[u8],
         _plaintext_buffer: &mut [u8],
-        _has_encrypted_media_header: bool,
     ) -> Result<usize> {
         Err(RingRtcError::FailedToDecrypt.into())
     }
@@ -190,7 +189,7 @@ pub trait PeerConnectionObserverTrait {
 /// PeerConnectionObserver OnIceCandidate() callback.
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_OnIceCandidate<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     cpp_candidate: webrtc::ptr::Borrowed<CppIceCandidate>,
 ) where
     T: PeerConnectionObserverTrait,
@@ -227,46 +226,30 @@ extern "C" fn pc_observer_OnIceCandidate<T>(
     }
 }
 
-/// PeerConnectionObserver OnIceCandidatesRemoved() callback.
+/// PeerConnectionObserver OnIceCandidateRemoved() callback.
 #[allow(non_snake_case)]
-extern "C" fn pc_observer_OnIceCandidatesRemoved<T>(
-    observer: webrtc::ptr::Borrowed<T>,
-    removed_addresses: webrtc::ptr::Borrowed<RffiIpPort>,
-    length: size_t,
+extern "C" fn pc_observer_OnIceCandidateRemoved<T>(
+    mut observer: webrtc::ptr::Borrowed<T>,
+    removed_address: RffiIpPort,
 ) where
     T: PeerConnectionObserverTrait,
 {
     // Safe because the observer should still be alive (it was just passed to us)
     if let Some(observer) = unsafe { observer.as_mut() } {
-        info!("pc_observer_OnIceCandidatesRemoved: {}", observer.log_id());
-
-        if removed_addresses.is_null() {
-            if length > 0 {
-                warn!("ICE candidates removed is null");
-            }
-            return;
-        }
-
-        trace!("pc_observer_OnIceCandidatesRemoved(): length: {}", length);
-
-        let removed_addresses =
-            unsafe { slice::from_raw_parts(removed_addresses.as_ptr(), length) }
-                .iter()
-                .map(|address| address.into())
-                .collect();
+        info!("pc_observer_OnIceCandidateRemoved: {}", observer.log_id());
 
         observer
-            .handle_ice_candidates_removed(removed_addresses)
-            .unwrap_or_else(|e| error!("Problems handling ice candidates removed: {}", e));
+            .handle_ice_candidate_removed((&removed_address).into())
+            .unwrap_or_else(|e| error!("Problems handling ice candidate removed: {}", e));
     } else {
-        error!("pc_observer_OnIceCandidatesRemoved called with null observer");
+        error!("pc_observer_OnIceCandidateRemoved called with null observer");
     }
 }
 
 /// PeerConnectionObserver OnIceConnectionChange() callback.
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_OnIceConnectionChange<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     new_state: IceConnectionState,
 ) where
     T: PeerConnectionObserverTrait,
@@ -294,7 +277,7 @@ extern "C" fn pc_observer_OnIceConnectionChange<T>(
 /// PeerConnectionObserver OnIceSelectedCandidatePairChanged() callback.
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_OnIceNetworkRouteChange<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     network_route: NetworkRoute,
     local_description: webrtc::ptr::Borrowed<c_char>,
     remote_description: webrtc::ptr::Borrowed<c_char>,
@@ -336,7 +319,7 @@ extern "C" fn pc_observer_OnIceNetworkRouteChange<T>(
 /// PeerConnectionObserver OnAddStream() callback.
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_OnAddStream<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     rffi_stream: webrtc::ptr::OwnedRc<RffiMediaStream>,
 ) where
     T: PeerConnectionObserverTrait,
@@ -360,7 +343,7 @@ extern "C" fn pc_observer_OnAddStream<T>(
 /// PeerConnectionObserver OnAddTrack() callback for audio tracks.
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_OnAddAudioRtpReceiver<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     rffi_track: webrtc::ptr::OwnedRc<RffiAudioTrack>,
 ) where
     T: PeerConnectionObserverTrait,
@@ -385,7 +368,7 @@ extern "C" fn pc_observer_OnAddAudioRtpReceiver<T>(
 /// PeerConnectionObserver OnAddTrack() callback for video tracks.
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_OnAddVideoRtpReceiver<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     rffi_track: webrtc::ptr::OwnedRc<RffiVideoTrack>,
     demux_id: u32,
 ) where
@@ -441,39 +424,8 @@ extern "C" fn pc_observer_OnVideoFrame<T>(
 }
 
 #[allow(non_snake_case)]
-extern "C" fn pc_observer_OnRtpReceived<T>(
-    observer: webrtc::ptr::Borrowed<T>,
-    pt: u8,
-    seqnum: u16,
-    timestamp: u32,
-    ssrc: u32,
-    payload_data: webrtc::ptr::Borrowed<u8>,
-    payload_size: size_t,
-) where
-    T: PeerConnectionObserverTrait,
-{
-    if payload_data.is_null() {
-        return;
-    }
-
-    // Safe because the observer should still be alive (it was just passed to us)
-    if let Some(observer) = unsafe { observer.as_mut() } {
-        let header = rtp::Header {
-            pt,
-            seqnum,
-            timestamp,
-            ssrc,
-        };
-        let payload = unsafe { slice::from_raw_parts(payload_data.as_ptr(), payload_size) };
-        observer.handle_rtp_received(header, payload)
-    } else {
-        error!("pc_observer_OnRtpReceived called with null observer");
-    }
-}
-
-#[allow(non_snake_case)]
 extern "C" fn pc_observer_GetMediaCiphertextBufferSize<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     is_audio: bool,
     plaintext_size: size_t,
 ) -> size_t
@@ -482,8 +434,7 @@ where
 {
     trace!(
         "pc_observer_GetMediaCiphertextBufferSize(): is_audio: {} plaintext_size: {}",
-        is_audio,
-        plaintext_size
+        is_audio, plaintext_size
     );
 
     // Safe because the observer should still be alive (it was just passed to us)
@@ -497,8 +448,7 @@ where
 
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_EncryptMedia<T>(
-    observer: webrtc::ptr::Borrowed<T>,
-    is_audio: bool,
+    mut observer: webrtc::ptr::Borrowed<T>,
     plaintext: webrtc::ptr::Borrowed<u8>,
     plaintext_size: size_t,
     ciphertext_out: *mut u8,
@@ -514,10 +464,8 @@ where
     }
 
     trace!(
-        "pc_observer_EncryptMedia(): is_audio: {} plaintext_size: {}, ciphertext_out_size: {}",
-        is_audio,
-        plaintext_size,
-        ciphertext_out_size
+        "pc_observer_EncryptMedia(): plaintext_size: {}, ciphertext_out_size: {}",
+        plaintext_size, ciphertext_out_size
     );
 
     // Safe because the observer should still be alive (it was just passed to us)
@@ -525,7 +473,7 @@ where
         let plaintext = unsafe { slice::from_raw_parts(plaintext.as_ptr(), plaintext_size) };
         let ciphertext = unsafe { slice::from_raw_parts_mut(ciphertext_out, ciphertext_out_size) };
 
-        match observer.encrypt_media(is_audio, plaintext, ciphertext) {
+        match observer.encrypt_media(plaintext, ciphertext) {
             Ok(size) => {
                 unsafe {
                     *ciphertext_size_out = size;
@@ -542,7 +490,7 @@ where
 
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_GetMediaPlaintextBufferSize<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     track_id: u32,
     is_audio: bool,
     ciphertext_size: size_t,
@@ -552,9 +500,7 @@ where
 {
     trace!(
         "pc_observer_GetMediaPlaintextBufferSize(): track_id: {}, is_audio: {} ciphertext_size: {}",
-        track_id,
-        is_audio,
-        ciphertext_size
+        track_id, is_audio, ciphertext_size
     );
 
     // Safe because the observer should still be alive (it was just passed to us)
@@ -568,15 +514,13 @@ where
 
 #[allow(non_snake_case)]
 extern "C" fn pc_observer_DecryptMedia<T>(
-    observer: webrtc::ptr::Borrowed<T>,
+    mut observer: webrtc::ptr::Borrowed<T>,
     track_id: u32,
-    is_audio: bool,
     ciphertext: webrtc::ptr::Borrowed<u8>,
     ciphertext_size: usize,
     plaintext_out: *mut u8,
     plaintext_out_size: size_t,
     plaintext_size_out: *mut size_t,
-    has_encrypted_media_header: bool,
 ) -> bool
 where
     T: PeerConnectionObserverTrait,
@@ -590,13 +534,7 @@ where
         let ciphertext = unsafe { slice::from_raw_parts(ciphertext.as_ptr(), ciphertext_size) };
         let plaintext = unsafe { slice::from_raw_parts_mut(plaintext_out, plaintext_out_size) };
 
-        match observer.decrypt_media(
-            track_id,
-            is_audio,
-            ciphertext,
-            plaintext,
-            has_encrypted_media_header,
-        ) {
+        match observer.decrypt_media(track_id, ciphertext, plaintext) {
             Ok(size) => {
                 unsafe {
                     *plaintext_size_out = size;
@@ -623,8 +561,7 @@ where
 {
     // ICE events
     onIceCandidate: extern "C" fn(webrtc::ptr::Borrowed<T>, webrtc::ptr::Borrowed<CppIceCandidate>),
-    onIceCandidatesRemoved:
-        extern "C" fn(webrtc::ptr::Borrowed<T>, webrtc::ptr::Borrowed<RffiIpPort>, size_t),
+    onIceCandidateRemoved: extern "C" fn(webrtc::ptr::Borrowed<T>, RffiIpPort),
     onIceConnectionChange: extern "C" fn(webrtc::ptr::Borrowed<T>, IceConnectionState),
     onIceNetworkRouteChange: extern "C" fn(
         webrtc::ptr::Borrowed<T>,
@@ -646,22 +583,10 @@ where
         webrtc::ptr::OwnedRc<RffiVideoFrameBuffer>,
     ),
 
-    // RTP data events
-    onRtpReceived: extern "C" fn(
-        webrtc::ptr::Borrowed<T>,
-        u8,
-        u16,
-        u32,
-        u32,
-        webrtc::ptr::Borrowed<u8>,
-        size_t,
-    ),
-
     // Frame encryption
     getMediaCiphertextBufferSize: extern "C" fn(webrtc::ptr::Borrowed<T>, bool, size_t) -> size_t,
     encryptMedia: extern "C" fn(
         webrtc::ptr::Borrowed<T>,
-        bool,
         webrtc::ptr::Borrowed<u8>,
         size_t,
         *mut u8,
@@ -673,13 +598,11 @@ where
     decryptMedia: extern "C" fn(
         webrtc::ptr::Borrowed<T>,
         u32,
-        bool,
         webrtc::ptr::Borrowed<u8>,
         size_t,
         *mut u8,
         size_t,
         *mut size_t,
-        bool,
     ) -> bool,
 }
 
@@ -687,7 +610,6 @@ where
 use crate::webrtc::ffi::peer_connection_observer as pc_observer;
 #[cfg(not(feature = "sim"))]
 pub use crate::webrtc::ffi::peer_connection_observer::RffiPeerConnectionObserver;
-
 #[cfg(feature = "sim")]
 use crate::webrtc::sim::peer_connection_observer as pc_observer;
 #[cfg(feature = "sim")]
@@ -726,7 +648,7 @@ where
         let pc_observer_callbacks = PeerConnectionObserverCallbacks::<T> {
             // ICE events
             onIceCandidate: pc_observer_OnIceCandidate::<T>,
-            onIceCandidatesRemoved: pc_observer_OnIceCandidatesRemoved::<T>,
+            onIceCandidateRemoved: pc_observer_OnIceCandidateRemoved::<T>,
             onIceConnectionChange: pc_observer_OnIceConnectionChange::<T>,
             onIceNetworkRouteChange: pc_observer_OnIceNetworkRouteChange::<T>,
 
@@ -741,9 +663,6 @@ where
             // Used for group calls.
             onAddVideoRtpReceiver: pc_observer_OnAddVideoRtpReceiver::<T>,
             onVideoFrame: pc_observer_OnVideoFrame::<T>,
-
-            // RTP data events
-            onRtpReceived: pc_observer_OnRtpReceived::<T>,
 
             // Frame encryption
             getMediaCiphertextBufferSize: pc_observer_GetMediaCiphertextBufferSize::<T>,

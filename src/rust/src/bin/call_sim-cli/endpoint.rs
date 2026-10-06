@@ -6,28 +6,41 @@
 mod direct_call_sim;
 mod group_call_sim;
 
+use core::unimplemented;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::mpsc::Sender,
+    time::{Duration, Instant},
+};
+
 use direct_call_sim::DirectCall;
+use group_call_sim::GroupCall;
 use log::*;
 use ringrtc::{
+    bin::utils::audio::set_default_audio_devices,
     common::{
-        actor::{Actor, Stopper},
         CallConfig, CallId, CallMediaType, DeviceId, Result,
+        actor::{Actor, Stopper},
     },
-    core::{call_manager::CallManager, group_call, signaling},
-    lite::{http, sfu::UserId},
+    core::{
+        call_manager::CallManager,
+        group_call::{self, GroupId},
+        signaling,
+        util::uuid_to_string,
+    },
+    lite::{
+        http::{self, Client, sim::HttpClient},
+        sfu::{GroupMember, UserId},
+    },
     native::{NativeCallContext, NativePlatform, PeerId, SignalingSender},
     webrtc::{
         media::{AudioTrack, VideoSink, VideoSource, VideoTrack},
         peer_connection_factory::{AudioConfig, IceServer, PeerConnectionFactory},
     },
 };
-use std::{collections::HashSet, sync::mpsc::Sender, time::Duration};
 
-use crate::{
-    network::DeterministicLossNetwork,
-    server::Server,
-    video::{LoggingVideoSink, VideoInput},
-};
+use crate::{network::DeterministicLossNetwork, relay::SignalingRelay, util, video::VideoInput};
+
 /// Used to optionally sync operations with the user layer.
 #[derive(Default)]
 pub struct EventSync {
@@ -42,8 +55,11 @@ pub struct EventSync {
 pub struct CallEndpoint {
     // We keep a copy of these outside of the actor state
     // so we can know them in any thread.
-    pub peer_id: PeerId,
+    pub name: String,
     pub device_id: DeviceId,
+    // Our uuid that we can identify ourselves with to the SFU
+    // and so our group_call_messages are properly identified
+    pub user_id: Option<UserId>,
     // There is probably a way to have a CallEndpoint without a thread,
     // but this is the easiest way to get around the nasty dependency cycle
     // of CallEndpoint -> CallManger -> NativePlatform -> CallEndpoint.
@@ -52,11 +68,10 @@ pub struct CallEndpoint {
 }
 
 struct CallEndpointState {
-    peer_id: PeerId,
     device_id: DeviceId,
 
     // How we send and receive signaling
-    signaling_server: Box<dyn Server + Send + 'static>,
+    signaling_server: Box<dyn SignalingRelay + Send + 'static>,
     // How we control calls
     call_manager: CallManager<NativePlatform>,
     // Events that can be used to signal the user layer (for latches there).
@@ -64,136 +79,161 @@ struct CallEndpointState {
 
     // Keep a copy around to be able to schedule video frames
     actor: Actor<Self>,
-    // Keep a copy around to be able to push out video frames
+
+    // Media related fields
     outgoing_video_source: VideoSource,
     outgoing_video_track: VideoTrack,
     outgoing_audio_track: AudioTrack,
     incoming_video_sink: Box<dyn VideoSink>,
 
+    // connection related resources
+    peer_connection_factory: PeerConnectionFactory,
+    delegate_http_client: HttpClient,
     network: Option<DeterministicLossNetwork>,
 
     direct_call: Option<DirectCall>,
+    group_call: Option<GroupCall>,
+    // How we look up members of a group
+    group_directory: HashMap<GroupId, Vec<GroupMember>>,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl CallEndpoint {
     pub fn new(
-        peer_id: &str,
+        name: &str,
         device_id: DeviceId,
+        user_id: Option<UserId>,
         audio_config: &AudioConfig,
-        signaling_server: Box<dyn Server + Send + 'static>,
+        signaling_server: Box<dyn SignalingRelay + Send + 'static>,
         stopper: &Stopper,
         event_sync: EventSync,
-        incoming_video_sink: Option<Box<dyn VideoSink>>,
+        incoming_video_sink: Box<dyn VideoSink>,
         use_injectable_network: bool,
+        field_trials: &str,
     ) -> Result<Self> {
-        let peer_id = PeerId::from(peer_id);
         let audio_config = audio_config.clone();
+        let name = name.to_owned();
+        let field_trials = field_trials.to_string();
 
         Ok(Self::from_actor(
-            peer_id.clone(),
+            name.clone(),
             device_id,
-            Actor::start(
-                format!("endpoint-{peer_id}"),
-                stopper.clone(),
-                move |actor| {
-                    // Constructing this is a funny way of getting a clone of the CallEndpoint
-                    // on the actor's thread so we can have it in the actor's state so we can
-                    // pass it to the NativePlatform/CallManager.
-                    // This is a little weird, but it seems nicer than doing some kind of
-                    // Option<CallManager> thing that we have to set later.
-                    let endpoint = Self::from_actor(peer_id.clone(), device_id, actor.clone());
+            user_id.clone(),
+            Actor::start(format!("endpoint-{name}"), stopper.clone(), move |actor| {
+                // Constructing this is a funny way of getting a clone of the CallEndpoint
+                // on the actor's thread so we can have it in the actor's state so we can
+                // pass it to the NativePlatform/CallManager.
+                // This is a little weird, but it seems nicer than doing some kind of
+                // Option<CallManager> thing that we have to set later.
+                let endpoint =
+                    Self::from_actor(name.clone(), device_id, user_id.clone(), actor.clone());
 
-                    let mut pcf =
-                        PeerConnectionFactory::new(&audio_config, use_injectable_network)?;
-                    info!(
-                        "Audio playout devices: {:?}",
-                        pcf.get_audio_playout_devices()
-                    );
-                    info!(
-                        "Audio recording devices: {:?}",
-                        pcf.get_audio_recording_devices()
-                    );
+                let mut peer_connection_factory = PeerConnectionFactory::new(
+                    &audio_config,
+                    use_injectable_network,
+                    &field_trials,
+                    None,
+                )?;
 
-                    // Set up signaling/state
-                    signaling_server.register(&endpoint);
-                    let signaling_sender = Box::new(endpoint.clone());
-                    let should_assume_messages_sent = true; // cli doesn't support async sending yet.
-                    let state_handler = Box::new(endpoint.clone());
+                set_default_audio_devices(&mut peer_connection_factory).unwrap();
 
-                    // Fill in fake group call things
-                    let http_client = http::DelegatingClient::new(endpoint.clone());
-                    let group_handler = Box::new(endpoint);
+                // Set up signaling/state
+                signaling_server.register(&endpoint);
+                let signaling_sender = Box::new(endpoint.clone());
+                let should_assume_messages_sent = true; // cli doesn't support async sending yet.
+                let state_handler = Box::new(endpoint.clone());
 
-                    let platform = NativePlatform::new(
-                        pcf.clone(),
-                        signaling_sender,
-                        should_assume_messages_sent,
-                        state_handler,
-                        group_handler,
-                    );
-                    let call_manager = CallManager::new(platform, http_client)?;
+                // Fill in group call things
+                let delegate_http_client = HttpClient::start();
+                let http_client = http::DelegatingClient::new(endpoint.clone());
+                let group_handler = Box::new(endpoint);
 
-                    // Initialize media. We'll use the same for each call.
-                    let outgoing_audio_track = pcf.create_outgoing_audio_track()?;
-                    let outgoing_video_source = pcf.create_outgoing_video_source()?;
-                    let outgoing_video_track =
-                        pcf.create_outgoing_video_track(&outgoing_video_source)?;
-                    let incoming_video_sink = incoming_video_sink.unwrap_or_else(|| {
-                        Box::new(LoggingVideoSink {
-                            peer_id: peer_id.clone(),
-                        })
-                    });
+                let platform = NativePlatform::new(
+                    peer_connection_factory.clone(),
+                    signaling_sender,
+                    should_assume_messages_sent,
+                    state_handler,
+                    group_handler,
+                );
+                let call_manager = CallManager::new(platform, http_client)?;
 
-                    let network = if use_injectable_network {
-                        Some(DeterministicLossNetwork::new(
-                            pcf.injectable_network().expect("get Injectable Network"),
-                        ))
-                    } else {
-                        None
-                    };
+                // Initialize media. We'll use the same for each call.
+                let outgoing_audio_track = peer_connection_factory.create_outgoing_audio_track()?;
+                let outgoing_video_source =
+                    peer_connection_factory.create_outgoing_video_source()?;
+                let outgoing_video_track =
+                    peer_connection_factory.create_outgoing_video_track(&outgoing_video_source)?;
 
-                    Ok(CallEndpointState {
-                        peer_id,
-                        device_id,
+                let network = if use_injectable_network {
+                    Some(DeterministicLossNetwork::new(
+                        peer_connection_factory
+                            .injectable_network()
+                            .expect("get Injectable Network"),
+                    ))
+                } else {
+                    None
+                };
 
-                        signaling_server,
-                        call_manager,
-                        event_sync,
+                Ok(CallEndpointState {
+                    device_id,
 
-                        actor,
+                    signaling_server,
+                    call_manager,
+                    event_sync,
 
-                        outgoing_video_source,
-                        outgoing_video_track,
-                        outgoing_audio_track,
-                        incoming_video_sink,
+                    actor,
 
-                        network,
+                    outgoing_video_source,
+                    outgoing_video_track,
+                    outgoing_audio_track,
+                    incoming_video_sink,
 
-                        direct_call: None,
-                    })
-                },
-            )?,
+                    peer_connection_factory,
+                    delegate_http_client,
+                    network,
+
+                    direct_call: None,
+                    group_call: None,
+                    group_directory: HashMap::new(),
+                })
+            })?,
         ))
     }
 
-    fn from_actor(peer_id: PeerId, device_id: DeviceId, actor: Actor<CallEndpointState>) -> Self {
+    fn from_actor(
+        name: String,
+        device_id: DeviceId,
+        user_id: Option<UserId>,
+        actor: Actor<CallEndpointState>,
+    ) -> Self {
         Self {
-            peer_id,
+            name: name.to_string(),
             device_id,
+            user_id,
             actor,
         }
+    }
+
+    pub fn peer_id(&self) -> PeerId {
+        self.user_id
+            .as_ref()
+            .map_or(self.name.to_string(), |id| uuid_to_string(id))
+    }
+
+    /// append device number so relay broadcast goes to user's other devices
+    pub fn relay_id(&self) -> String {
+        format!("{}:{}", self.peer_id(), self.device_id)
     }
 
     /// Initializes state used in direct calls
     pub fn init_direct_settings(
         &mut self,
         hide_ip: bool,
-        ice_server: &IceServer,
+        ice_servers: &[IceServer],
         call_config: CallConfig,
     ) {
         // To send across threads
-        let ice_servers = vec![ice_server.clone()];
+        let ice_servers = ice_servers.to_vec();
 
         self.actor.send(move |state| {
             let call_context = NativeCallContext::new(
@@ -205,6 +245,13 @@ impl CallEndpoint {
             );
 
             state.direct_call = Some(DirectCall::new(call_context, call_config));
+        });
+    }
+
+    /// Initializes state used in group calls
+    pub fn init_group_settings(&mut self, group_directory: HashMap<GroupId, Vec<GroupMember>>) {
+        self.actor.send(move |state| {
+            state.group_directory = group_directory;
         });
     }
 
@@ -238,25 +285,24 @@ impl CallEndpoint {
         let callee_id = callee_id.clone();
 
         self.actor.send(move |state| {
-            state
-                .call_manager
-                .create_outgoing_call(callee_id, call_id, media_type, local_device_id)
-                .expect("start outgoing call");
+            state.call_manager.create_outgoing_call(
+                callee_id,
+                call_id,
+                media_type,
+                local_device_id,
+            );
         });
     }
 
     pub fn accept_incoming_direct_call(&self, call_id: CallId) {
         self.actor.send(move |state| {
-            state
-                .call_manager
-                .accept_call(call_id)
-                .expect("accept incoming call");
+            state.call_manager.accept_call(call_id);
         });
     }
 
     pub fn hangup(&self) {
         self.actor.send(move |state| {
-            state.call_manager.hangup().expect("hangup");
+            state.call_manager.hangup();
         });
     }
 
@@ -272,28 +318,27 @@ impl CallEndpoint {
         let sender_id = sender_id.clone();
 
         let sender_identity_key = sender_id.as_bytes().to_vec();
-        let receiver_identity_key = self.peer_id.as_bytes().to_vec();
+        let receiver_identity_key = self.peer_id().as_bytes().to_vec();
         self.actor.send(move |state| {
             let cm = &mut state.call_manager;
             match msg {
                 signaling::Message::Offer(offer) => {
                     cm.received_offer(
-                        sender_id,
+                        PeerId::from("dummy"),
                         call_id,
                         signaling::ReceivedOffer {
                             offer,
                             age: Duration::from_secs(0),
                             sender_device_id,
                             receiver_device_id: state.device_id,
-                            receiver_device_is_primary: (state.device_id == 1),
                             sender_identity_key,
                             receiver_identity_key,
                         },
-                    )
-                    .expect("receive offer");
+                    );
                 }
                 signaling::Message::Answer(answer) => {
                     cm.received_answer(
+                        PeerId::from("dummy"),
                         call_id,
                         signaling::ReceivedAnswer {
                             answer,
@@ -301,34 +346,62 @@ impl CallEndpoint {
                             sender_identity_key,
                             receiver_identity_key,
                         },
-                    )
-                    .expect("received answer");
+                    );
                 }
                 signaling::Message::Ice(ice) => {
                     cm.received_ice(
+                        PeerId::from("dummy"),
                         call_id,
                         signaling::ReceivedIce {
                             ice,
                             sender_device_id,
                         },
-                    )
-                    .expect("received ice candidates");
+                    );
                 }
                 signaling::Message::Hangup(hangup) => {
                     cm.received_hangup(
+                        PeerId::from("dummy"),
                         call_id,
                         signaling::ReceivedHangup {
                             hangup,
                             sender_device_id,
                         },
-                    )
-                    .expect("received hangup");
+                    );
                 }
                 signaling::Message::Busy => {
-                    cm.received_busy(call_id, signaling::ReceivedBusy { sender_device_id })
-                        .expect("received busy");
+                    cm.received_busy(
+                        PeerId::from("dummy"),
+                        call_id,
+                        signaling::ReceivedBusy { sender_device_id },
+                    );
                 }
             }
+        });
+    }
+
+    pub fn receive_call_message(
+        &self,
+        sender_id: &PeerId,
+        sender_device_id: DeviceId,
+        received_at: Instant,
+        group_message: Vec<u8>,
+    ) {
+        info!(
+            "Received call message from sender `{}` on device {}",
+            sender_id, sender_device_id
+        );
+
+        let sender_uuid = util::string_to_uuid(sender_id).expect("sender_id is valid uuid");
+        self.actor.send(move |state| {
+            let local_device_id = state.device_id;
+            state.call_manager.received_call_message(
+                sender_uuid,
+                // these two arguments are ignored
+                sender_device_id,
+                local_device_id,
+                group_message,
+                received_at.elapsed(),
+            );
         });
     }
 
@@ -364,43 +437,114 @@ impl SignalingSender for CallEndpoint {
     ) -> Result<()> {
         // To send across threads
         let recipient_id = recipient_id.to_string();
+        let sender_id = self.peer_id();
 
         self.actor.send(move |state| {
-            let sender_id = &state.peer_id;
-            let sender_device_id = state.device_id;
-            state
-                .signaling_server
-                .send(sender_id, sender_device_id, &recipient_id, call_id, msg);
-            state
-                .call_manager
-                .message_sent(call_id)
-                .expect("signaling message sent");
+            state.signaling_server.send_signaling(
+                &sender_id,
+                state.device_id,
+                &recipient_id,
+                call_id,
+                msg,
+            );
+            state.call_manager.message_sent(call_id);
         });
         Ok(())
     }
 
     fn send_call_message(
         &self,
-        _recipient_id: UserId,
-        _message: Vec<u8>,
+        recipient_id: UserId,
+        message: Vec<u8>,
         _urgency: group_call::SignalingMessageUrgency,
     ) -> Result<()> {
-        unimplemented!()
+        let sender_id = self.peer_id();
+        self.actor.send(move |state| {
+            let sender_device_id = state.device_id;
+            state.signaling_server.send_call_message(
+                &sender_id,
+                sender_device_id,
+                recipient_id,
+                message,
+            )
+        });
+
+        Ok(())
     }
 
     fn send_call_message_to_group(
         &self,
-        _group_id: group_call::GroupId,
+        group_id: group_call::GroupId,
+        message: Vec<u8>,
+        _urgency: group_call::SignalingMessageUrgency,
+        recipients_override: HashSet<UserId>,
+    ) -> Result<()> {
+        let sender_id = self.peer_id();
+        let self_user_id = self.user_id.clone();
+
+        self.actor.send(move |state| {
+            let recipients: Vec<UserId> = if recipients_override.is_empty() {
+                match state.group_directory.get(&group_id) {
+                    Some(members) => members
+                        .iter()
+                        .filter(|member| Some(&member.user_id) != self_user_id.as_ref())
+                        .map(|member| member.user_id.clone())
+                        .collect(),
+                    None => {
+                        error!(
+                            "Could not resolve group members, group not found in directory; dropping message"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                recipients_override.into_iter().collect()
+            };
+
+            let sender_device_id = state.device_id;
+            for recipient_id in recipients {
+                state.signaling_server.send_call_message(
+                    &sender_id,
+                    sender_device_id,
+                    recipient_id,
+                    message.clone(),
+                );
+            }
+        });
+
+        Ok(())
+    }
+
+    #[allow(clippy::disallowed_macros)]
+    fn send_call_message_to_adhoc_group(
+        &self,
         _message: Vec<u8>,
         _urgency: group_call::SignalingMessageUrgency,
-        _recipients_override: HashSet<UserId>,
+        _expiration: u64,
+        _recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
     ) -> Result<()> {
-        unimplemented!()
+        // Dropping the message degrades the call; panicking here would tear down the
+        // PeerConnection and break the rest of the test run.
+        error!("Asked to send call message adhoc group, but is not implemented yet");
+        unimplemented!("Have not implemented send_call_message_to_adhoc_group");
     }
 }
 
 impl http::Delegate for CallEndpoint {
-    fn send_request(&self, _request_id: u32, _request: http::Request) {
-        unimplemented!()
+    fn send_request(&self, request_id: u32, request: http::Request) {
+        let endpoint = self.clone();
+
+        self.actor.send(move |state| {
+            state.delegate_http_client.send_request(
+                request,
+                Box::new(move |response| {
+                    endpoint.actor.send(move |state| {
+                        state
+                            .call_manager
+                            .received_http_response(request_id, response);
+                    });
+                }),
+            );
+        });
     }
 }

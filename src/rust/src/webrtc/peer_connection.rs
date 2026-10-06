@@ -4,33 +4,35 @@
 //
 
 //! WebRTC Peer Connection Interface
-use std::ffi::CString;
-use std::net::SocketAddr;
+use std::{ffi::CString, net::SocketAddr};
 
-use crate::common::{units::DataRate, Result};
-use crate::core::util::redact_string;
-use crate::error::RingRtcError;
-use crate::webrtc;
-use crate::webrtc::ice_gatherer::IceGatherer;
-use crate::webrtc::media::AudioEncoderConfig;
-use crate::webrtc::network::RffiIpPort;
-use crate::webrtc::peer_connection_factory::RffiPeerConnectionFactoryOwner;
-use crate::webrtc::peer_connection_observer::RffiPeerConnectionObserver;
-use crate::webrtc::rtp;
-use crate::webrtc::sdp_observer::{
-    CreateSessionDescriptionObserver, SessionDescription, SetSessionDescriptionObserver,
-};
-use crate::webrtc::stats_observer::StatsObserver;
+pub use pc::RffiPeerConnection;
 
 #[cfg(not(feature = "sim"))]
 use crate::webrtc::ffi::peer_connection as pc;
-
 #[cfg(feature = "sim")]
 use crate::webrtc::sim::peer_connection as pc;
 #[cfg(feature = "sim")]
 pub use crate::webrtc::sim::peer_connection::BoxedRtpPacketSink;
-
-pub use pc::RffiPeerConnection;
+use crate::{
+    common::{Result, units::DataRate},
+    core::util::redact_string,
+    error::RingRtcError,
+    webrtc,
+    webrtc::{
+        ice_gatherer::IceGatherer,
+        media::{AudioDecoderConfig, AudioEncoderConfig},
+        network::RffiIpPort,
+        peer_connection_factory::RffiPeerConnectionFactoryOwner,
+        peer_connection_observer::RffiPeerConnectionObserver,
+        rtp,
+        rtp_observer::RffiRtpObserver,
+        sdp_observer::{
+            CreateSessionDescriptionObserver, SessionDescription, SetSessionDescriptionObserver,
+        },
+        stats_observer::StatsObserver,
+    },
+};
 
 /// Rust wrapper around WebRTC C++ PeerConnection object.
 #[derive(Debug)]
@@ -77,6 +79,13 @@ pub struct RffiReceivedAudioLevel {
 pub type AudioLevel = RffiAudioLevel;
 pub type ReceivedAudioLevel = RffiReceivedAudioLevel;
 
+#[derive(Debug)]
+pub enum Protocol<'a> {
+    Udp,
+    Tcp,
+    Tls(&'a str),
+}
+
 impl PeerConnection {
     pub fn new(
         rffi: webrtc::Arc<RffiPeerConnection>,
@@ -92,9 +101,35 @@ impl PeerConnection {
 
     #[cfg(feature = "sim")]
     pub fn set_rtp_packet_sink(&self, rtp_packet_sink: BoxedRtpPacketSink) {
-        unsafe { self.rffi.as_borrowed().as_ref() }
-            .unwrap()
-            .set_rtp_packet_sink(rtp_packet_sink)
+        unsafe {
+            self.rffi
+                .as_borrowed()
+                .as_ref()
+                .unwrap()
+                .set_rtp_packet_sink(rtp_packet_sink)
+        }
+    }
+
+    pub fn set_scalability_mode(
+        &self,
+        scalability_mode: &str,
+        max_bitrate_bps: Option<i32>,
+    ) -> Result<()> {
+        let success = unsafe {
+            let scalability_mode_c = CString::new(scalability_mode)?;
+            let scalability_mode_ptr = webrtc::ptr::Borrowed::from_ptr(scalability_mode_c.as_ptr());
+            pc::Rust_setScalabilityMode(
+                self.rffi.as_borrowed(),
+                scalability_mode_ptr,
+                max_bitrate_bps.unwrap_or(-1),
+            )
+        };
+
+        if success {
+            Ok(())
+        } else {
+            Err(RingRtcError::EnableScalableVideoCoding.into())
+        }
     }
 
     pub fn update_transceivers(&self, remote_demux_ids: &[u32]) -> Result<()> {
@@ -116,6 +151,10 @@ impl PeerConnection {
     /// Rust wrapper around C++ webrtc::CreateSessionDescription(kOffer).
     pub fn create_offer(&self, csd_observer: &CreateSessionDescriptionObserver) {
         unsafe { pc::Rust_createOffer(self.rffi.as_borrowed(), csd_observer.rffi().as_borrowed()) }
+    }
+
+    pub fn create_send_only_transceiver(&self) -> bool {
+        unsafe { pc::Rust_createSendOnlyTransceiver(self.rffi.as_borrowed()) }
     }
 
     /// Rust wrapper around C++ PeerConnection::SetLocalDescription().
@@ -209,11 +248,30 @@ impl PeerConnection {
         &self,
         ip: std::net::IpAddr,
         port: u16,
-        tcp: bool,
+        protocol: &Protocol,
     ) -> Result<()> {
-        let add_ok = unsafe {
-            pc::Rust_addIceCandidateFromServer(self.rffi.as_borrowed(), ip.into(), port, tcp)
+        let (tcp, hostname_c) = match protocol {
+            Protocol::Udp => (false, None),
+            Protocol::Tcp => (true, None),
+            Protocol::Tls(hostname) => (true, Some(CString::new(*hostname)?)),
         };
+
+        let add_ok = unsafe {
+            let hostname_ptr = hostname_c
+                .as_ref()
+                .map_or(webrtc::ptr::Borrowed::null(), |h| {
+                    webrtc::ptr::Borrowed::from_ptr(h.as_ptr())
+                });
+
+            pc::Rust_addIceCandidateFromServer(
+                self.rffi.as_borrowed(),
+                ip.into(),
+                port,
+                tcp,
+                hostname_ptr,
+            )
+        };
+
         if add_ok {
             Ok(())
         } else {
@@ -222,17 +280,37 @@ impl PeerConnection {
     }
 
     /// Rust wrapper around C++ PeerConnection::RemoveIceCandidates.
-    pub fn remove_ice_candidates(&self, removed_addresses: impl Iterator<Item = SocketAddr>) {
+    pub fn remove_ice_candidates<'a>(
+        &self,
+        removed_addresses: impl Iterator<Item = &'a SocketAddr>,
+        group: bool,
+        protocol: &Protocol,
+    ) -> Result<()> {
+        let (tcp, hostname_c) = match protocol {
+            Protocol::Udp => (false, None),
+            Protocol::Tcp => (true, None),
+            Protocol::Tls(hostname) => (true, Some(CString::new(*hostname)?)),
+        };
         let removed_addresses: Vec<RffiIpPort> =
-            removed_addresses.map(|address| address.into()).collect();
+            removed_addresses.map(|address| (*address).into()).collect();
 
         unsafe {
+            let hostname_ptr = hostname_c
+                .as_ref()
+                .map_or(webrtc::ptr::Borrowed::null(), |h| {
+                    webrtc::ptr::Borrowed::from_ptr(h.as_ptr())
+                });
+
             pc::Rust_removeIceCandidates(
                 self.rffi.as_borrowed(),
                 webrtc::ptr::Borrowed::from_ptr(removed_addresses.as_ptr()),
                 removed_addresses.len(),
+                group,
+                tcp,
+                hostname_ptr,
             )
         };
+        Ok(())
     }
 
     // Rust wrapper around C++ PeerConnection::CreateSharedIceGatherer().
@@ -345,6 +423,19 @@ impl PeerConnection {
         };
     }
 
+    pub fn configure_audio_decoders(&self, audio_decoder_config: &AudioDecoderConfig) {
+        info!(
+            "PeerConnection.configure_audio_decoders({:?})",
+            audio_decoder_config
+        );
+        unsafe {
+            pc::Rust_configureAudioDecoders(
+                self.rffi.as_borrowed(),
+                webrtc::ptr::Borrowed::from_ptr(&audio_decoder_config.rffi()),
+            )
+        };
+    }
+
     pub fn get_audio_levels(&self) -> (AudioLevel, Vec<RffiReceivedAudioLevel>) {
         let captured_level: RffiAudioLevel = 0;
         let mut received_levels: Vec<RffiReceivedAudioLevel> = Vec::with_capacity(100);
@@ -368,7 +459,19 @@ impl PeerConnection {
         DataRate::from_bps(bps.into())
     }
 
+    pub fn set_rtp_packet_observer(&self, rtp_observer: webrtc::ptr::Borrowed<RffiRtpObserver>) {
+        unsafe {
+            pc::Rust_setRtpPacketObserver(self.rffi.as_borrowed(), rtp_observer);
+        }
+    }
+
     pub fn close(&self) {
         unsafe { pc::Rust_closePeerConnection(self.rffi.as_borrowed()) };
+    }
+
+    pub fn regather_on_all_networks(&self) {
+        unsafe {
+            pc::Rust_regatherOnAllNetworks(self.rffi.as_borrowed());
+        };
     }
 }

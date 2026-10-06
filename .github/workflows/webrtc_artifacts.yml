@@ -20,26 +20,36 @@ jobs:
   build_android:
     name: Build Android
 
-    runs-on: 'ubuntu-latest-8-cores'
+    runs-on: 'ubuntu-24.04-8-cores'
+
+    outputs:
+      checksum: ${{ steps.checksum.outputs.checksum }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      - name: Setup Git Cookies
+        uses: ./.github/actions/setup-gitcookies
+        with:
+          cookie-content: ${{ secrets.WEBRTC_GIT_COOKIES }}
+
       - run: ./bin/build-webrtc.py --target android --release
 
       - name: Output Artifact Checksum
+        id: checksum
         run: |
           sha256sum out/webrtc-*.tar.bz2 | tee -a $GITHUB_STEP_SUMMARY
+          echo "checksum=$(sha256sum out/webrtc-*.tar.bz2 | awk '{print $1}')" >> $GITHUB_OUTPUT
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: 'projects/741367068918/locations/global/workloadIdentityPools/github/providers/github-actions'
           service_account: 'github-actions@signal-build-artifacts.iam.gserviceaccount.com'
 
-      - uses: google-github-actions/upload-cloud-storage@v2
+      - uses: google-github-actions/upload-cloud-storage@v3
         if: ${{ !inputs.dry_run }}
         with:
           path: 'out'
@@ -51,28 +61,38 @@ jobs:
   build_ios:
     name: Build iOS
 
-    runs-on: 'macos-14-xlarge'
+    runs-on: 'macos-15-xlarge'
+
+    outputs:
+      checksum: ${{ steps.checksum.outputs.checksum }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - run: brew install protobuf
 
       # Installs the pkg_resources python module needed to build webrtc on a mac host
       - run: pip install setuptools
 
+      - name: Setup Git Cookies
+        uses: ./.github/actions/setup-gitcookies
+        with:
+          cookie-content: ${{ secrets.WEBRTC_GIT_COOKIES }}
+
       - run: ./bin/build-webrtc.py --target ios --release
 
       - name: Output Artifact Checksum
+        id: checksum
         run: |
           sha256sum out/webrtc-*.tar.bz2 | tee -a $GITHUB_STEP_SUMMARY
+          echo "checksum=$(sha256sum out/webrtc-*.tar.bz2 | awk '{print $1}')" >> $GITHUB_OUTPUT
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: 'projects/741367068918/locations/global/workloadIdentityPools/github/providers/github-actions'
           service_account: 'github-actions@signal-build-artifacts.iam.gserviceaccount.com'
 
-      - uses: google-github-actions/upload-cloud-storage@v2
+      - uses: google-github-actions/upload-cloud-storage@v3
         if: ${{ !inputs.dry_run }}
         with:
           path: 'out'
@@ -84,27 +104,39 @@ jobs:
   build_linux:
     name: Build Linux
 
-    runs-on: 'ubuntu-latest-4-cores'
+    runs-on: 'ubuntu-24.04-4-cores'
+
+    outputs:
+      checksum_x64: ${{ steps.checksum.outputs.checksum_x64 }}
+      checksum_arm64: ${{ steps.checksum.outputs.checksum_arm64 }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler crossbuild-essential-arm64
 
+      - name: Setup Git Cookies
+        uses: ./.github/actions/setup-gitcookies
+        with:
+          cookie-content: ${{ secrets.WEBRTC_GIT_COOKIES }}
+
       - run: ./bin/build-webrtc.py --target linux --release
 
       - name: Output Artifact Checksum
+        id: checksum
         run: |
           sha256sum out/webrtc-*.tar.bz2 | tee -a $GITHUB_STEP_SUMMARY
           sha256sum out_arm/webrtc-*.tar.bz2 | tee -a $GITHUB_STEP_SUMMARY
+          echo "checksum_x64=$(sha256sum out/webrtc-*.tar.bz2 | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "checksum_arm64=$(sha256sum out_arm/webrtc-*.tar.bz2 | awk '{print $1}')" >> $GITHUB_OUTPUT
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: 'projects/741367068918/locations/global/workloadIdentityPools/github/providers/github-actions'
           service_account: 'github-actions@signal-build-artifacts.iam.gserviceaccount.com'
 
-      - uses: google-github-actions/upload-cloud-storage@v2
+      - uses: google-github-actions/upload-cloud-storage@v3
         if: ${{ !inputs.dry_run }}
         with:
           path: 'out'
@@ -113,7 +145,7 @@ jobs:
           parent: false
           process_gcloudignore: false
 
-      - uses: google-github-actions/upload-cloud-storage@v2
+      - uses: google-github-actions/upload-cloud-storage@v3
         if: ${{ !inputs.dry_run }}
         with:
           path: 'out_arm'
@@ -125,29 +157,41 @@ jobs:
   build_mac:
     name: Build Mac
 
-    runs-on: 'macos-14-xlarge'
+    runs-on: 'macos-15-xlarge'
+
+    outputs:
+      checksum_x64: ${{ steps.checksum.outputs.checksum_x64 }}
+      checksum_arm64: ${{ steps.checksum.outputs.checksum_arm64 }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - run: brew install protobuf
 
       # Installs the pkg_resources python module needed to build webrtc on a mac host
       - run: pip install setuptools
 
+      - name: Setup Git Cookies
+        uses: ./.github/actions/setup-gitcookies
+        with:
+          cookie-content: ${{ secrets.WEBRTC_GIT_COOKIES }}
+
       - run: ./bin/build-webrtc.py --target mac --release
 
       - name: Output Artifact Checksum
+        id: checksum
         run: |
           sha256sum out/webrtc-*.tar.bz2 | tee -a $GITHUB_STEP_SUMMARY
           sha256sum out_arm/webrtc-*.tar.bz2 | tee -a $GITHUB_STEP_SUMMARY
+          echo "checksum_x64=$(sha256sum out/webrtc-*.tar.bz2 | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "checksum_arm64=$(sha256sum out_arm/webrtc-*.tar.bz2 | awk '{print $1}')" >> $GITHUB_OUTPUT
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: 'projects/741367068918/locations/global/workloadIdentityPools/github/providers/github-actions'
           service_account: 'github-actions@signal-build-artifacts.iam.gserviceaccount.com'
 
-      - uses: google-github-actions/upload-cloud-storage@v2
+      - uses: google-github-actions/upload-cloud-storage@v3
         if: ${{ !inputs.dry_run }}
         with:
           path: 'out'
@@ -156,7 +200,7 @@ jobs:
           parent: false
           process_gcloudignore: false
 
-      - uses: google-github-actions/upload-cloud-storage@v2
+      - uses: google-github-actions/upload-cloud-storage@v3
         if: ${{ !inputs.dry_run }}
         with:
           path: 'out_arm'
@@ -168,7 +212,11 @@ jobs:
   build_windows:
     name: Build Windows
 
-    runs-on: 'windows-latest-8-cores'
+    runs-on: 'windows-2025-8-cores'
+
+    outputs:
+      checksum_x64: ${{ steps.checksum.outputs.checksum_x64 }}
+      checksum_arm64: ${{ steps.checksum.outputs.checksum_arm64 }}
 
     steps:
     - name: Setup git to use linux line endings and keep permissions
@@ -177,23 +225,37 @@ jobs:
         git config --global core.eol lf
         git config --global core.filemode false
 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
+
+    - name: Install Windows SDK
+      uses: ChristopheLav/windows-sdk-install@v1
+      with:
+        version-sdk: 26100
+        features: 'OptionId.WindowsDesktopDebuggers'
+
+    - name: Setup Git Cookies
+      uses: ./.github/actions/setup-gitcookies
+      with:
+        cookie-content: ${{ secrets.WEBRTC_GIT_COOKIES }}
 
     - run: python bin/build-webrtc.py --target windows --release
       shell: bash
 
     - name: Output Artifact Checksum
+      id: checksum
       run: |
         sha256sum out/webrtc-*.tar.bz2 | tee -a $GITHUB_STEP_SUMMARY
         sha256sum out_arm/webrtc-*.tar.bz2 | tee -a $GITHUB_STEP_SUMMARY
+        echo "checksum_x64=$(sha256sum out/webrtc-*.tar.bz2 | awk '{print $1}')" >> $GITHUB_OUTPUT
+        echo "checksum_arm64=$(sha256sum out_arm/webrtc-*.tar.bz2 | awk '{print $1}')" >> $GITHUB_OUTPUT
       shell: bash
 
-    - uses: google-github-actions/auth@v2
+    - uses: google-github-actions/auth@v3
       with:
         workload_identity_provider: 'projects/741367068918/locations/global/workloadIdentityPools/github/providers/github-actions'
         service_account: 'github-actions@signal-build-artifacts.iam.gserviceaccount.com'
 
-    - uses: google-github-actions/upload-cloud-storage@v2
+    - uses: google-github-actions/upload-cloud-storage@v3
       if: ${{ !inputs.dry_run }}
       with:
         path: 'out'
@@ -202,7 +264,7 @@ jobs:
         parent: false
         process_gcloudignore: false
 
-    - uses: google-github-actions/upload-cloud-storage@v2
+    - uses: google-github-actions/upload-cloud-storage@v3
       if: ${{ !inputs.dry_run }}
       with:
         path: 'out_arm'
@@ -210,3 +272,29 @@ jobs:
         glob: 'webrtc-*.tar.bz2'
         parent: false
         process_gcloudignore: false
+
+  output_checksums_json:
+    name: Output Checksums JSON
+
+    runs-on: ubuntu-latest
+
+    needs: [build_android, build_ios, build_linux, build_mac, build_windows]
+
+    steps:
+      - name: Output Combined JSON
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## Combined `webrtc_artifact_checksums.json`
+          ```json
+          {
+            "android": "${{ needs.build_android.outputs.checksum }}",
+            "ios": "${{ needs.build_ios.outputs.checksum }}",
+            "linux-x64": "${{ needs.build_linux.outputs.checksum_x64 }}",
+            "linux-arm64": "${{ needs.build_linux.outputs.checksum_arm64 }}",
+            "mac-x64": "${{ needs.build_mac.outputs.checksum_x64 }}",
+            "mac-arm64": "${{ needs.build_mac.outputs.checksum_arm64 }}",
+            "windows-x64": "${{ needs.build_windows.outputs.checksum_x64 }}",
+            "windows-arm64": "${{ needs.build_windows.outputs.checksum_arm64 }}"
+          }
+          ```
+          EOF

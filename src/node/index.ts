@@ -5,66 +5,64 @@
 
 import { RingRTCType } from './ringrtc/Service';
 
+export type {
+  AudioDevice,
+  CallId,
+  CallSettings,
+  DeviceId,
+  GroupCallObserver,
+  GroupCallSvcConfig,
+  HttpResult,
+  PeekDeviceInfo,
+  PeekInfo,
+  Reaction,
+  UserId,
+  VideoFrameSender,
+  VideoFrameSource,
+} from './ringrtc/Service';
 export {
   AnswerMessage,
-  AudioDevice,
   DataMode,
   BusyMessage,
   Call,
-  CallEndedReason,
-  CallId,
+  CallEndReason,
   CallLogLevel,
   CallMessageUrgency,
-  CallSettings,
+  CallRejectReason,
   CallState,
   CallingMessage,
   ConnectionState,
-  DeviceId,
   GroupCall,
-  GroupCallEndReason,
   GroupCallKind,
-  GroupCallObserver,
   GroupMemberInfo,
   HangupMessage,
   HangupType,
   HttpMethod,
-  HttpResult,
   IceCandidateMessage,
   JoinState,
   LocalDeviceState,
   OfferMessage,
   OfferType,
   OpaqueMessage,
-  PeekDeviceInfo,
-  PeekInfo,
   PeekStatusCodes,
-  Reaction,
   RemoteDeviceState,
   RingCancelReason,
   RingRTCType,
   RingUpdate,
-  UserId,
-  VideoCapturer,
-  VideoRenderer,
+  SpeechEvent,
+  VideoPixelFormatEnum,
+  videoPixelFormatToEnum,
   VideoRequest,
   callIdFromEra,
   callIdFromRingId,
 } from './ringrtc/Service';
 
 export {
-  CanvasVideoRenderer,
-  GumVideoCapturer,
-  VideoFrameSource,
-  MAX_VIDEO_CAPTURE_AREA,
-  MAX_VIDEO_CAPTURE_BUFFER_SIZE,
-  MAX_VIDEO_CAPTURE_HEIGHT,
-  MAX_VIDEO_CAPTURE_WIDTH,
-} from './ringrtc/VideoSupport';
-
-export {
   CallLinkRootKey,
   CallLinkRestrictions,
   CallLinkState,
 } from './ringrtc/CallLinks';
+
+export { CallSummary, QualityStats } from './ringrtc/CallSummary';
 
 export const RingRTC = new RingRTCType();

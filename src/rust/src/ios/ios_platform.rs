@@ -5,37 +5,50 @@
 
 //! iOS Platform
 
-use std::collections::HashSet;
-use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
-use crate::common::{
-    ApplicationEvent, CallConfig, CallDirection, CallId, CallMediaType, DeviceId, Result,
+use anyhow::anyhow;
+
+use crate::{
+    common::{
+        ApplicationEvent, CallConfig, CallDirection, CallEndReason, CallId, CallMediaType,
+        DeviceId, Result,
+    },
+    core::{
+        call::Call,
+        call_summary::CallSummary,
+        connection::{Connection, ConnectionType},
+        group_call::{self, Reaction},
+        platform::{Platform, PlatformItem},
+        signaling,
+    },
+    ios::{
+        api::{
+            call_manager_interface::{
+                AppByteSlice, AppByteSliceArray, AppCallContext, AppConnectionInterface,
+                AppIceCandidateArray, AppInterface, AppObject, AppOptionalBool, AppOptionalUInt32,
+                AppRaisedHandsArray, AppReaction, AppReactionsArray, AppReceivedAudioLevel,
+                AppReceivedAudioLevelArray, AppRemoteDeviceState, AppRemoteDeviceStateArray,
+                AppUuidArray,
+            },
+            call_summary::rtc_callsummary_CallSummary,
+        },
+        error::IosError,
+        ios_media_stream::IosMediaStream,
+    },
+    lite::sfu::{self, DemuxId, PeekInfo, PeekResult, UserId},
+    webrtc::{
+        self,
+        media::{MediaStream, VideoTrack},
+        peer_connection::{AudioLevel, PeerConnection, ReceivedAudioLevel, RffiPeerConnection},
+        peer_connection_observer::{NetworkRoute, PeerConnectionObserver},
+    },
 };
-use crate::core::call::Call;
-use crate::core::connection::{Connection, ConnectionType};
-use crate::core::group_call::{ClientId, Reaction};
-use crate::core::platform::{Platform, PlatformItem};
-use crate::core::{group_call, signaling};
-use crate::ios::api::call_manager_interface::{
-    AppByteSlice, AppCallContext, AppConnectionInterface, AppIceCandidateArray, AppInterface,
-    AppObject, AppOptionalBool, AppOptionalUInt32, AppRaisedHandsArray, AppReaction,
-    AppReactionsArray, AppReceivedAudioLevel, AppReceivedAudioLevelArray, AppRemoteDeviceState,
-    AppRemoteDeviceStateArray, AppUuidArray,
-};
-use crate::ios::error::IosError;
-use crate::ios::ios_media_stream::IosMediaStream;
-use crate::lite::{
-    sfu,
-    sfu::{DemuxId, PeekInfo, PeekResult, UserId},
-};
-use crate::webrtc;
-use crate::webrtc::media::{MediaStream, VideoTrack};
-use crate::webrtc::peer_connection::{
-    AudioLevel, PeerConnection, ReceivedAudioLevel, RffiPeerConnection,
-};
-use crate::webrtc::peer_connection_observer::{NetworkRoute, PeerConnectionObserver};
 
 /// Concrete type for iOS AppIncomingMedia objects.
 impl PlatformItem for IosMediaStream {}
@@ -47,9 +60,6 @@ impl PlatformItem for IosConnection {}
 /// Concrete type for iOS AppCallContext objects.
 pub type IosCallContext = Arc<AppCallContext>;
 impl PlatformItem for IosCallContext {}
-
-/// Concrete type for iOS AppRemotePeer objects.
-impl PlatformItem for AppObject {}
 
 /// iOS implementation of platform::Platform.
 pub struct IosPlatform {
@@ -84,9 +94,67 @@ impl Drop for IosPlatform {
     }
 }
 
+/// The AppRemotePeer platform type generally refers to a specific remote peer for
+/// a call, but the iOS client provides the pointer to the entire call object. However,
+/// when receiving messages, only the remote peer is known and there doesn't need to
+/// be an associated call object to handle them. `IosCallData` can work with either
+/// variant and maintains the Call Object lifetime:
+///
+/// - Either `ringrtcCall()` or `ringrtcReceivedOffer()` is invoked, and both the call object
+///   and remote uuid are stored. The call object is retained for storage in RingRTC.
+///     - When the call ends and RingRTC is done, `on_call_concluded()` is invoked and the
+///       call object can be released.
+/// - At any time, any of the other Direct Call `ringrtcReceived*` functions can be
+///   invoked and will provide just the remote uuid which is _copied_ to a Vec<u8> buffer.
+///     - When necessary, the `compare_remotes()` function can be called to compare any
+///       two remote uuid's of any variant, here in the iOS platform implementation.
+///
+/// Other clients have other considerations but generally set AppRemotePeer directly to the
+/// remote uuid.
+#[derive(Clone)]
+pub enum IosCallData {
+    Call {
+        call_object: AppObject,
+        remote_uuid: Vec<u8>,
+    },
+    RemoteUuidOnly {
+        remote_uuid: Vec<u8>,
+    },
+}
+
+impl IosCallData {
+    pub fn new_call(call_object: AppObject, remote_uuid: Vec<u8>) -> Self {
+        IosCallData::Call {
+            call_object,
+            remote_uuid,
+        }
+    }
+
+    pub fn new_remote(remote_uuid: Vec<u8>) -> Self {
+        IosCallData::RemoteUuidOnly { remote_uuid }
+    }
+
+    pub fn get_call_object(&self) -> Option<AppObject> {
+        match self {
+            IosCallData::Call { call_object, .. } => Some(*call_object),
+            IosCallData::RemoteUuidOnly { .. } => None,
+        }
+    }
+
+    pub fn get_remote_uuid(&self) -> &Vec<u8> {
+        match self {
+            IosCallData::Call { remote_uuid, .. } => remote_uuid,
+            IosCallData::RemoteUuidOnly { remote_uuid } => remote_uuid,
+        }
+    }
+}
+
+/// Concrete type for iOS AppRemotePeer objects.
+impl PlatformItem for IosCallData {}
+
 impl Platform for IosPlatform {
     type AppIncomingMedia = IosMediaStream;
-    type AppRemotePeer = AppObject;
+    type AppRemotePeer = IosCallData;
     type AppConnection = IosConnection;
     type AppCallContext = IosCallContext;
 
@@ -185,13 +253,45 @@ impl Platform for IosPlatform {
     ) -> Result<()> {
         info!("on_start_call(): id: {}, direction: {}", call_id, direction);
 
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         (self.app_interface.onStartCall)(
             self.app_interface.object,
-            remote_peer.ptr,
+            call_object.ptr,
             u64::from(call_id),
             direction == CallDirection::Outgoing,
             call_media_type as i32,
         );
+
+        Ok(())
+    }
+
+    fn on_call_ended(
+        &self,
+        remote_peer: &Self::AppRemotePeer,
+        call_id: CallId,
+        reason: CallEndReason,
+        summary: CallSummary,
+    ) -> Result<()> {
+        info!("on_call_ended: {:?}", reason);
+
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
+        let summary = rtc_callsummary_CallSummary::wrap(&summary);
+
+        (self.app_interface.onCallEnded)(
+            self.app_interface.object,
+            call_object.ptr,
+            call_id.into(),
+            reason as i32,
+            &summary as *const rtc_callsummary_CallSummary,
+        );
+
+        summary.release();
 
         Ok(())
     }
@@ -204,7 +304,11 @@ impl Platform for IosPlatform {
     ) -> Result<()> {
         info!("on_event(): {}", event);
 
-        (self.app_interface.onEvent)(self.app_interface.object, remote_peer.ptr, event as i32);
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
+        (self.app_interface.onEvent)(self.app_interface.object, call_object.ptr, event as i32);
 
         Ok(())
     }
@@ -216,9 +320,13 @@ impl Platform for IosPlatform {
     ) -> Result<()> {
         trace!("on_network_route_changed(): {:?}", network_route);
 
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         (self.app_interface.onNetworkRouteChanged)(
             self.app_interface.object,
-            remote_peer.ptr,
+            call_object.ptr,
             network_route.local_adapter_type as i32,
         );
 
@@ -232,9 +340,14 @@ impl Platform for IosPlatform {
         received_level: AudioLevel,
     ) -> Result<()> {
         trace!("on_audio_levels(): {}, {}", captured_level, received_level);
+
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         (self.app_interface.onAudioLevels)(
             self.app_interface.object,
-            remote_peer.ptr,
+            call_object.ptr,
             captured_level,
             received_level,
         );
@@ -248,11 +361,17 @@ impl Platform for IosPlatform {
         recovered: bool,
     ) -> Result<()> {
         info!("on_low_bandwidth_for_video(): {}", recovered);
+
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         (self.app_interface.onLowBandwidthForVideo)(
             self.app_interface.object,
-            remote_peer.ptr,
+            call_object.ptr,
             recovered,
         );
+
         Ok(())
     }
 
@@ -268,10 +387,14 @@ impl Platform for IosPlatform {
 
         info!("on_send_offer(): call_id: {}", call_id);
 
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         (self.app_interface.onSendOffer)(
             self.app_interface.object,
             u64::from(call_id),
-            remote_peer.ptr,
+            call_object.ptr,
             receiver_device_id,
             broadcast,
             app_slice_from_bytes(Some(&offer.opaque)),
@@ -296,10 +419,14 @@ impl Platform for IosPlatform {
             call_id, receiver_device_id
         );
 
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         (self.app_interface.onSendAnswer)(
             self.app_interface.object,
             u64::from(call_id),
-            remote_peer.ptr,
+            call_object.ptr,
             receiver_device_id,
             broadcast,
             app_slice_from_bytes(Some(&send.answer.opaque)),
@@ -325,6 +452,10 @@ impl Platform for IosPlatform {
             call_id, receiver_device_id, broadcast
         );
 
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         if send.ice.candidates.is_empty() {
             return Ok(());
         }
@@ -346,7 +477,7 @@ impl Platform for IosPlatform {
         (self.app_interface.onSendIceCandidates)(
             self.app_interface.object,
             u64::from(call_id),
-            remote_peer.ptr,
+            call_object.ptr,
             receiver_device_id,
             broadcast,
             &app_ice_candidates_array,
@@ -367,6 +498,10 @@ impl Platform for IosPlatform {
 
         info!("on_send_hangup(): call_id: {}", call_id);
 
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         let (hangup_type, hangup_device_id) = send.hangup.to_type_and_device_id();
         // We set the device_id to 0 in case it is not defined. It will
         // only be used for hangup types other than Normal.
@@ -375,7 +510,7 @@ impl Platform for IosPlatform {
         (self.app_interface.onSendHangup)(
             self.app_interface.object,
             u64::from(call_id),
-            remote_peer.ptr,
+            call_object.ptr,
             receiver_device_id,
             broadcast,
             hangup_type as i32,
@@ -392,10 +527,14 @@ impl Platform for IosPlatform {
 
         info!("on_send_busy(): call_id: {}", call_id);
 
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         (self.app_interface.onSendBusy)(
             self.app_interface.object,
             u64::from(call_id),
-            remote_peer.ptr,
+            call_object.ptr,
             receiver_device_id,
             broadcast,
         );
@@ -447,6 +586,42 @@ impl Platform for IosPlatform {
         Ok(())
     }
 
+    fn send_call_message_to_adhoc_group(
+        &self,
+        message: Vec<u8>,
+        urgency: group_call::SignalingMessageUrgency,
+        expiration: u64,
+        recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
+    ) -> Result<()> {
+        let app_recipients: Vec<AppByteSlice> = recipients_to_endorsements
+            .keys()
+            .map(|recipient| app_slice_from_bytes(Some(recipient)))
+            .collect();
+        let app_recipients_array = AppUuidArray {
+            uuids: app_recipients.as_ptr(),
+            count: app_recipients.len(),
+        };
+        let app_endorsements: Vec<AppByteSlice> = recipients_to_endorsements
+            .values()
+            .map(|endorsement| app_slice_from_bytes(Some(endorsement)))
+            .collect();
+        let app_endorsements_array = AppByteSliceArray {
+            slices: app_endorsements.as_ptr(),
+            count: app_endorsements.len(),
+        };
+
+        (self.app_interface.sendCallMessageToAdhocGroup)(
+            self.app_interface.object,
+            app_slice_from_bytes(Some(&message)),
+            urgency as i32,
+            expiration,
+            app_recipients_array,
+            app_endorsements_array,
+        );
+
+        Ok(())
+    }
+
     fn create_incoming_media(
         &self,
         connection: &Connection<Self>,
@@ -479,12 +654,16 @@ impl Platform for IosPlatform {
     ) -> Result<()> {
         info!("connect_incoming_media():");
 
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
         let ios_media_stream = incoming_media as &IosMediaStream;
-        let app_media_stream = ios_media_stream.get_ref()?;
+        let app_media_stream = ios_media_stream.get_ref();
 
         (self.app_interface.onConnectMedia)(
             self.app_interface.object,
-            remote_peer.ptr,
+            call_object.ptr,
             app_call_context.object,
             app_media_stream.as_ptr(),
         );
@@ -497,13 +676,11 @@ impl Platform for IosPlatform {
         remote_peer1: &Self::AppRemotePeer,
         remote_peer2: &Self::AppRemotePeer,
     ) -> Result<bool> {
-        info!("compare_remotes():");
+        let remote_uuid_1 = remote_peer1.get_remote_uuid();
+        let remote_uuid_2 = remote_peer2.get_remote_uuid();
 
-        let result = (self.app_interface.onCompareRemotes)(
-            self.app_interface.object,
-            remote_peer1.ptr,
-            remote_peer2.ptr,
-        );
+        let result = remote_uuid_1 == remote_uuid_2;
+        info!("compare_remotes(): {}", result);
 
         Ok(result)
     }
@@ -515,13 +692,18 @@ impl Platform for IosPlatform {
         _age: Duration,
     ) -> Result<()> {
         // iOS already keeps track of the offer timestamp, so no need to pass the age through.
-        self.on_event(remote_peer, call_id, ApplicationEvent::ReceivedOfferExpired)
+        self.on_event(remote_peer, call_id, ApplicationEvent::ReceivedOfferExpired)?;
+        Ok(())
     }
 
     fn on_call_concluded(&self, remote_peer: &Self::AppRemotePeer, _call_id: CallId) -> Result<()> {
         info!("on_call_concluded():");
 
-        (self.app_interface.onCallConcluded)(self.app_interface.object, remote_peer.ptr);
+        let call_object = remote_peer
+            .get_call_object()
+            .ok_or_else(|| anyhow!("No call object available"))?;
+
+        (self.app_interface.onCallConcluded)(self.app_interface.object, call_object.ptr);
 
         Ok(())
     }
@@ -617,7 +799,7 @@ impl Platform for IosPlatform {
         );
     }
 
-    fn handle_reactions(&self, client_id: ClientId, reactions: Vec<Reaction>) {
+    fn handle_reactions(&self, client_id: group_call::ClientId, reactions: Vec<Reaction>) {
         trace!("handle_reactions(): {:?}", reactions);
 
         let app_reactions: Vec<AppReaction> = reactions
@@ -697,7 +879,7 @@ impl Platform for IosPlatform {
         );
     }
 
-    fn handle_raised_hands(&self, client_id: ClientId, raised_hands: Vec<DemuxId>) {
+    fn handle_raised_hands(&self, client_id: group_call::ClientId, raised_hands: Vec<DemuxId>) {
         info!("handle_raised_hands(): {:?}", raised_hands);
 
         let app_raised_hands_array = AppRaisedHandsArray {
@@ -775,8 +957,56 @@ impl Platform for IosPlatform {
         );
     }
 
-    fn handle_ended(&self, client_id: group_call::ClientId, reason: group_call::EndReason) {
-        (self.app_interface.handleEnded)(self.app_interface.object, client_id, reason as i32);
+    fn handle_ended(
+        &self,
+        client_id: group_call::ClientId,
+        reason: CallEndReason,
+        summary: CallSummary,
+    ) {
+        let summary = rtc_callsummary_CallSummary::wrap(&summary);
+
+        (self.app_interface.handleEnded)(
+            self.app_interface.object,
+            client_id,
+            reason as i32,
+            &summary as *const rtc_callsummary_CallSummary,
+        );
+
+        summary.release();
+    }
+
+    fn handle_speaking_notification(
+        &self,
+        client_id: group_call::ClientId,
+        event: group_call::SpeechEvent,
+    ) {
+        (self.app_interface.handleSpeakingNotification)(
+            self.app_interface.object,
+            client_id,
+            event as i32,
+        );
+    }
+
+    fn handle_remote_mute_request(&self, client_id: group_call::ClientId, mute_source: DemuxId) {
+        (self.app_interface.handleRemoteMuteRequest)(
+            self.app_interface.object,
+            client_id,
+            mute_source,
+        );
+    }
+
+    fn handle_observed_remote_mute(
+        &self,
+        client_id: group_call::ClientId,
+        mute_source: DemuxId,
+        mute_target: DemuxId,
+    ) {
+        (self.app_interface.handleObservedRemoteMute)(
+            self.app_interface.object,
+            client_id,
+            mute_source,
+            mute_target,
+        );
     }
 }
 
@@ -792,10 +1022,10 @@ impl sfu::Delegate for IosPlatform {
 
 impl IosPlatform {
     /// Create a new IOSPlatform object.
-    pub fn new(app_interface: AppInterface) -> Result<Self> {
+    pub fn new(app_interface: AppInterface) -> Self {
         debug!("IOSPlatform::new: {:?}", app_interface);
 
-        Ok(Self { app_interface })
+        Self { app_interface }
     }
 }
 

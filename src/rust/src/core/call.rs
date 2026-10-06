@@ -5,31 +5,44 @@
 
 //! A peer-to-peer call connection interface.
 
-use std::collections::{hash_map, HashMap};
-use std::fmt;
-use std::sync::{
-    atomic::AtomicBool, atomic::Ordering, mpsc::SyncSender, Arc, Condvar, Mutex, MutexGuard,
+use std::{
+    collections::{HashMap, hash_map},
+    fmt,
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+        mpsc::SyncSender,
+    },
+    thread,
+    time::Duration,
 };
-use std::thread;
-use std::time::Duration;
 
 use x25519_dalek::StaticSecret;
 
-use crate::common::actor::{Actor, Stopper};
-use crate::common::{
-    ApplicationEvent, CallConfig, CallDirection, CallId, CallMediaType, CallState, DeviceId, Result,
+use crate::{
+    common::{
+        ApplicationEvent, CallConfig, CallDirection, CallId, CallMediaType, CallState, DeviceId,
+        EVENT_QUEUE_SIZE, Result, TERMINATE_TIMEOUT,
+        actor::{Actor, Stopper},
+    },
+    core::{
+        assets::AssetRegistry,
+        call_fsm::{CallEvent, CallStateMachine},
+        call_manager::CallManager,
+        call_mutex::CallMutex,
+        call_summary::DirectCallSummary,
+        connection::{Connection, ConnectionObserverEvent, ConnectionType},
+        platform::Platform,
+        signaling, util,
+    },
+    error::RingRtcError,
+    webrtc::{
+        ice_gatherer::IceGatherer,
+        media::{MediaStream, configure_dred_from_assets},
+        peer_connection::AudioLevel,
+        peer_connection_observer::NetworkRoute,
+    },
 };
-use crate::core::call_fsm::{CallEvent, CallStateMachine};
-use crate::core::call_manager::CallManager;
-use crate::core::call_mutex::CallMutex;
-use crate::core::connection::{Connection, ConnectionObserverEvent, ConnectionType};
-use crate::core::platform::Platform;
-use crate::core::signaling;
-use crate::error::RingRtcError;
-use crate::webrtc::ice_gatherer::IceGatherer;
-use crate::webrtc::media::MediaStream;
-use crate::webrtc::peer_connection::AudioLevel;
-use crate::webrtc::peer_connection_observer::NetworkRoute;
 
 /// Container for incoming call data, retained briefly while an
 /// underlying Connection object is created and initialized.
@@ -88,6 +101,8 @@ where
     connection_map: Arc<CallMutex<HashMap<DeviceId, Connection<T>>>>,
     /// Condition variable used at termination to quiesce and synchronize the FSM.
     terminate_condvar: Arc<(Mutex<bool>, Condvar)>,
+    /// Set when the call has been asked to terminate.
+    terminate_requested: Arc<AtomicBool>,
     /// Whether or not an offer has been sent via messaging for this call.
     did_send_offer: Arc<AtomicBool>,
     /// Whether or not the application has already been notified of ApplicationEvent::RemoteRinging.
@@ -98,6 +113,10 @@ where
     /// ICE candidates and signaling alive.
     /// And we also need to keep around that parent's offer that it created.
     forking: Arc<CallMutex<Option<ForkingState<T>>>>,
+    /// Captures call statistics for reporting.
+    call_summary: DirectCallSummary,
+    /// Registry for accessing large, pre-loaded assets
+    asset_registry: AssetRegistry,
 }
 
 impl<T> fmt::Display for Call<T>
@@ -139,10 +158,10 @@ where
 
             // This is the last call reference, so let the application
             // release the the remote object.
-            if let Ok(call_manager) = self.call_manager() {
-                if let Ok(remote_peer) = self.remote_peer() {
-                    let _ = call_manager.notify_call_concluded(&remote_peer, self.call_id);
-                }
+            if let Ok(call_manager) = self.call_manager()
+                && let Ok(remote_peer) = self.remote_peer()
+            {
+                let _ = call_manager.notify_call_concluded(&remote_peer, self.call_id);
             }
         } else {
             debug!(
@@ -174,11 +193,14 @@ where
             timeout_stopper: self.timeout_stopper.clone(),
             connection_map: Arc::clone(&self.connection_map),
             terminate_condvar: Arc::clone(&self.terminate_condvar),
+            terminate_requested: Arc::clone(&self.terminate_requested),
             did_send_offer: Arc::clone(&self.did_send_offer),
             did_notify_application_of_remote_ringing: Arc::clone(
                 &self.did_notify_application_of_remote_ringing,
             ),
             forking: Arc::clone(&self.forking),
+            call_summary: self.call_summary.clone(),
+            asset_registry: self.asset_registry.clone(),
         }
     }
 }
@@ -197,9 +219,10 @@ where
         call_manager: CallManager<T>,
     ) -> Result<Self> {
         info!("new(): call_id: {}", call_id);
+        let asset_registry = call_manager.asset_registry()?;
 
         // create a FSM worker for this connection
-        let (fsm_sender, fsm_receiver) = std::sync::mpsc::sync_channel(256);
+        let (fsm_sender, fsm_receiver) = std::sync::mpsc::sync_channel(EVENT_QUEUE_SIZE);
         let mut call_fsm = CallStateMachine::new(fsm_receiver.into())?;
         thread::Builder::new()
             .name("fsm-worker".to_string())
@@ -220,9 +243,12 @@ where
             timeout_stopper: Stopper::new(),
             connection_map: Arc::new(CallMutex::new(HashMap::new(), "connection_map")),
             terminate_condvar: Arc::new((Mutex::new(false), Condvar::new())),
+            terminate_requested: Arc::new(AtomicBool::new(false)),
             did_send_offer: Arc::new(AtomicBool::new(false)),
             did_notify_application_of_remote_ringing: Arc::new(AtomicBool::new(false)),
             forking: Arc::new(CallMutex::new(None, "forking")),
+            call_summary: DirectCallSummary::default(),
+            asset_registry,
         };
 
         Ok(call)
@@ -243,6 +269,23 @@ where
         }
 
         Ok(())
+    }
+
+    /// Connects the active connection to the call survey stats collector. This
+    /// method will fail if currently there is no active connection. It is safe
+    /// to ignore any errors returned by this method as they will only impact
+    /// stats collection and not the call itself.
+    pub fn start_call_summary_stats_collection(&self) -> Result<()> {
+        self.active_connection()?
+            .set_stats_snapshot_consumer(self.call_summary.as_stats_consumer())
+    }
+
+    /// Returns the `DirectCallSummary` instance that is being used to collect
+    /// call information. The returned object can be cheaply cloned and accesses
+    /// the underlying, potentially still active, instance of the direct call
+    /// stats collector.
+    pub fn summary(&self) -> DirectCallSummary {
+        self.call_summary.clone()
     }
 
     /// Return the Call identifier.
@@ -308,7 +351,7 @@ where
             Some(pending) => {
                 return Err(
                     RingRtcError::PendingCallAlreadySet(pending.received.sender_device_id).into(),
-                )
+                );
             }
             None => {
                 let pending_data = PendingCall {
@@ -349,13 +392,9 @@ where
         }
     }
 
-    /// Returns `true` if the call is terminating.
+    /// Returns `true` if the call is terminating or already terminated.
     pub fn terminating(&self) -> Result<bool> {
-        if let CallState::Terminating = self.state()? {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(self.state()?.terminating_or_terminated())
     }
 
     /// Return the strong reference count on the state `Arc<Mutex<>>`.
@@ -532,12 +571,25 @@ where
     /// - handle the previously stored pending Offer and ICE Candidates
     pub fn proceed(
         &mut self,
-        call_config: CallConfig,
+        mut call_config: CallConfig,
         audio_levels_interval: Option<Duration>,
     ) -> Result<()> {
         info!("proceed():");
 
+        // Update the call summary capture limits now that we have a CallConfig available.
+        // Ignore any errors here as that will only impact stats collection.
+        let _ = self.call_summary.update_limits(
+            Duration::from_secs(call_config.call_summary_time_limit_secs as u64),
+            Duration::from_secs(call_config.stats_interval_secs as u64),
+        );
+
         let mut call_manager = self.call_manager()?;
+
+        configure_dred_from_assets(
+            &self.asset_registry,
+            &mut call_config.audio_encoder_config,
+            &mut call_config.audio_decoder_config,
+        );
 
         match self.direction {
             // This happens after received_offer and an offer is put in self.pending_call.
@@ -557,6 +609,7 @@ where
                     )?;
                     let answer = connection
                         .start_incoming(pending_call.received, pending_call.ice_candidates)?;
+                    self.call_summary.on_call_event(&CallEvent::SendingAnswer);
                     call_manager.send_answer(
                         self.clone(),
                         connection.clone(),
@@ -565,6 +618,10 @@ where
                             answer,
                         },
                     )?;
+
+                    // Attach the stats consumer to this connection
+                    connection
+                        .set_stats_snapshot_consumer(self.call_summary.as_stats_consumer())?;
 
                     let mut connection_map = self.connection_map.lock()?;
                     connection_map.insert(remote_device_id, connection);
@@ -599,6 +656,7 @@ where
                     offer: offer.clone(),
                 });
 
+                self.call_summary.on_call_event(&CallEvent::SendingOffer);
                 call_manager.send_offer(self.clone(), parent_connection, offer)?;
                 // If we don't do this, then hangups won't be sent.
                 self.did_send_offer.store(true, Ordering::Release);
@@ -623,7 +681,10 @@ where
             }
             let mut maybe_forking = self.forking.lock()?;
             if let Some(forking) = maybe_forking.as_mut() {
-                info!("received_answer from device {}; forking enabled, so inject into connection_map", sender_device_id);
+                info!(
+                    "received_answer from device {}; forking enabled, so inject into connection_map",
+                    sender_device_id
+                );
                 let call_manager = self.call_manager()?;
                 let call_config = forking.parent_connection.call_config();
                 let audio_levels_interval = forking.parent_connection.audio_levels_interval();
@@ -689,16 +750,28 @@ where
         }
     }
 
-    /// Return true if at least one offer has been sent for the outgoing
-    /// call or if the call is incoming.
+    /// Return true if a hangup should be sent to the remote peer.
     pub fn should_send_hangup(&self) -> bool {
         match self.direction {
+            CallDirection::Incoming => true,
             CallDirection::Outgoing => {
-                // If the call is outgoing, only send hangup message if an
+                // If the call is outgoing, only send a hangup message if an
                 // offer was actually sent out.
                 self.did_send_offer.load(Ordering::Acquire)
             }
-            _ => true,
+        }
+    }
+
+    /// Return true if a hangup should be sent to the remote peer for a failure condition.
+    pub fn should_send_hangup_on_failure(&self) -> bool {
+        match self.direction {
+            CallDirection::Incoming => {
+                // For any failure, only send a hangup message if the user has
+                // accepted the incoming call, to avoid stopping ringing on other
+                // devices.
+                self.state().is_ok_and(|state| state.accepted())
+            }
+            CallDirection::Outgoing => true,
         }
     }
 
@@ -806,6 +879,11 @@ where
     ///
     /// Using the `EventPump` send a CallEvent to the internal FSM.
     fn inject_event(&mut self, event: CallEvent) -> Result<()> {
+        if let Ok(state) = self.state()
+            && state != CallState::Terminated
+        {
+            self.call_summary.on_call_event(&event);
+        }
         self.fsm_sender
             .try_send((self.clone(), event))
             .or_else(|err| match &err {
@@ -827,27 +905,26 @@ where
         // we should continue terminating even if that individual component fails.
 
         // close any application specific resources
-        if let Ok(call_context) = self.call_context() {
-            if let Err(e) = self
+        if let Ok(call_context) = self.call_context()
+            && let Err(e) = self
                 .call_manager()?
                 .disconnect_incoming_media(&call_context)
-            {
-                error!(
-                    "terminate_connections(): call_id: {} failed to disconnect incoming media: {}",
-                    self.call_id(),
-                    e
-                );
-            }
+        {
+            error!(
+                "terminate_connections(): call_id: {} failed to disconnect incoming media: {}",
+                self.call_id(),
+                e
+            );
         }
 
-        if let Some(mut forking) = self.forking.lock()?.take() {
-            if let Err(e) = forking.parent_connection.terminate() {
-                error!(
-                    "terminate_connections(): call_id: {} failed to terminate forking parent connection: {}",
-                    self.call_id(),
-                    e
-                );
-            }
+        if let Some(mut forking) = self.forking.lock()?.take()
+            && let Err(e) = forking.parent_connection.terminate()
+        {
+            error!(
+                "terminate_connections(): call_id: {} failed to terminate forking parent connection: {}",
+                self.call_id(),
+                e
+            );
         }
         let mut connection_map = self.connection_map.lock()?;
         for (_, mut connection) in connection_map.drain() {
@@ -898,6 +975,11 @@ where
         Ok(())
     }
 
+    /// Whether the call has been asked to terminate.
+    pub fn terminate_requested(&self) -> bool {
+        self.terminate_requested.load(Ordering::SeqCst)
+    }
+
     /// Terminate this Call.
     ///
     /// Notify the internal FSM to terminate.
@@ -905,12 +987,23 @@ where
     /// `Note:` The current thread is blocked while waiting for the
     /// FSM to signal that termination is complete.
     pub fn terminate(&mut self) -> Result<()> {
-        let start_ref_count = self.ref_count();
-        info!("terminate(): ref_count: {}", start_ref_count);
+        info!("terminate(): ref_count: {}", self.ref_count());
 
-        self.set_state(CallState::Terminating)?;
-        self.inject_event(CallEvent::Terminate)?;
-        self.wait_for_terminate()?;
+        // Set the state before the terminate_requested flag, so the FSM
+        // cannot observe the flag while the state still reads as active.
+        if let Err(err) = self.set_state(CallState::Terminating) {
+            warn!("terminate(): failed to set Terminating state: {}", err);
+        }
+        self.terminate_requested.store(true, Ordering::SeqCst);
+
+        // Wait for the FSM to quiesce.
+        if let Err(err) = util::try_scoped(|| {
+            self.inject_event(CallEvent::Terminate)?;
+            self.wait_for_terminate()
+        }) {
+            // Log-and-continue so that teardown can continue below.
+            error!("terminate(): failed to quiesce the FSM: {}", err);
+        }
 
         self.terminate_connections()?;
 
@@ -921,19 +1014,28 @@ where
         Ok(())
     }
 
-    /// Bottom half of `close()`
+    /// Bottom half of `terminate()`
     ///
-    /// Waits for the FSM shutdown condition variable to signal that
-    /// shutdown is complete.
+    /// Waits for the FSM shutdown condition variable to signal that shutdown is
+    /// complete, or times out after `TERMINATE_TIMEOUT`.
     pub fn wait_for_terminate(&mut self) -> Result<()> {
-        // Wait for terminate operation to complete
         info!("terminate(): waiting for terminate complete...");
         let (mutex, condvar) = &*self.terminate_condvar;
-        if let Ok(mut terminate_complete) = mutex.lock() {
-            while !*terminate_complete {
-                terminate_complete = condvar.wait(terminate_complete).map_err(|_| {
+        if let Ok(terminate_complete) = mutex.lock() {
+            let (_terminate_complete, result) = condvar
+                .wait_timeout_while(
+                    terminate_complete,
+                    TERMINATE_TIMEOUT,
+                    |terminate_complete| !*terminate_complete,
+                )
+                .map_err(|_| {
                     RingRtcError::MutexPoisoned("Call Terminate Condition Variable".to_string())
                 })?;
+            if result.timed_out() {
+                return Err(RingRtcError::TerminateTimeout(
+                    "Call Terminate Condition Variable".to_string(),
+                )
+                .into());
             }
         } else {
             return Err(RingRtcError::MutexPoisoned(
@@ -1141,7 +1243,7 @@ where
             parent_connection.synchronize()?;
         }
         if let Ok(mut connection_map) = self.connection_map.lock() {
-            for (_, connection) in connection_map.iter_mut() {
+            for connection in connection_map.values_mut() {
                 info!(
                     "synchronize(): call_id: {} remote_device_id: {}",
                     self.call_id(),
@@ -1177,5 +1279,37 @@ where
         let forking = self.forking.lock()?;
         let parent_connection = forking.as_ref().unwrap().parent_connection.clone();
         Ok(parent_connection)
+    }
+
+    /// Inject a pausing event into the FSM.
+    ///
+    /// Blocks the FSM once it dequeues the event, until released.
+    ///
+    /// `Called By:` Test infrastructure
+    #[cfg(feature = "sim")]
+    pub fn inject_pause(&mut self, pause: Arc<(Mutex<bool>, Condvar)>) -> Result<()> {
+        self.inject_event(CallEvent::Pause(pause))
+    }
+
+    /// Whether the FSM has signaled that termination is complete.
+    ///
+    /// `Called By:` Test infrastructure
+    #[cfg(feature = "sim")]
+    pub fn fsm_terminated(&self) -> bool {
+        *self.terminate_condvar.0.lock().unwrap()
+    }
+
+    /// Block the caller until the FSM signals termination, or the timeout
+    /// elapses. Returns whether termination is completed.
+    ///
+    /// `Called By:` Test infrastructure
+    #[cfg(feature = "sim")]
+    pub fn wait_for_fsm_terminated(&self, timeout: Duration) -> bool {
+        let (mutex, condvar) = &*self.terminate_condvar;
+        let guard = mutex.lock().unwrap();
+        let (guard, _) = condvar
+            .wait_timeout_while(guard, timeout, |terminated| !*terminated)
+            .unwrap();
+        *guard
     }
 }

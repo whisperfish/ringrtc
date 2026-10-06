@@ -3,17 +3,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use crate::webrtc;
-use crate::webrtc::ffi::media::{RffiAudioTrack, RffiVideoSource, RffiVideoTrack};
-use crate::webrtc::ffi::peer_connection::RffiPeerConnection;
-use crate::webrtc::ffi::peer_connection_observer::RffiPeerConnectionObserver;
+use std::os::raw::c_char;
+
 #[cfg(feature = "injectable_network")]
 use crate::webrtc::injectable_network::RffiInjectableNetwork;
-use crate::webrtc::peer_connection_factory::{
-    RffiAudioConfig, RffiAudioJitterBufferConfig, RffiIceServers, RffiPeerConnectionKind,
+use crate::{
+    webrtc,
+    webrtc::{
+        ffi::{
+            media::{RffiAudioTrack, RffiVideoSource, RffiVideoTrack},
+            peer_connection::RffiPeerConnection,
+            peer_connection_observer::RffiPeerConnectionObserver,
+        },
+        peer_connection_factory::{
+            RffiAudioConfig, RffiAudioJitterBufferConfig, RffiIceServers, RffiPeerConnectionKind,
+        },
+    },
 };
-#[cfg(feature = "native")]
-use std::os::raw::c_char;
 
 /// Incomplete type for C++ PeerConnectionFactoryOwner.
 #[repr(C)]
@@ -33,10 +39,11 @@ pub struct RffiPeerConnectionFactoryInterface {
 // in webrtc/api/peer_connection_interface.h
 impl webrtc::RefCounted for RffiPeerConnectionFactoryInterface {}
 
-extern "C" {
+unsafe extern "C" {
     pub fn Rust_createPeerConnectionFactory(
         audio_config: webrtc::ptr::Borrowed<RffiAudioConfig>,
         use_injectable_network: bool,
+        field_trials_string: *const c_char,
     ) -> webrtc::ptr::OwnedRc<RffiPeerConnectionFactoryOwner>;
     pub fn Rust_createPeerConnectionFactoryWrapper(
         factory: webrtc::ptr::BorrowedRc<RffiPeerConnectionFactoryInterface>,
@@ -65,36 +72,4 @@ extern "C" {
         factory: webrtc::ptr::BorrowedRc<RffiPeerConnectionFactoryOwner>,
         source: webrtc::ptr::BorrowedRc<RffiVideoSource>,
     ) -> webrtc::ptr::OwnedRc<RffiVideoTrack>;
-    #[cfg(feature = "native")]
-    pub fn Rust_getAudioPlayoutDevices(
-        factory: webrtc::ptr::BorrowedRc<RffiPeerConnectionFactoryOwner>,
-    ) -> i16;
-    #[cfg(feature = "native")]
-    pub fn Rust_getAudioPlayoutDeviceName(
-        factory: webrtc::ptr::BorrowedRc<RffiPeerConnectionFactoryOwner>,
-        index: u16,
-        name_out: *mut c_char,
-        uuid_out: *mut c_char,
-    ) -> i32;
-    #[cfg(feature = "native")]
-    pub fn Rust_setAudioPlayoutDevice(
-        factory: webrtc::ptr::BorrowedRc<RffiPeerConnectionFactoryOwner>,
-        index: u16,
-    ) -> bool;
-    #[cfg(feature = "native")]
-    pub fn Rust_getAudioRecordingDevices(
-        factory: webrtc::ptr::BorrowedRc<RffiPeerConnectionFactoryOwner>,
-    ) -> i16;
-    #[cfg(feature = "native")]
-    pub fn Rust_getAudioRecordingDeviceName(
-        factory: webrtc::ptr::BorrowedRc<RffiPeerConnectionFactoryOwner>,
-        index: u16,
-        name_out: *mut c_char,
-        uuid_out: *mut c_char,
-    ) -> i32;
-    #[cfg(feature = "native")]
-    pub fn Rust_setAudioRecordingDevice(
-        factory: webrtc::ptr::BorrowedRc<RffiPeerConnectionFactoryOwner>,
-        index: u16,
-    ) -> bool;
 }

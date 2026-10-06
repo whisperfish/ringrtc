@@ -72,7 +72,7 @@ impl<T> Owned<T> {
         unsafe { self.as_ptr().as_ref() }
     }
 
-    pub fn as_mut(&self) -> Option<&mut T> {
+    pub fn as_mut(&mut self) -> Option<&mut T> {
         // Safe because we own it
         unsafe { (self.as_ptr() as *mut T).as_mut() }
     }
@@ -120,13 +120,13 @@ impl<T> Borrowed<T> {
     /// # Safety
     /// It's as safe as any pointer deref.
     pub unsafe fn as_ref(&self) -> Option<&T> {
-        self.as_ptr().as_ref()
+        unsafe { self.as_ptr().as_ref() }
     }
 
     /// # Safety
     /// It's as safe as any pointer deref.
-    pub unsafe fn as_mut(&self) -> Option<&mut T> {
-        (self.as_ptr() as *mut T).as_mut()
+    pub unsafe fn as_mut(&mut self) -> Option<&mut T> {
+        unsafe { (self.as_ptr() as *mut T).as_mut() }
     }
 }
 
@@ -189,7 +189,7 @@ impl<T: RefCounted> OwnedRc<T> {
         unsafe { self.as_ptr().as_ref() }
     }
 
-    pub fn as_mut(&self) -> Option<&mut T> {
+    pub fn as_mut(&mut self) -> Option<&mut T> {
         // Safe because we own it
         unsafe { (self.as_ptr() as *mut T).as_mut() }
     }
@@ -227,13 +227,13 @@ impl<T: RefCounted> BorrowedRc<T> {
     /// # Safety
     /// It's as safe as any pointer deref.
     pub unsafe fn as_ref(&self) -> Option<&T> {
-        self.as_ptr().as_ref()
+        unsafe { self.as_ptr().as_ref() }
     }
 
     /// # Safety
     /// It's as safe as any pointer deref.
-    pub unsafe fn as_mut(&self) -> Option<&mut T> {
-        (self.as_ptr() as *mut T).as_mut()
+    pub unsafe fn as_mut(&mut self) -> Option<&mut T> {
+        unsafe { (self.as_ptr() as *mut T).as_mut() }
     }
 }
 
@@ -298,7 +298,7 @@ impl<T: Delete> Unique<T> {
         self.0.as_ref()
     }
 
-    pub fn as_mut(&self) -> Option<&mut T> {
+    pub fn as_mut(&mut self) -> Option<&mut T> {
         self.0.as_mut()
     }
 }

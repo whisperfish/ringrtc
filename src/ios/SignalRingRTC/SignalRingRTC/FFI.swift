@@ -43,6 +43,16 @@ extension rtc_OptionalU32 {
     }
 }
 
+extension rtc_OptionalF32 {
+    func asFloat32() -> Float32? {
+        if self.valid {
+            return self.value
+        } else {
+            return nil
+        }
+    }
+}
+
 extension rtc_Bytes {
     static func empty() -> Self {
         return Self(ptr: nil, count: 0)
@@ -66,6 +76,10 @@ extension rtc_Bytes {
         }
 
         return Self.allocate(from: Array(data))
+    }
+    
+    func isEmpty() -> Bool {
+        self.ptr == nil
     }
 
     func deallocate() {

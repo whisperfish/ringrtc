@@ -5,59 +5,79 @@
 
 //! The main Call Manager object definitions.
 
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
-use std::stringify;
-use std::sync::{Arc, MutexGuard};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
-
 #[cfg(feature = "sim")]
 use std::sync::{Condvar, Mutex};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet, VecDeque},
+    fmt, stringify,
+    sync::{Arc, LazyLock, MutexGuard},
+    thread,
+    time::{Duration, Instant, SystemTime},
+};
 
 use bytes::{Bytes, BytesMut};
-use lazy_static::lazy_static;
 use prost::Message;
+use zkgroup::call_links::CallLinkSecretParams;
 
-use crate::common::actor::{Actor, Stopper};
-use crate::common::{
-    ApplicationEvent, CallConfig, CallDirection, CallId, CallMediaType, CallState, DataMode,
-    DeviceId, Result, RingBench,
+use crate::{
+    common::{
+        ApplicationEvent, CallConfig, CallDirection, CallEndReason, CallId, CallMediaType,
+        CallState, DataMode, DeviceId, Result, RingBench,
+        actor::{Actor, Stopper},
+    },
+    core::{
+        assets::{self, AssetManager, AssetRegistry},
+        call::Call,
+        call_mutex::CallMutex,
+        call_rwlock::CallRwLock,
+        call_summary::CallSummary,
+        connection::{Connection, ConnectionType},
+        endorsements::{EndorsementUpdateResultRef, EndorsementsCache},
+        group_call::{
+            self, Client, ClientId, ClientStartParams, GroupCallKind, HttpSfuClient, Observer,
+            Reaction,
+        },
+        platform::Platform,
+        signaling::{self, ReceivedOffer},
+        util::{try_scoped, uuid_to_string},
+    },
+    error::RingRtcError,
+    lite::{
+        call_links::{self, CallLinkMemberResolver, CallLinkRootKey},
+        http,
+        sfu::{
+            self, DemuxId, GroupMember, MemberMap, MembershipProof, ObfuscatedResolver, PeekArgs,
+            PeekInfo, UserId,
+        },
+    },
+    protobuf,
+    webrtc::{
+        media::{AudioTrack, MediaStream, VideoSink, VideoTrack},
+        peer_connection::{AudioLevel, ReceivedAudioLevel},
+        peer_connection_factory::PeerConnectionFactory,
+        peer_connection_observer::NetworkRoute,
+    },
 };
-use crate::core::call::Call;
-use crate::core::call_mutex::CallMutex;
-use crate::core::connection::{Connection, ConnectionType};
-use crate::core::group_call::{HttpSfuClient, Observer, Reaction};
-use crate::core::platform::Platform;
-use crate::core::signaling::ReceivedOffer;
-use crate::core::util::{try_scoped, uuid_to_string};
-use crate::core::{group_call, signaling};
-use crate::error::RingRtcError;
-use crate::lite::call_links::{self, CallLinkRootKey};
-use crate::lite::{
-    http, sfu,
-    sfu::{DemuxId, GroupMember, MembershipProof, PeekInfo, UserId},
-};
-use crate::protobuf;
-use crate::webrtc::media::{AudioTrack, MediaStream, VideoSink, VideoTrack};
-use crate::webrtc::peer_connection::{AudioLevel, ReceivedAudioLevel};
-use crate::webrtc::peer_connection_factory::PeerConnectionFactory;
-use crate::webrtc::peer_connection_observer::NetworkRoute;
+
+/// Default SVC mode
+const DEFAULT_SVC_MODE: &str = "L3T3_KEY";
+/// Default SVC screenshare mode
+const DEFAULT_SVC_MODE_FOR_SCREENSHARE: &str = "L1T3";
 
 pub const MAX_MESSAGE_AGE: Duration = Duration::from_secs(60);
 const TIME_OUT_PERIOD: Duration = Duration::from_secs(60);
 
-lazy_static! {
-    static ref INCOMING_GROUP_CALL_RING_TIME: Duration =
-        std::env::var("INCOMING_GROUP_CALL_RING_SECS")
-            .ok()
-            .map(|secs| secs
-                .parse()
-                .expect("INCOMING_GROUP_CALL_RING_SECS must be an integer"))
-            .map(Duration::from_secs)
-            .unwrap_or(TIME_OUT_PERIOD);
-}
+static INCOMING_GROUP_CALL_RING_TIME: LazyLock<Duration> = LazyLock::new(|| {
+    std::env::var("INCOMING_GROUP_CALL_RING_SECS")
+        .ok()
+        .map(|secs| {
+            secs.parse()
+                .expect("INCOMING_GROUP_CALL_RING_SECS must be an integer")
+        })
+        .map(Duration::from_secs)
+        .unwrap_or(TIME_OUT_PERIOD)
+});
 
 /// Spawns a task on the worker thread to handle an API
 /// request with error handling.
@@ -79,7 +99,7 @@ macro_rules! handle_active_call_api {
                 error!("{} failed: {}", stringify!($f), err);
                 let _ = call_manager.internal_api_error(err);
             }
-        })
+        });
     }};
 }
 
@@ -119,7 +139,7 @@ macro_rules! handle_api {
             if let Err(err) = $f(&mut call_manager $( , $a)*) {
                 error!("{} failed: {}", stringify!($f), err);
             }
-        })
+        });
     }};
 }
 
@@ -185,6 +205,7 @@ where
 /// Information about a received group ring that hasn't yet been accepted or cancelled.
 #[derive(Debug)]
 struct OutstandingGroupRing {
+    sender_id: UserId,
     ring_id: group_call::RingId,
     received: Instant,
 }
@@ -215,23 +236,40 @@ enum ReceivedOfferCollision {
 /// Management of 1:1 call messages that arrive before the offer for a particular call.
 ///
 /// We don't save all message kinds here, only the ones that can affect an incoming call.
-enum PendingCallMessages {
+#[derive(Default)]
+enum PendingCallMessages<T>
+where
+    T: Platform,
+{
+    #[default]
     None,
     IceCandidates {
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: Vec<signaling::ReceivedIce>,
     },
     Hangup {
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedHangup,
     },
 }
 
-impl PendingCallMessages {
-    fn save_ice_candidates(&mut self, new_call_id: CallId, new_received: signaling::ReceivedIce) {
+impl<T> PendingCallMessages<T>
+where
+    T: Platform,
+{
+    fn save_ice_candidates(
+        &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
+        new_call_id: CallId,
+        new_received: signaling::ReceivedIce,
+    ) {
         info!("no active call; saving ice candidates for {}", new_call_id);
         match self {
-            PendingCallMessages::IceCandidates { call_id, received } if call_id == &new_call_id => {
+            PendingCallMessages::IceCandidates {
+                call_id, received, ..
+            } if call_id == &new_call_id => {
                 // Avoid growing unbounded.
                 if received.len() >= 30 {
                     received.remove(0);
@@ -250,12 +288,18 @@ impl PendingCallMessages {
             PendingCallMessages::None => {}
         }
         *self = PendingCallMessages::IceCandidates {
+            remote_peer,
             call_id: new_call_id,
             received: vec![new_received],
         }
     }
 
-    fn save_hangup(&mut self, new_call_id: CallId, new_received: signaling::ReceivedHangup) {
+    fn save_hangup(
+        &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
+        new_call_id: CallId,
+        new_received: signaling::ReceivedHangup,
+    ) {
         info!("no active call; saving hangup for {}", new_call_id);
         match self {
             PendingCallMessages::IceCandidates { call_id, .. } if call_id == &new_call_id => {
@@ -278,15 +322,10 @@ impl PendingCallMessages {
         }
 
         *self = PendingCallMessages::Hangup {
+            remote_peer,
             call_id: new_call_id,
             received: new_received,
         }
-    }
-}
-
-impl Default for PendingCallMessages {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -346,6 +385,153 @@ pub fn validate_call_message_as_opaque_ring(
     }
 }
 
+/// A wrapper for group call and call link clients.
+#[derive(Clone)]
+struct GroupCallClient {
+    /// The underlying group call or call link client.
+    client: group_call::Client,
+    /// Flag to indicate if the client is active or not. For a specific group, duplicate
+    /// clients can exist, but only one of those can be active at a time. A client is
+    /// considered `active` until the UI initiates a `disconnect`.
+    active: bool,
+}
+
+/// SVC configuration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SvcConfig {
+    /// The scalability mode to use.
+    pub mode: String,
+    /// The scalability mode to use for screenshare.
+    pub mode_for_screenshare: String,
+    /// The optional maximum bitrate (bps).
+    pub max_bitrate_bps: Option<i32>,
+}
+
+impl Default for SvcConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_SVC_MODE.to_owned(),
+            mode_for_screenshare: DEFAULT_SVC_MODE_FOR_SCREENSHARE.to_owned(),
+            max_bitrate_bps: None,
+        }
+    }
+}
+
+impl SvcConfig {
+    /// This function takes a scalability mode string as input and validates if it exists
+    /// within a predefined set of allowed scalability modes. The valid scalability
+    /// modes include various combinations such as "L1T1", "L2T1h", and so on.
+    pub fn is_valid_scalability_mode(mode: &str) -> bool {
+        const VALID_MODES: [&str; 34] = [
+            "L1T1",
+            "L1T2",
+            "L1T3",
+            "L2T1",
+            "L2T1h",
+            "L2T1_KEY",
+            "L2T2",
+            "L2T2h",
+            "L2T2_KEY",
+            "L2T2_KEY_SHIFT",
+            "L2T3",
+            "L2T3h",
+            "L2T3_KEY",
+            "L3T1",
+            "L3T1h",
+            "L3T1_KEY",
+            "L3T2",
+            "L3T2h",
+            "L3T2_KEY",
+            "L3T3",
+            "L3T3h",
+            "L3T3_KEY",
+            "S2T1",
+            "S2T1h",
+            "S2T2",
+            "S2T2h",
+            "S2T3",
+            "S2T3h",
+            "S3T1",
+            "S3T1h",
+            "S3T2",
+            "S3T2h",
+            "S3T3",
+            "S3T3h",
+        ];
+        VALID_MODES.contains(&mode)
+    }
+
+    /// Checks if the provided screenshare scalability mode is valid.
+    /// The valid screenshare scalability modes are: `"L1T1"`, `"L1T2"`, and `"L1T3"`.
+    pub fn is_valid_screenshare_scalability_mode(mode: &str) -> bool {
+        const VALID_MODES: [&str; 3] = ["L1T1", "L1T2", "L1T3"];
+        VALID_MODES.contains(&mode)
+    }
+
+    /// Validates and, if necessary, corrects the scalability modes in the given `SvcConfig`
+    /// structure. Consumes the given `SvcConfig` and returns a new one with updated
+    /// scalability mode values.
+    ///
+    /// The invalid values, will be changed to the appropriate default values.
+    pub fn validate_and_correct_if_necessary(svc_config: SvcConfig) -> SvcConfig {
+        let SvcConfig {
+            mode,
+            mode_for_screenshare,
+            max_bitrate_bps,
+        } = svc_config;
+        let mode = if Self::is_valid_scalability_mode(&mode) {
+            mode
+        } else {
+            warn!("SVC mode correction: '{mode}' -> '{}'", DEFAULT_SVC_MODE);
+            DEFAULT_SVC_MODE.to_owned()
+        };
+        let mode_for_screenshare =
+            if Self::is_valid_screenshare_scalability_mode(&mode_for_screenshare) {
+                mode_for_screenshare
+            } else {
+                warn!(
+                    "SVC screenshare mode correction: '{mode_for_screenshare}' -> '{}'",
+                    DEFAULT_SVC_MODE_FOR_SCREENSHARE
+                );
+                DEFAULT_SVC_MODE_FOR_SCREENSHARE.to_owned()
+            };
+        SvcConfig {
+            mode,
+            mode_for_screenshare,
+            max_bitrate_bps,
+        }
+    }
+}
+
+pub struct CreateGroupCallParams {
+    pub group_id: group_call::GroupId,
+    pub sfu_url: String,
+    pub hkdf_extra_info: Vec<u8>,
+    pub audio_levels_interval: Option<Duration>,
+    pub dred_duration: u8,
+    pub svc_config: Option<SvcConfig>,
+    pub peer_connection_factory: Option<PeerConnectionFactory>,
+    pub outgoing_audio_track: AudioTrack,
+    pub outgoing_video_track: VideoTrack,
+    pub incoming_video_sink: Option<Box<dyn VideoSink>>,
+}
+
+pub struct CreateCallLinkCallParams<'a> {
+    pub sfu_url: String,
+    pub endorsement_public_key: &'a [u8],
+    pub auth_presentation: &'a [u8],
+    pub root_key: CallLinkRootKey,
+    pub admin_passkey: Option<Vec<u8>>,
+    pub hkdf_extra_info: Vec<u8>,
+    pub audio_levels_interval: Option<Duration>,
+    pub dred_duration: u8,
+    pub svc_config: Option<SvcConfig>,
+    pub peer_connection_factory: Option<PeerConnectionFactory>,
+    pub outgoing_audio_track: AudioTrack,
+    pub outgoing_video_track: VideoTrack,
+    pub incoming_video_sink: Option<Box<dyn VideoSink>>,
+}
+
 pub struct CallManager<T>
 where
     T: Platform,
@@ -359,9 +545,9 @@ where
     /// CallId of the active call.
     active_call_id: Arc<CallMutex<Option<CallId>>>,
     /// 1:1 call messages that arrived before the Offer for a particular call.
-    pending_call_messages: Arc<CallMutex<PendingCallMessages>>,
+    pending_call_messages: Arc<CallMutex<PendingCallMessages<T>>>,
     /// Map of all group calls.
-    group_call_by_client_id: Arc<CallMutex<HashMap<group_call::ClientId, group_call::Client>>>,
+    group_call_by_client_id: Arc<CallMutex<HashMap<group_call::ClientId, GroupCallClient>>>,
     /// Next value of the group call client id (sequential).
     next_group_call_client_id: Arc<CallMutex<u32>>,
     /// Recent outstanding group rings, keyed by group ID.
@@ -374,6 +560,12 @@ where
     message_queue: Arc<CallMutex<SignalingMessageQueue<T>>>,
     /// How to make HTTP requests to the SFU for group calls.
     http_client: http::DelegatingClient,
+    /// Asset manager that holds a copy of assets in memory
+    /// Assets are initialized before the start of a call by
+    /// the application using the platform addAsset() function
+    /// Manager can be used to inject a registry handle into
+    /// call state.
+    asset_manager: Arc<CallRwLock<AssetManager>>,
 }
 
 impl<T> fmt::Display for CallManager<T>
@@ -439,6 +631,7 @@ where
             worker: self.worker.clone(),
             message_queue: Arc::clone(&self.message_queue),
             http_client: self.http_client.clone(),
+            asset_manager: self.asset_manager.clone(),
         }
     }
 }
@@ -457,6 +650,11 @@ where
         info!(
             "RingRTC v{}",
             option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
+        );
+
+        info!(
+            "WebRTC v{}",
+            option_env!("WEBRTC_VERSION").unwrap_or("unknown")
         );
 
         let worker_stopper = Stopper::new();
@@ -486,11 +684,28 @@ where
                 "message_queue",
             )),
             http_client,
+            asset_manager: Arc::new(CallRwLock::new(
+                AssetManager::new(assets::manifest::supported_assets()),
+                "asset-manager",
+            )),
         })
     }
 
     pub fn http_client(&self) -> &dyn http::Client {
         &self.http_client
+    }
+
+    pub fn asset_registry(&self) -> Result<AssetRegistry> {
+        Ok(self.asset_manager.read()?.get_registry())
+    }
+
+    /// Adds an asset to the asset manager, verifying it against the supported assets manifest.
+    pub fn add_asset(&self, asset_group: &str, handle: assets::AssetHandle) -> Result<()> {
+        info!("Adding asset for asset group {asset_group}");
+        self.asset_manager
+            .write()?
+            .add_asset_for_feature(asset_group, handle)?;
+        Ok(())
     }
 
     /// Updates the current user's UUID.
@@ -506,10 +721,10 @@ where
         remote_peer: <T as Platform>::AppRemotePeer,
         call_media_type: CallMediaType,
         local_device_id: DeviceId,
-    ) -> Result<()> {
+    ) {
         info!("API:call():");
         let call_id = CallId::random();
-        self.create_outgoing_call(remote_peer, call_id, call_media_type, local_device_id)
+        self.create_outgoing_call(remote_peer, call_id, call_media_type, local_device_id);
     }
 
     /// Create an outgoing call with specified CallId.
@@ -519,7 +734,7 @@ where
         call_id: CallId,
         call_media_type: CallMediaType,
         local_device_id: DeviceId,
-    ) -> Result<()> {
+    ) {
         info!("API:create_outgoing_call({}):", call_id);
 
         let mut call_manager = self.clone();
@@ -531,17 +746,17 @@ where
                 error!("Handle call failed: {}", err);
                 call_manager.internal_create_api_error(&remote_peer_error, call_id, err);
             }
-        })
+        });
     }
 
     /// Accept an incoming call.
-    pub fn accept_call(&mut self, call_id: CallId) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_accept_call, call_id)
+    pub fn accept_call(&mut self, call_id: CallId) {
+        handle_active_call_api!(self, CallManager::handle_accept_call, call_id);
     }
 
     /// Drop the active call.
-    pub fn drop_call(&mut self, call_id: CallId) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_drop_call, call_id)
+    pub fn drop_call(&mut self, call_id: CallId) {
+        handle_active_call_api!(self, CallManager::handle_drop_call, call_id);
     }
 
     /// Proceed with the outgoing call.
@@ -551,7 +766,7 @@ where
         app_call_context: <T as Platform>::AppCallContext,
         call_config: CallConfig,
         audio_levels_interval: Option<Duration>,
-    ) -> Result<()> {
+    ) {
         handle_active_call_api!(
             self,
             CallManager::handle_proceed,
@@ -559,34 +774,39 @@ where
             app_call_context,
             call_config,
             audio_levels_interval
-        )
+        );
     }
 
     /// OK for the library to continue to send signaling messages.
-    pub fn message_sent(&mut self, call_id: CallId) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_message_sent, call_id)
+    pub fn message_sent(&mut self, call_id: CallId) {
+        handle_active_call_api!(self, CallManager::handle_message_sent, call_id);
     }
 
     /// The previous message send failed. Handle, but continue to send signaling messages.
-    pub fn message_send_failure(&mut self, call_id: CallId) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_message_send_failure, call_id)
+    pub fn message_send_failure(&mut self, call_id: CallId) {
+        handle_active_call_api!(self, CallManager::handle_message_send_failure, call_id);
     }
 
     /// Local hangup of the active call.
-    pub fn hangup(&mut self) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_hangup)
+    pub fn hangup(&mut self) {
+        handle_active_call_api!(self, CallManager::handle_hangup);
     }
 
+    /// removes outstanding group ring. If expected user ID is specified, verifies the pending
+    /// ring's sender_id matches before removing
     fn remove_outstanding_group_ring(
         &mut self,
         group_id: group_call::GroupIdRef,
+        expected_user_id: Option<&UserId>,
         ring_id: group_call::RingId,
     ) -> Result<()> {
         let mut outstanding_group_rings = self.outstanding_group_rings.lock()?;
-        if let Some(ring) = outstanding_group_rings.get(group_id) {
-            if ring.ring_id == ring_id {
-                outstanding_group_rings.remove(group_id);
-            }
+        if let Some(ring) = outstanding_group_rings.get(group_id)
+            && ring.ring_id == ring_id
+            && expected_user_id
+                .is_none_or(|expected| ring.sender_id.as_slice() == expected.as_slice())
+        {
+            outstanding_group_rings.remove(group_id);
         }
         Ok(())
     }
@@ -600,7 +820,7 @@ where
     ) -> Result<()> {
         info!("cancel_group_ring(): ring_id: {}", ring_id);
 
-        self.remove_outstanding_group_ring(&group_id, ring_id)?;
+        self.remove_outstanding_group_ring(&group_id, None, ring_id)?;
 
         if let Some(reason) = reason {
             let self_uuid = self
@@ -642,7 +862,7 @@ where
         remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedOffer,
-    ) -> Result<()> {
+    ) {
         info!("API:received_offer():");
 
         let mut call_manager = self.clone();
@@ -652,43 +872,71 @@ where
                 error!("Handle received offer failed: {}", err);
                 call_manager.internal_create_api_error(&remote_peer_error, call_id, err);
             }
-        })
+        });
     }
 
     /// Received answer from application.
     pub fn received_answer(
         &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedAnswer,
-    ) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_received_answer, call_id, received)
+    ) {
+        handle_active_call_api!(
+            self,
+            CallManager::handle_received_answer,
+            remote_peer,
+            call_id,
+            received
+        );
     }
 
     /// Received ICE candidates from application.
     pub fn received_ice(
         &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedIce,
-    ) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_received_ice, call_id, received)
+    ) {
+        handle_active_call_api!(
+            self,
+            CallManager::handle_received_ice,
+            remote_peer,
+            call_id,
+            received
+        );
     }
 
     /// Received hangup message from application.
     pub fn received_hangup(
         &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedHangup,
-    ) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_received_hangup, call_id, received)
+    ) {
+        handle_active_call_api!(
+            self,
+            CallManager::handle_received_hangup,
+            remote_peer,
+            call_id,
+            received
+        );
     }
 
     /// Received busy message from application.
     pub fn received_busy(
         &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedBusy,
-    ) -> Result<()> {
-        handle_active_call_api!(self, CallManager::handle_received_busy, call_id, received)
+    ) {
+        handle_active_call_api!(
+            self,
+            CallManager::handle_received_busy,
+            remote_peer,
+            call_id,
+            received
+        );
     }
 
     /// Received a call message from the application.
@@ -699,7 +947,7 @@ where
         local_device_id: DeviceId,
         message: Vec<u8>,
         message_age: Duration,
-    ) -> Result<()> {
+    ) {
         handle_api!(
             self,
             CallManager::handle_received_call_message,
@@ -708,12 +956,12 @@ where
             local_device_id,
             message,
             message_age
-        )
+        );
     }
 
     /// Received a HTTP response from the application.
     pub fn received_http_response(&mut self, request_id: u32, response: Option<http::Response>) {
-        let _ = handle_api!(
+        handle_api!(
             self,
             CallManager::handle_received_http_response,
             request_id,
@@ -725,8 +973,8 @@ where
     ///
     /// Conclude all calls and clear active callId.  Do not notify the
     /// application at the conclusion.
-    pub fn reset(&mut self) -> Result<()> {
-        handle_api!(self, CallManager::handle_reset)
+    pub fn reset(&mut self) {
+        handle_api!(self, CallManager::handle_reset);
     }
 
     /// Close down the Call Manager.
@@ -739,7 +987,7 @@ where
 
         if !self.worker.stopper().has_been_stopped() {
             // Clear out any outstanding calls
-            let _ = self.reset();
+            self.reset();
 
             self.worker.stopper().stop_all_and_join();
 
@@ -818,15 +1066,15 @@ where
         for i in 0..3 {
             info!("synchronize(): pass: {}", i);
             let mut calls = self.call_by_call_id.lock()?.clone();
-            for (_, call) in calls.iter_mut() {
+            for call in calls.values_mut() {
                 info!("synchronize(): syncing call: {}", call.call_id());
                 call.synchronize()?;
             }
 
             let mut group_calls = self.group_call_by_client_id.lock()?.clone();
-            for (client_id, call) in group_calls.iter_mut() {
+            for (client_id, group_call) in group_calls.iter_mut() {
                 info!("synchronize(): syncing group call: {}", client_id);
-                call.synchronize();
+                group_call.client.synchronize();
             }
 
             self.sync_worker_thread()?;
@@ -846,7 +1094,7 @@ where
     }
 
     /// Spawn a task on the worker thread, unless we are shutting down.
-    fn worker_spawn<F>(&mut self, f: F) -> Result<()>
+    fn worker_spawn<F>(&mut self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
@@ -855,14 +1103,13 @@ where
         } else {
             warn!("worker_spawn(): worker unavailable");
         }
-        Ok(())
     }
 
     #[cfg(feature = "sim")]
-    fn worker_start_sync(&mut self, sync_condvar: Arc<(Mutex<bool>, Condvar)>) -> Result<()> {
+    fn worker_start_sync(&mut self, sync_condvar: Arc<(Mutex<bool>, Condvar)>) {
         self.worker_spawn(move || {
             // signal the condvar
-            info!("sync_worker_thread(): syncing");
+            info!("worker_start_sync(): syncing");
             let (mutex, condvar) = &*sync_condvar;
             if let Ok(mut terminate_complete) = mutex.lock() {
                 *terminate_complete = true;
@@ -871,7 +1118,7 @@ where
                 // Not much else to do here.
                 error!("Close call manager mutex poisoned");
             }
-        })
+        });
     }
 
     #[cfg(feature = "sim")]
@@ -898,10 +1145,10 @@ where
     }
 
     #[cfg(feature = "sim")]
-    fn sync_worker_thread(&mut self) -> Result<()> {
+    pub fn sync_worker_thread(&mut self) -> Result<()> {
         // cycle a condvar through the worker thread
         let condvar = Arc::new((Mutex::new(false), Condvar::new()));
-        self.worker_start_sync(condvar.clone())?;
+        self.worker_start_sync(condvar.clone());
 
         // This blocks while the thread synchronizes.
         self.wait_worker_sync(condvar)
@@ -924,7 +1171,7 @@ where
     /// Terminates Call and optionally notifies application of the reason why.
     /// Also removes/drops it from the map.
     fn terminate_and_drop_call(&mut self, call_id: CallId) -> Result<()> {
-        info!("terminate_call(): call_id: {}", call_id);
+        info!("terminate_and_drop_call(): call_id: {}", call_id);
 
         let mut call = match self.call_by_call_id.lock()?.remove(&call_id) {
             Some(v) => v,
@@ -968,63 +1215,85 @@ where
         self.send_next_message(Some(message_item))
     }
 
-    /// Concludes the specified Call.
+    /// Terminates the specified Call.
     ///
-    /// Conclusion includes:
+    /// Termination includes:
     /// - Trimming the message_queue, before possibly sending hangup message(s)
     /// - [optional] notifying application about call ended reason
-    /// - closing down Call object
+    /// - Closing down Call object
     /// - [optional] sending hangup on all connections via RTP data
     /// - [optional] sending Signal hangup message
+    ///
+    /// Don't return early on error; log it and continue to ensure a complete
+    /// teardown of the call.
     fn terminate_call(
         &mut self,
         mut call: Call<T>,
         hangup: Option<signaling::Hangup>,
-        event: Option<ApplicationEvent>,
-    ) -> Result<()> {
+        reason: Option<CallEndReason>,
+    ) {
         let call_id = call.call_id();
 
-        info!("conclude_call(): call_id: {}", call_id);
+        info!("terminate_call(): call_id: {}", call_id);
 
-        self.trim_messages(call_id)?;
+        if let Err(err) = self.trim_messages(call_id) {
+            error!("terminate_call(): failed to trim messages: {}", err);
+        }
 
-        if let Some(event) = event {
-            let remote_peer = call.remote_peer()?;
-            self.notify_application(&remote_peer, call_id, event)?;
+        if let Some(reason) = reason
+            && let Err(err) = try_scoped(|| {
+                let remote_peer = call.remote_peer()?;
+                let summary = call
+                    .summary()
+                    .build_call_summary(Some(call_id.call_summary_hash()), reason);
+                self.on_call_ended(&remote_peer, call_id, reason, summary)
+            })
+        {
+            error!("terminate_call(): failed to notify call ended: {}", err);
         }
 
         if let Some(hangup) = hangup {
             // All connections send hangup via RTP data.
-            call.inject_send_hangup_via_rtp_data_to_all(hangup)?;
+            if let Err(err) = call.inject_send_hangup_via_rtp_data_to_all(hangup) {
+                error!("terminate_call(): failed to hangup via RTP data: {}", err);
+            }
         }
 
         let mut call_manager = self.clone();
         self.worker_spawn(move || {
-            let err = try_scoped(|| {
-                if let Some(hangup) = hangup {
-                    // If we want to send a hangup message, be sure that
-                    // the call actually should send one.
-                    if call.should_send_hangup() {
-                        call.send_hangup_via_signaling_to_all(hangup)?;
-                    }
-                }
-                call_manager.terminate_and_drop_call(call_id)
-            });
-            if let Err(err) = err {
-                error!("Conclude call failed: {}", err);
-                if let Ok(remote_peer) = call.remote_peer() {
-                    let _ = call_manager.notify_application(
-                        &remote_peer,
-                        call_id,
-                        ApplicationEvent::EndedInternalFailure,
-                    );
-                }
+            let mut failed = false;
+
+            // If we want to send a hangup message, be sure that the call
+            // actually should send one.
+            if let Some(hangup) = hangup
+                && call.should_send_hangup()
+                && let Err(err) = call.send_hangup_via_signaling_to_all(hangup)
+            {
+                error!("terminate_call(): failed to hangup via signaling: {}", err);
+                failed = true;
             }
-        })
+
+            if let Err(err) = call_manager.terminate_and_drop_call(call_id) {
+                error!(
+                    "terminate_call(): failed to terminate and drop call: {}",
+                    err
+                );
+                failed = true;
+            }
+
+            if failed && let Ok(remote_peer) = call.remote_peer() {
+                let _ = call_manager.on_call_ended(
+                    &remote_peer,
+                    call_id,
+                    CallEndReason::InternalFailure,
+                    CallSummary::default(),
+                );
+            }
+        });
     }
 
     /// Terminates the active call.
-    fn terminate_active_call(&mut self, send_hangup: bool, event: ApplicationEvent) -> Result<()> {
+    fn terminate_active_call(&mut self, send_hangup: bool, reason: CallEndReason) -> Result<()> {
         info!("terminate_active_call():");
 
         if !self.call_active()? {
@@ -1042,7 +1311,8 @@ where
             None
         };
 
-        self.terminate_call(call, hangup, Some(event))
+        self.terminate_call(call, hangup, Some(reason));
+        Ok(())
     }
 
     /// Handle call() API from application.
@@ -1116,11 +1386,12 @@ where
         &mut self,
         active_call: Call<T>,
         hangup: Option<signaling::Hangup>,
-        event: ApplicationEvent,
+        reason: CallEndReason,
     ) -> Result<()> {
         self.clear_active_call()?;
         self.release_busy()?;
-        self.terminate_call(active_call, hangup, Some(event))
+        self.terminate_call(active_call, hangup, Some(reason));
+        Ok(())
     }
 
     /// Handle drop_call() API from application.
@@ -1137,7 +1408,7 @@ where
             return Ok(());
         }
 
-        self.handle_terminate_active_call(active_call, None, ApplicationEvent::EndedAppDroppedCall)
+        self.handle_terminate_active_call(active_call, None, CallEndReason::AppDroppedCall)
     }
 
     /// Handle proceed() API from application.
@@ -1178,64 +1449,58 @@ where
 
     /// Handle message_send_failure() API from application.
     fn handle_message_send_failure(&mut self, call_id: CallId) -> Result<()> {
-        let mut is_active_call = false;
-        let mut should_handle = true;
-
-        if let Ok(active_call) = self.active_call() {
-            if active_call.call_id() == call_id {
-                is_active_call = true;
-                if let Ok(state) = active_call.state() {
-                    if state.connected_or_reconnecting() {
-                        // Get the last sent message type and see if it was for ICE.
-                        // Since we are in a connected state, don't handle it if so.
-                        if let Ok(message_queue) = self.message_queue.lock() {
-                            if message_queue.last_sent_message_type
-                                == Some(signaling::MessageType::Ice)
-                            {
-                                should_handle = false
-                            }
-                        }
-                    }
+        let (call, is_active) = self
+            .active_call()
+            .ok()
+            .filter(|call| call.call_id() == call_id)
+            .map(|call| (Some(call), true))
+            .unwrap_or_else(|| {
+                if let Ok(call_map) = self.call_by_call_id.lock() {
+                    (call_map.get(&call_id).cloned(), false)
+                } else {
+                    (None, false)
                 }
-            }
-        }
+            });
 
-        if should_handle {
-            if is_active_call {
+        if let Some(call) = call {
+            if is_active {
+                // Get the last sent message type and see if it was for ICE.
+                // Since we are in a connected state, don't handle it if so.
+                if call
+                    .state()
+                    .is_ok_and(|state| state.connected_or_reconnecting())
+                    && self.message_queue.lock().is_ok_and(|queue| {
+                        queue.last_sent_message_type == Some(signaling::MessageType::Ice)
+                    })
+                {
+                    warn!(
+                        "handle_message_send_failure(): id: {}, failed to send ICE message but staying in call",
+                        call_id
+                    );
+                } else {
+                    info!(
+                        "handle_message_send_failure(): id: {}, terminating active call",
+                        call_id
+                    );
+                    let _ = self.terminate_active_call(
+                        call.should_send_hangup_on_failure(),
+                        CallEndReason::SignalingFailure,
+                    );
+                }
+            } else {
                 info!(
-                    "handle_message_send_failure(): id: {}, concluding active call",
+                    "handle_message_send_failure(): id: {}, terminating call",
                     call_id
                 );
 
-                let _ = self.terminate_active_call(true, ApplicationEvent::EndedSignalingFailure);
-            } else {
-                // See if the associated call is in the call map.
-                let mut call = None;
-                {
-                    if let Ok(call_map) = self.call_by_call_id.lock() {
-                        if let Some(v) = call_map.get(&call_id) {
-                            call = Some(v.clone());
-                        };
-                    }
-                }
+                let hangup = call
+                    .should_send_hangup_on_failure()
+                    .then_some(signaling::Hangup::Normal);
 
-                match call {
-                    Some(call) => {
-                        info!(
-                            "handle_message_send_failure(): id: {}, concluding call",
-                            call_id
-                        );
-                        self.terminate_call(
-                            call,
-                            Some(signaling::Hangup::Normal),
-                            Some(ApplicationEvent::EndedSignalingFailure),
-                        )?;
-                    }
-                    None => {
-                        info!("handle_message_send_failure(): no matching call found");
-                    }
-                }
+                self.terminate_call(call, hangup, Some(CallEndReason::SignalingFailure));
             }
+        } else {
+            info!("handle_message_send_failure(): no matching call found");
         }
 
         match self.message_queue.lock() {
@@ -1260,7 +1525,7 @@ where
         self.handle_terminate_active_call(
             active_call,
             Some(signaling::Hangup::Normal),
-            ApplicationEvent::EndedLocalHangup,
+            CallEndReason::LocalHangup,
         )
     }
 
@@ -1275,10 +1540,9 @@ where
             RingBench::App,
             RingBench::Cm,
             format!(
-                "received_offer()\t{}\t{}\tprimary={}\t{}\t{}",
+                "received_offer()\t{}\t{}\t{}\t{}",
                 incoming_call_id,
                 received.sender_device_id,
-                received.receiver_device_is_primary,
                 received.offer.to_info_string(),
                 received.receiver_device_id,
             )
@@ -1341,8 +1605,8 @@ where
 
         enum ActiveCallAction {
             DontTerminate,
-            TerminateAndSendHangup(ApplicationEvent),
-            TerminateWithoutSendingHangup(ApplicationEvent),
+            TerminateAndSendHangup(CallEndReason),
+            TerminateWithoutSendingHangup(CallEndReason),
         }
 
         enum IncomingCallAction {
@@ -1364,36 +1628,34 @@ where
                 IncomingCallAction::Ignore(ApplicationEvent::ReceivedOfferWithGlare),
             ),
             ReceivedOfferCollision::GlareLoser => (
-                ActiveCallAction::TerminateAndSendHangup(ApplicationEvent::EndedRemoteGlare),
+                ActiveCallAction::TerminateAndSendHangup(CallEndReason::RemoteGlare),
                 IncomingCallAction::Start,
             ),
             ReceivedOfferCollision::GlareDoubleLoser => (
-                ActiveCallAction::TerminateAndSendHangup(ApplicationEvent::EndedRemoteGlare),
-                IncomingCallAction::RejectAsBusy(ApplicationEvent::EndedGlareHandlingFailure),
+                ActiveCallAction::TerminateAndSendHangup(CallEndReason::RemoteGlare),
+                IncomingCallAction::RejectAsBusy(ApplicationEvent::GlareHandlingFailure),
             ),
             ReceivedOfferCollision::ReCall => (
-                ActiveCallAction::TerminateWithoutSendingHangup(
-                    ApplicationEvent::EndedRemoteReCall,
-                ),
+                ActiveCallAction::TerminateWithoutSendingHangup(CallEndReason::RemoteReCall),
                 IncomingCallAction::Start,
             ),
         };
 
         match active_call_action {
             ActiveCallAction::DontTerminate => {}
-            ActiveCallAction::TerminateAndSendHangup(app_event) => {
+            ActiveCallAction::TerminateAndSendHangup(reason) => {
                 self.clear_active_call()?;
                 *busy = false;
                 self.terminate_call(
                     active_call.unwrap(),
                     Some(signaling::Hangup::Normal),
-                    Some(app_event),
-                )?;
+                    Some(reason),
+                );
             }
-            ActiveCallAction::TerminateWithoutSendingHangup(app_event) => {
+            ActiveCallAction::TerminateWithoutSendingHangup(reason) => {
                 self.clear_active_call()?;
                 *busy = false;
-                self.terminate_call(active_call.unwrap(), None, Some(app_event))?;
+                self.terminate_call(active_call.unwrap(), None, Some(reason));
             }
         }
 
@@ -1425,17 +1687,35 @@ where
 
                 match std::mem::take(&mut *self.pending_call_messages.lock()?) {
                     PendingCallMessages::None => {}
-                    PendingCallMessages::IceCandidates { call_id, received }
-                        if call_id == incoming_call_id =>
-                    {
+                    PendingCallMessages::IceCandidates {
+                        remote_peer: pending_remote_peer,
+                        call_id,
+                        received,
+                    } if call_id == incoming_call_id => {
                         for received in received {
-                            incoming_call.inject_received_ice(received)?;
+                            if self
+                                .platform
+                                .lock()?
+                                .compare_remotes(&pending_remote_peer, &remote_peer)
+                                .unwrap_or(false)
+                            {
+                                incoming_call.inject_received_ice(received)?;
+                            }
                         }
                     }
-                    PendingCallMessages::Hangup { call_id, received }
-                        if call_id == incoming_call_id =>
-                    {
-                        incoming_call.inject_received_hangup(received)?;
+                    PendingCallMessages::Hangup {
+                        remote_peer: pending_remote_peer,
+                        call_id,
+                        received,
+                    } if call_id == incoming_call_id => {
+                        if self
+                            .platform
+                            .lock()?
+                            .compare_remotes(&pending_remote_peer, &remote_peer)
+                            .unwrap_or(false)
+                        {
+                            incoming_call.inject_received_hangup(received)?;
+                        }
                     }
                     PendingCallMessages::IceCandidates { call_id, .. }
                     | PendingCallMessages::Hangup { call_id, .. } => {
@@ -1450,6 +1730,7 @@ where
     /// Handle received_answer() API from application.
     fn handle_received_answer(
         &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedAnswer,
     ) -> Result<()> {
@@ -1470,12 +1751,24 @@ where
             return Ok(());
         }
 
-        active_call.inject_received_answer(received)
+        let active_remote_peer = active_call.remote_peer()?.clone();
+        if self
+            .platform
+            .lock()?
+            .compare_remotes(&active_remote_peer, &remote_peer)
+            .unwrap_or(false)
+        {
+            active_call.inject_received_answer(received)
+        } else {
+            warn!("Unexpected remote peer for answer, ignoring");
+            Ok(())
+        }
     }
 
     /// Handle received_ice() API from application.
     fn handle_received_ice(
         &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedIce,
     ) -> Result<()> {
@@ -1492,14 +1785,26 @@ where
 
         match self.active_call() {
             Ok(mut active_call) if active_call.call_id() == call_id => {
-                active_call.inject_received_ice(received)?;
+                let active_remote_peer = active_call.remote_peer()?.clone();
+                if self
+                    .platform
+                    .lock()?
+                    .compare_remotes(&active_remote_peer, &remote_peer)
+                    .unwrap_or(false)
+                {
+                    active_call.inject_received_ice(received)?;
+                } else {
+                    warn!("Unexpected remote peer for ice, ignoring");
+                }
             }
             Ok(active_call) => {
                 if active_call.direction() == CallDirection::Outgoing {
                     // Save the ICE candidates anyway, in case we have a glare scenario.
-                    self.pending_call_messages
-                        .lock()?
-                        .save_ice_candidates(call_id, received);
+                    self.pending_call_messages.lock()?.save_ice_candidates(
+                        remote_peer,
+                        call_id,
+                        received,
+                    );
                 }
             }
             Err(_) => {
@@ -1507,9 +1812,11 @@ where
                     // We're in a group call. Discard the candidates.
                 } else {
                     // Save it for later in case it's arriving out-of-order.
-                    self.pending_call_messages
-                        .lock()?
-                        .save_ice_candidates(call_id, received);
+                    self.pending_call_messages.lock()?.save_ice_candidates(
+                        remote_peer,
+                        call_id,
+                        received,
+                    );
                 }
             }
         }
@@ -1520,6 +1827,7 @@ where
     /// Handle received_hangup() API from application.
     fn handle_received_hangup(
         &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedHangup,
     ) -> Result<()> {
@@ -1534,14 +1842,24 @@ where
 
         match self.active_call() {
             Ok(mut active_call) if active_call.call_id() == call_id => {
-                active_call.inject_received_hangup(received)?;
+                let active_remote_peer = active_call.remote_peer()?.clone();
+                if self
+                    .platform
+                    .lock()?
+                    .compare_remotes(&active_remote_peer, &remote_peer)
+                    .unwrap_or(false)
+                {
+                    active_call.inject_received_hangup(received)?;
+                } else {
+                    warn!("Unexpected remote peer for hangup, ignoring");
+                }
             }
             Ok(active_call) => {
                 if active_call.direction() == CallDirection::Outgoing {
                     // Save the hangup anyway, in case we have a glare scenario.
                     self.pending_call_messages
                         .lock()?
-                        .save_hangup(call_id, received);
+                        .save_hangup(remote_peer, call_id, received);
                 }
             }
             Err(_) => {
@@ -1551,7 +1869,7 @@ where
                     // Save it for later in case it's arriving out-of-order.
                     self.pending_call_messages
                         .lock()?
-                        .save_hangup(call_id, received);
+                        .save_hangup(remote_peer, call_id, received);
                 }
             }
         }
@@ -1562,6 +1880,7 @@ where
     /// Handle received_busy() API from application.
     fn handle_received_busy(
         &mut self,
+        remote_peer: <T as Platform>::AppRemotePeer,
         call_id: CallId,
         received: signaling::ReceivedBusy,
     ) -> Result<()> {
@@ -1578,14 +1897,25 @@ where
             return Ok(());
         }
 
-        // Invoke hangup_other for the call, which will inject hangup/busy
-        // to all connections, if any.
-        let hangup = signaling::Hangup::BusyOnAnotherDevice(sender_device_id);
-        active_call
-            .send_hangup_via_rtp_data_and_signaling_to_all_except(hangup, sender_device_id)?;
+        let active_remote_peer = active_call.remote_peer()?.clone();
+        if self
+            .platform
+            .lock()?
+            .compare_remotes(&active_remote_peer, &remote_peer)
+            .unwrap_or(false)
+        {
+            // Invoke hangup_other for the call, which will inject hangup/busy
+            // to all connections, if any.
+            let hangup = signaling::Hangup::BusyOnAnotherDevice(sender_device_id);
+            active_call
+                .send_hangup_via_rtp_data_and_signaling_to_all_except(hangup, sender_device_id)?;
 
-        // Handle the normal processing of busy by concluding the call locally.
-        self.handle_terminate_active_call(active_call, None, ApplicationEvent::EndedRemoteBusy)
+            // Handle the normal processing of busy by concluding the call locally.
+            self.handle_terminate_active_call(active_call, None, CallEndReason::RemoteBusy)
+        } else {
+            warn!("Unexpected remote peer for busy, ignoring");
+            Ok(())
+        }
     }
 
     /// Handle received_call_message() API from the application.
@@ -1640,7 +1970,11 @@ where
                                 }
                             }
                             IntentionType::Cancelled => {
-                                self.remove_outstanding_group_ring(group_id, ring_id.into())?;
+                                self.remove_outstanding_group_ring(
+                                    group_id,
+                                    Some(&sender_uuid),
+                                    ring_id.into(),
+                                )?;
                                 group_call::RingUpdate::CancelledByRinger
                             }
                         };
@@ -1699,7 +2033,7 @@ where
                             }
                             ResponseType::Ringing => unreachable!("handled above"),
                         };
-                        self.remove_outstanding_group_ring(group_id, ring_id.into())?;
+                        self.remove_outstanding_group_ring(group_id, None, ring_id.into())?;
                         self.platform.lock()?.group_call_ring_update(
                             std::mem::take(group_id),
                             ring_id.into(),
@@ -1721,11 +2055,13 @@ where
                         .group_call_by_client_id
                         .lock()
                         .expect("lock group_call_by_client_id");
-                    let group_call = group_calls.values().find(|c| &c.group_id == group_id);
+                    let group_call = group_calls
+                        .values()
+                        .find(|c| &c.client.group_id == group_id && c.active);
                     match group_call {
-                        Some(call) => {
-                            call.on_signaling_message_received(sender_uuid, group_call_message)
-                        }
+                        Some(group_call) => group_call
+                            .client
+                            .on_signaling_message_received(sender_uuid, group_call_message),
                         None => warn!("Received signaling message for unknown group ID"),
                     };
                 }
@@ -1753,6 +2089,7 @@ where
             outstanding_group_rings.insert(
                 group_id.clone(),
                 OutstandingGroupRing {
+                    sender_id: sender_uuid.clone(),
                     ring_id,
                     received: Instant::now(),
                 },
@@ -1763,8 +2100,10 @@ where
             if let Ok(mut group_calls) = self.group_call_by_client_id.lock() {
                 group_calls
                     .values_mut()
-                    .filter(|call| call.group_id == group_id)
-                    .for_each(|call| call.provide_ring_id_if_absent(ring_id))
+                    .filter(|group_call| {
+                        group_call.client.group_id == group_id && group_call.active
+                    })
+                    .for_each(|group_call| group_call.client.provide_ring_id_if_absent(ring_id))
             } else {
                 // Ignore the failure to lock; it's more important that we cancel the ring.
             }
@@ -1774,7 +2113,11 @@ where
         self.worker
             .send_delayed(*INCOMING_GROUP_CALL_RING_TIME, move |_| {
                 let result = try_scoped(|| {
-                    self_for_timeout.remove_outstanding_group_ring(&group_id, ring_id)?;
+                    self_for_timeout.remove_outstanding_group_ring(
+                        &group_id,
+                        Some(&sender_uuid),
+                        ring_id,
+                    )?;
                     self_for_timeout.platform.lock()?.group_call_ring_update(
                         group_id,
                         ring_id,
@@ -1793,12 +2136,15 @@ where
 
     #[cfg(feature = "sim")]
     pub fn age_all_outstanding_group_rings(&mut self, age: Duration) {
-        for (_group_id, ring) in self.outstanding_group_rings.lock().unwrap().iter_mut() {
+        for ring in self.outstanding_group_rings.lock().unwrap().values_mut() {
             ring.received -= age;
         }
     }
 
     /// Handle receiving an HTTP response from the application.
+    // Infallible, but `handle_api!` matches on the handler's error, and this handler must
+    // return a Result.
+    #[allow(clippy::unnecessary_wraps)]
     fn handle_received_http_response(
         &mut self,
         request_id: u32,
@@ -1829,7 +2175,7 @@ where
         // foreach call, terminate without notifying application
         for call in calls {
             info!("reset(): terminating call_id: {}", call.call_id());
-            let _ = self.terminate_call(call, Some(signaling::Hangup::Normal), None);
+            self.terminate_call(call, Some(signaling::Hangup::Normal), None);
         }
 
         self.clear_active_call()?;
@@ -1941,12 +2287,11 @@ where
         active_call: &Call<T>,
         remote_peer: &<T as Platform>::AppRemotePeer,
     ) -> bool {
-        if let Ok(active_remote_peer) = active_call.remote_peer() {
-            if let Ok(platform) = self.platform.lock() {
-                if let Ok(result) = platform.compare_remotes(&active_remote_peer, remote_peer) {
-                    return result;
-                }
-            }
+        if let Ok(active_remote_peer) = active_call.remote_peer()
+            && let Ok(platform) = self.platform.lock()
+            && let Ok(result) = platform.compare_remotes(&active_remote_peer, remote_peer)
+        {
+            return result;
         }
         false
     }
@@ -1963,20 +2308,24 @@ where
         error: anyhow::Error,
     ) {
         info!("internal_create_api_error(): error: {}", error);
-        if let Ok(active_call) = self.active_call() {
-            if self.remote_peer_equals_active(&active_call, remote_peer) {
-                // The task managed to create the active call and then
-                // hit problems.  Error out with active call clean up.
-                let _ = self.internal_api_error(error);
-                return;
-            }
+        if let Ok(active_call) = self.active_call()
+            && self.remote_peer_equals_active(&active_call, remote_peer)
+        {
+            // The task managed to create the active call and then
+            // hit problems.  Error out with active call clean up.
+            let _ = self.internal_api_error(error);
+            return;
         }
 
         // The task hit problems before creating or accessing
         // an active call. Simply notify the application with no
         // call clean up.
-        let _ =
-            self.notify_application(remote_peer, call_id, ApplicationEvent::EndedInternalFailure);
+        let _ = self.on_call_ended(
+            remote_peer,
+            call_id,
+            CallEndReason::InternalFailure,
+            CallSummary::default(),
+        );
         let _ = self.notify_call_concluded(remote_peer, call_id);
     }
 
@@ -2145,6 +2494,23 @@ where
         platform.on_start_call(remote_peer, call_id, direction, call_media_type)
     }
 
+    pub(super) fn on_call_ended(
+        &self,
+        remote_peer: &<T as Platform>::AppRemotePeer,
+        call_id: CallId,
+        reason: CallEndReason,
+        summary: CallSummary,
+    ) -> Result<()> {
+        ringbench!(
+            RingBench::Cm,
+            RingBench::App,
+            format!("on_call_ended({reason})")
+        );
+
+        let platform = self.platform.lock()?;
+        platform.on_call_ended(remote_peer, call_id, reason, summary)
+    }
+
     /// Notify application of an event.
     pub(super) fn notify_application(
         &self,
@@ -2253,14 +2619,14 @@ where
     pub(super) fn remote_hangup(
         &mut self,
         call_id: CallId,
-        app_event_override: Option<ApplicationEvent>,
+        end_reason_override: Option<CallEndReason>,
     ) -> Result<()> {
         info!("remote_hangup(): call_id: {}", call_id);
 
         if self.call_is_active(call_id)? {
-            match app_event_override {
-                Some(event) => self.terminate_active_call(false, event),
-                None => self.terminate_active_call(false, ApplicationEvent::EndedRemoteHangup),
+            match end_reason_override {
+                Some(end_reason) => self.terminate_active_call(false, end_reason),
+                None => self.terminate_active_call(false, CallEndReason::RemoteHangup),
             }
         } else {
             info!("remote_hangup(): ignoring for inactive call");
@@ -2306,7 +2672,7 @@ where
         info!("timeout(): call_id: {}", call_id);
 
         if self.call_is_active(call_id)? {
-            self.terminate_active_call(true, ApplicationEvent::EndedTimeout)
+            self.terminate_active_call(true, CallEndReason::Timeout)
         } else {
             info!("timeout(): ignoring for inactive call");
             Ok(())
@@ -2315,12 +2681,16 @@ where
 
     /// Network failure occurred on the active call.
     pub(super) fn connection_failure(&mut self, call_id: CallId) -> Result<()> {
-        info!("call_failed(): call_id: {}", call_id);
+        info!("connection_failure(): call_id: {}", call_id);
 
         if self.call_is_active(call_id)? {
-            self.terminate_active_call(true, ApplicationEvent::EndedConnectionFailure)
+            let call = self.active_call()?;
+            self.terminate_active_call(
+                call.should_send_hangup_on_failure(),
+                CallEndReason::ConnectionFailure,
+            )
         } else {
-            info!("call_failed(): ignoring for inactive call");
+            info!("connection_failure(): ignoring for inactive call");
             Ok(())
         }
     }
@@ -2333,7 +2703,11 @@ where
         info!("internal_error(): call_id: {}, error: {}", call_id, error);
 
         if self.call_is_active(call_id)? {
-            self.terminate_active_call(true, ApplicationEvent::EndedInternalFailure)
+            let call = self.active_call()?;
+            self.terminate_active_call(
+                call.should_send_hangup_on_failure(),
+                CallEndReason::InternalFailure,
+            )
         } else {
             info!("internal_error(): ignoring for inactive call");
             Ok(())
@@ -2592,6 +2966,15 @@ where
         );
     }
 
+    fn handle_speaking_notification(
+        &mut self,
+        client_id: group_call::ClientId,
+        event: group_call::SpeechEvent,
+    ) {
+        info!("handle_speaking_notification():");
+        platform_handler!(self, handle_speaking_notification, client_id, event);
+    }
+
     fn handle_audio_levels(
         &self,
         client_id: group_call::ClientId,
@@ -2606,6 +2989,21 @@ where
             captured_level,
             received_levels
         );
+    }
+
+    fn handle_endorsements_update(&self, client_id: ClientId, update: EndorsementUpdateResultRef) {
+        debug!("handle_endorsements_update(client_id={}):", client_id);
+        match update {
+            Ok((_expiration, endorsements)) => {
+                info!(
+                    "Received endorsements update with {} new endorsements",
+                    endorsements.len()
+                );
+            }
+            Err(e) => {
+                error!("Endorsements update error: {:?}", e);
+            }
+        }
     }
 
     fn handle_low_bandwidth_for_video(&self, client_id: group_call::ClientId, recovered: bool) {
@@ -2623,13 +3021,42 @@ where
         platform_handler!(self, handle_raised_hands, client_id, raised_hands);
     }
 
+    fn handle_remote_mute_request(&self, client_id: group_call::ClientId, mute_source: DemuxId) {
+        info!("handle_remote_mute_request() {}", mute_source);
+        platform_handler!(self, handle_remote_mute_request, client_id, mute_source);
+    }
+
+    fn handle_observed_remote_mute(
+        &self,
+        client_id: group_call::ClientId,
+        mute_source: DemuxId,
+        mute_target: DemuxId,
+    ) {
+        info!(
+            "handle_observed_remote_mute() {} muted {}",
+            mute_source, mute_target
+        );
+        platform_handler!(
+            self,
+            handle_observed_remote_mute,
+            client_id,
+            mute_source,
+            mute_target
+        );
+    }
+
     fn handle_rtc_stats_report(&self, report_json: String) {
         platform_handler!(self, handle_rtc_stats_report, report_json);
     }
 
-    fn handle_ended(&self, client_id: group_call::ClientId, reason: group_call::EndReason) {
+    fn handle_ended(
+        &self,
+        client_id: group_call::ClientId,
+        reason: CallEndReason,
+        summary: CallSummary,
+    ) {
         info!("handle_ended({:?}):", reason);
-        platform_handler!(self, handle_ended, client_id, reason);
+        platform_handler!(self, handle_ended, client_id, reason, summary);
     }
 
     fn send_signaling_message(
@@ -2689,13 +3116,43 @@ where
             }
         }
     }
+
+    fn send_signaling_message_to_adhoc_group(
+        &mut self,
+        call_message: protobuf::signaling::CallMessage,
+        urgency: group_call::SignalingMessageUrgency,
+        expiration: u64,
+        recipients_to_endorsements: HashMap<UserId, Vec<u8>>,
+    ) {
+        debug!("send_signaling_message_to_adhoc_group():");
+
+        let platform = self.platform.lock().expect("platform.lock()");
+        let mut bytes = BytesMut::with_capacity(call_message.encoded_len());
+        match call_message.encode(&mut bytes) {
+            Ok(()) => {
+                platform
+                    .send_call_message_to_adhoc_group(
+                        bytes.to_vec(),
+                        urgency,
+                        expiration,
+                        recipients_to_endorsements,
+                    )
+                    .unwrap_or_else(|e| {
+                        error!("failed to send signaling message to adhoc group {:?}", e);
+                    });
+            }
+            Err(_) => {
+                error!("Failed to encode signaling message");
+            }
+        }
+    }
 }
 
 impl<T> CallManager<T>
 where
     T: Platform,
 {
-    // The membership proof is need for authentication and the group members
+    // The membership proof is needed for authentication and the group members
     // are needed for the opaque ID => user UUID mapping.
     pub fn peek_group_call(
         &self,
@@ -2705,15 +3162,17 @@ where
         group_members: Vec<GroupMember>,
     ) {
         if let Some(auth_header) = sfu::auth_header_from_membership_proof(&membership_proof) {
-            let member_resolver = sfu::MemberMap::new(&group_members);
+            let member_resolver = Arc::new(sfu::MemberMap::new(&group_members));
             let call_manager = self.clone();
             sfu::peek(
                 &self.http_client,
                 &sfu_url,
-                None,
-                auth_header,
-                Arc::new(member_resolver),
-                None,
+                PeekArgs {
+                    auth_header,
+                    member_resolver,
+                    room_id_header: None,
+                    call_link_root_key: None,
+                },
                 Box::new(move |peek_result| {
                     info!("handle_peek_response");
                     platform_handler!(call_manager, handle_peek_result, request_id, peek_result);
@@ -2724,24 +3183,41 @@ where
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn create_group_call_client(
         &mut self,
-        group_id: group_call::GroupId,
-        sfu_url: String,
-        hkdf_extra_info: Vec<u8>,
-        audio_levels_interval: Option<Duration>,
-        peer_connection_factory: Option<PeerConnectionFactory>,
-        outgoing_audio_track: AudioTrack,
-        outgoing_video_track: VideoTrack,
-        incoming_video_sink: Option<Box<dyn VideoSink>>,
+        params: CreateGroupCallParams,
     ) -> Result<group_call::ClientId> {
+        let CreateGroupCallParams {
+            group_id,
+            sfu_url,
+            hkdf_extra_info,
+            audio_levels_interval,
+            dred_duration,
+            svc_config,
+            peer_connection_factory,
+            outgoing_audio_track,
+            outgoing_video_track,
+            incoming_video_sink,
+        } = params;
+
         info!("create_group_call_client():");
         debug!(
             "  group_id: {} sfu_url: {}",
             uuid_to_string(&group_id),
             sfu_url
         );
+
+        let mut client_by_id = self.group_call_by_client_id.lock()?;
+        if let Some((client_id, _)) = client_by_id
+            .iter()
+            .find(|(_, c)| c.client.group_id == group_id && c.active)
+        {
+            error!(
+                "Group Client already exists for group_id with id: {}",
+                client_id
+            );
+            return Err(anyhow::anyhow!(RingRtcError::ClientAlreadyExistsForCall));
+        }
 
         let client_id = {
             let mut next_group_call_client_id = self.next_group_call_client_id.lock()?;
@@ -2767,46 +3243,71 @@ where
             sfu_url,
             None,
             None,
+            None,
             hkdf_extra_info,
         );
-        let client = group_call::Client::start(
+
+        let obfuscated_resolver =
+            ObfuscatedResolver::new(Arc::new(MemberMap::new(&[])), None, None);
+
+        let asset_registry = { self.asset_manager.read()?.get_registry() };
+
+        let svc_config = svc_config.map(SvcConfig::validate_and_correct_if_necessary);
+
+        let client = Client::start(ClientStartParams {
             group_id,
             client_id,
-            group_call::GroupCallKind::SignalGroup,
-            Box::new(sfu_client),
-            Box::new(self.clone()),
-            self.busy.clone(),
-            self.self_uuid.clone(),
+            kind: GroupCallKind::SignalGroup,
+            sfu_client: Box::new(sfu_client),
+            observer: Box::new(self.clone()),
+            obfuscated_resolver,
+            busy: self.busy.clone(),
+            self_uuid: self.self_uuid.clone(),
+            asset_registry,
             peer_connection_factory,
             outgoing_audio_track,
-            Some(outgoing_video_track),
+            outgoing_video_track: Some(outgoing_video_track),
             incoming_video_sink,
             ring_id,
             audio_levels_interval,
-        )?;
+            dred_duration,
+            group_send_endorsement_cache: None,
+            svc_config,
+        })?;
 
-        let mut client_by_id = self.group_call_by_client_id.lock()?;
-        client_by_id.insert(client_id, client);
+        client_by_id.insert(
+            client_id,
+            GroupCallClient {
+                client,
+                active: true,
+            },
+        );
 
         info!("Group Client created with id: {}", client_id);
 
         Ok(client_id)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn create_call_link_call_client(
         &mut self,
-        sfu_url: String,
-        auth_presentation: &[u8],
-        root_key: CallLinkRootKey,
-        admin_passkey: Option<Vec<u8>>,
-        hkdf_extra_info: Vec<u8>,
-        audio_levels_interval: Option<Duration>,
-        peer_connection_factory: Option<PeerConnectionFactory>,
-        outgoing_audio_track: AudioTrack,
-        outgoing_video_track: VideoTrack,
-        incoming_video_sink: Option<Box<dyn VideoSink>>,
-    ) -> Result<group_call::ClientId> {
+        params: CreateCallLinkCallParams,
+    ) -> Result<ClientId> {
+        let CreateCallLinkCallParams {
+            sfu_url,
+            endorsement_public_key,
+            auth_presentation,
+            root_key,
+            admin_passkey,
+            hkdf_extra_info,
+            audio_levels_interval,
+            dred_duration,
+            svc_config,
+            peer_connection_factory,
+            outgoing_audio_track,
+            outgoing_video_track,
+            incoming_video_sink,
+        } = params;
+
         info!("create_call_link_call_client():");
         let room_id: group_call::GroupId = root_key.derive_room_id();
         debug!(
@@ -2815,6 +3316,18 @@ where
             hex::encode(&room_id),
             sfu_url
         );
+
+        let mut client_by_id = self.group_call_by_client_id.lock()?;
+        if let Some((client_id, _)) = client_by_id
+            .iter()
+            .find(|(_, c)| c.client.group_id == room_id && c.active)
+        {
+            error!(
+                "Call Link Client already exists for room_id with id: {}",
+                client_id
+            );
+            return Err(anyhow::anyhow!(RingRtcError::ClientAlreadyExistsForCall));
+        }
 
         let client_id = {
             let mut next_group_call_client_id = self.next_group_call_client_id.lock()?;
@@ -2826,37 +3339,64 @@ where
             client_id
         };
 
+        let member_resolver = Arc::new(CallLinkMemberResolver::from(&root_key));
+
         let mut sfu_client = HttpSfuClient::new(
             Box::new(self.http_client.clone()),
             sfu_url,
-            Some(&room_id),
+            None,
+            Some(root_key),
             admin_passkey,
             hkdf_extra_info,
         );
         sfu_client.set_auth_header(call_links::auth_header_from_auth_credential(
             auth_presentation,
         ));
-        sfu_client.set_member_resolver(Arc::new(call_links::CallLinkMemberResolver::from(
-            &root_key,
-        )));
-        let client = group_call::Client::start(
-            room_id,
+        sfu_client.set_member_resolver(member_resolver.clone());
+
+        let group_send_endorsement_cache = Some(EndorsementsCache::new(
+            CallLinkSecretParams::derive_from_root_key(root_key.as_slice()),
+        ));
+        let endorsements_public_key: zkgroup::EndorsementPublicKey =
+            zkgroup::deserialize(endorsement_public_key)?;
+        let obfuscated_resolver = ObfuscatedResolver::new(
+            member_resolver,
+            Some(root_key),
+            Some(endorsements_public_key),
+        );
+
+        let asset_registry = { self.asset_manager.read()?.get_registry() };
+
+        let svc_config = svc_config.map(SvcConfig::validate_and_correct_if_necessary);
+
+        let client = Client::start(ClientStartParams {
+            group_id: room_id,
             client_id,
-            group_call::GroupCallKind::CallLink,
-            Box::new(sfu_client),
-            Box::new(self.clone()),
-            self.busy.clone(),
-            self.self_uuid.clone(),
+            kind: GroupCallKind::CallLink,
+            sfu_client: Box::new(sfu_client),
+            observer: Box::new(self.clone()),
+            obfuscated_resolver,
+            busy: self.busy.clone(),
+            self_uuid: self.self_uuid.clone(),
+            asset_registry,
             peer_connection_factory,
             outgoing_audio_track,
-            Some(outgoing_video_track),
+            outgoing_video_track: Some(outgoing_video_track),
             incoming_video_sink,
-            None,
+            ring_id: None,
             audio_levels_interval,
-        )?;
+            dred_duration,
+            group_send_endorsement_cache,
+            svc_config,
+        })?;
 
-        let mut client_by_id = self.group_call_by_client_id.lock()?;
-        client_by_id.insert(client_id, client);
+        client_by_id.insert(
+            client_id,
+            GroupCallClient {
+                client,
+                active: true,
+            },
+        );
 
         info!("Call Link Client created with id: {}", client_id);
 
@@ -2923,7 +3463,7 @@ where
                 let group_call = group_call_map.get_mut(&client_id);
                 match group_call {
                     Some(group_call) => {
-                        use_group_call(group_call);
+                        use_group_call(&mut group_call.client);
                     }
                     None => {
                         warn!("Group Client not found for id: {}", client_id);
@@ -2941,18 +3481,22 @@ where
     forward_group_call_api!(leave());
     forward_group_call_api!(react(value: String));
     forward_group_call_api!(raise_hand(raise: bool));
-    forward_group_call_api!(disconnect());
     forward_group_call_api!(group_ring => ring(recipient: Option<UserId>));
     forward_group_call_api!(set_outgoing_audio_muted(muted: bool));
+    forward_group_call_api!(set_outgoing_audio_muted_remotely(source: DemuxId));
+    forward_group_call_api!(send_remote_mute_request(target: DemuxId));
     forward_group_call_api!(set_outgoing_video_muted(muted: bool));
     forward_group_call_api!(set_presenting(presenting: bool));
     forward_group_call_api!(set_sharing_screen(sharing_screen: bool));
     forward_group_call_api!(resend_media_keys());
     forward_group_call_api!(set_data_mode(data_mode: DataMode));
-    forward_group_call_api!(request_video(
-        rendered_resolutions: Vec<group_call::VideoRequest>,
-        active_speaker_height: u16,
-    ), false);
+    forward_group_call_api!(
+        request_video(
+            rendered_resolutions: Vec<group_call::VideoRequest>,
+            active_speaker_height: u16,
+        ),
+        false
+    );
     forward_group_call_api!(approve_user(user_id: UserId));
     forward_group_call_api!(deny_user(user_id: UserId));
     forward_group_call_api!(remove_client(other_client_id: DemuxId));
@@ -2960,12 +3504,43 @@ where
     forward_group_call_api!(set_group_members(members: Vec<GroupMember>));
     forward_group_call_api!(set_membership_proof(proof: Vec<u8>));
     forward_group_call_api!(set_rtc_stats_interval(interval: Duration));
+    forward_group_call_api!(
+        reconfigure_video_encoder_for_screenshare(video_track: VideoTrack, is_screenshare: bool)
+    );
+
+    pub fn disconnect(&mut self, client_id: group_call::ClientId) {
+        info!("disconnect(): id: {}", client_id);
+
+        let group_call_map = self.group_call_by_client_id.lock();
+        match group_call_map {
+            Ok(mut group_call_map) => {
+                let group_call = group_call_map.get_mut(&client_id);
+                match group_call {
+                    Some(group_call) => {
+                        // When the UI wants to disconnect(), we assume that the call is
+                        // not active on the UI anymore, so we will mark it as not active
+                        // (the group call client won't receive messages anymore).
+                        group_call.active = false;
+                        group_call.client.disconnect();
+                    }
+                    None => {
+                        warn!("Group Client not found for id: {}", client_id);
+                    }
+                }
+            }
+            Err(error) => {
+                error!("{}", error);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use protobuf::signaling::call_message::ring_intention::Type as IntentionType;
-    use protobuf::signaling::{call_message::RingIntention, CallMessage};
+    use protobuf::signaling::{
+        CallMessage,
+        call_message::{RingIntention, ring_intention::Type as IntentionType},
+    };
 
     use super::*;
 
@@ -2977,7 +3552,6 @@ mod tests {
                 age,
                 sender_device_id: 1,
                 receiver_device_id: 1,
-                receiver_device_is_primary: true,
                 sender_identity_key: vec![],
                 receiver_identity_key: vec![],
             }
@@ -3124,5 +3698,130 @@ mod tests {
             },
             "not a ring intention",
         );
+    }
+
+    const SVC_VALID_MODES: [&str; 34] = [
+        "L1T1",
+        "L1T2",
+        "L1T3",
+        "L2T1",
+        "L2T1h",
+        "L2T1_KEY",
+        "L2T2",
+        "L2T2h",
+        "L2T2_KEY",
+        "L2T2_KEY_SHIFT",
+        "L2T3",
+        "L2T3h",
+        "L2T3_KEY",
+        "L3T1",
+        "L3T1h",
+        "L3T1_KEY",
+        "L3T2",
+        "L3T2h",
+        "L3T2_KEY",
+        "L3T3",
+        "L3T3h",
+        "L3T3_KEY",
+        "S2T1",
+        "S2T1h",
+        "S2T2",
+        "S2T2h",
+        "S2T3",
+        "S2T3h",
+        "S3T1",
+        "S3T1h",
+        "S3T2",
+        "S3T2h",
+        "S3T3",
+        "S3T3h",
+    ];
+
+    const SVC_VALID_SCREENSHARE_MODES: [&str; 3] = ["L1T1", "L1T2", "L1T3"];
+
+    #[test]
+    fn test_svc_defaults() {
+        assert!(SvcConfig::is_valid_scalability_mode(DEFAULT_SVC_MODE));
+        assert!(SvcConfig::is_valid_screenshare_scalability_mode(
+            DEFAULT_SVC_MODE_FOR_SCREENSHARE
+        ));
+    }
+
+    #[test]
+    fn test_default_svc_config() {
+        assert_eq!(
+            SvcConfig::default(),
+            SvcConfig {
+                mode: DEFAULT_SVC_MODE.to_owned(),
+                mode_for_screenshare: DEFAULT_SVC_MODE_FOR_SCREENSHARE.to_owned(),
+                max_bitrate_bps: None,
+            }
+        )
+    }
+
+    #[test]
+    fn test_svc_config_correction() {
+        // Both modes are invalid and should both be corrected to their corresponding
+        // default values.
+        assert_eq!(
+            SvcConfig::validate_and_correct_if_necessary(SvcConfig {
+                mode: "abc123".to_owned(),
+                mode_for_screenshare: "abc123".to_owned(),
+                ..Default::default()
+            }),
+            SvcConfig::default()
+        );
+
+        // The mode is invalid and should be corrected to its default value.
+        assert_eq!(
+            SvcConfig::validate_and_correct_if_necessary(SvcConfig {
+                mode: "abc123".to_owned(),
+                ..Default::default()
+            }),
+            SvcConfig::default()
+        );
+
+        // The screen share mode is invalid and should be corrected to its
+        // default value.
+        assert_eq!(
+            SvcConfig::validate_and_correct_if_necessary(SvcConfig {
+                mode_for_screenshare: "abc123".to_owned(),
+                ..Default::default()
+            }),
+            SvcConfig::default()
+        );
+
+        // Select each valid, but not applicable mode as the screen share mode value.
+        // The screen share mode should be corrected to the default value.
+        for mode in SVC_VALID_MODES {
+            if mode != "L1T1" && mode != "L1T2" && mode != "L1T3" {
+                let config = SvcConfig {
+                    mode_for_screenshare: mode.to_owned(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    SvcConfig::validate_and_correct_if_necessary(config),
+                    SvcConfig::default(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_svc_config_validity_checks() {
+        for mode in SVC_VALID_MODES {
+            for screenshare_mode in SVC_VALID_SCREENSHARE_MODES {
+                let config = SvcConfig {
+                    mode: mode.to_owned(),
+                    mode_for_screenshare: screenshare_mode.to_owned(),
+                    ..Default::default()
+                };
+                let config_cloned = config.clone();
+                assert_eq!(
+                    config_cloned,
+                    SvcConfig::validate_and_correct_if_necessary(config)
+                );
+            }
+        }
     }
 }

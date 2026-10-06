@@ -11,6 +11,9 @@
 //! call signaling transport.
 //!
 
+#![deny(clippy::disallowed_methods)]
+#![deny(clippy::disallowed_macros)]
+
 #[macro_use]
 extern crate log;
 
@@ -33,13 +36,17 @@ pub mod lite {
 
 /// Core, platform independent functionality.
 pub mod core {
+    pub mod assets;
     pub mod call;
     pub mod call_fsm;
     pub mod call_manager;
     pub mod call_mutex;
+    pub mod call_rwlock;
+    pub mod call_summary;
     pub mod connection;
     pub mod connection_fsm;
     pub mod crypto;
+    pub mod endorsements;
     pub mod group_call;
     pub mod platform;
     pub mod signaling;
@@ -63,6 +70,7 @@ mod android {
     mod call_manager;
     mod error;
     mod logging;
+    mod types;
     mod webrtc_java_media_stream;
     mod webrtc_peer_connection_factory;
 }
@@ -72,6 +80,7 @@ mod android {
 mod ios {
     mod api {
         pub mod call_manager_interface;
+        pub mod call_summary;
     }
     mod call_manager;
     mod error;
@@ -85,13 +94,26 @@ pub mod electron;
 #[cfg(feature = "native")]
 pub mod native;
 
+#[cfg(all(feature = "virtual_audio", feature = "native"))]
+pub mod virtual_audio;
+
+pub mod bin {
+    pub mod utils {
+        #[cfg(feature = "native")]
+        pub mod audio;
+    }
+}
+
 /// Foreign Function Interface (FFI) to WebRTC C++ library.
 pub mod webrtc {
     pub mod arc;
     pub use arc::Arc;
-    #[cfg(all(not(feature = "sim"), feature = "native"))]
+    #[cfg(feature = "native")]
     pub mod audio_device_module;
-    pub mod field_trial;
+    #[cfg(feature = "native")]
+    pub mod audio_device_module_callbacks;
+    #[cfg(feature = "native")]
+    pub mod audio_device_module_utils;
     pub mod ice_gatherer;
     #[cfg(feature = "injectable_network")]
     pub mod injectable_network;
@@ -105,13 +127,13 @@ pub mod webrtc {
     pub mod ptr;
     pub use ptr::RefCounted;
     pub mod rtp;
+    pub mod rtp_observer;
     pub mod sdp_observer;
     pub mod stats_observer;
     #[cfg(not(feature = "sim"))]
     mod ffi {
         #[cfg(feature = "native")]
         pub mod audio_device_module;
-        pub mod field_trial;
         pub mod ice_gatherer;
         pub mod logging;
         pub mod media;
@@ -119,18 +141,21 @@ pub mod webrtc {
         pub mod peer_connection_factory;
         pub mod peer_connection_observer;
         pub mod ref_count;
+        pub mod rtp_observer;
         pub mod sdp_observer;
         pub mod stats_observer;
     }
     #[cfg(feature = "sim")]
     pub mod sim {
-        pub mod field_trial;
+        #[cfg(feature = "native")]
+        pub mod audio_device_module;
         pub mod ice_gatherer;
         pub mod media;
         pub mod peer_connection;
         pub mod peer_connection_factory;
         pub mod peer_connection_observer;
         pub mod ref_count;
+        pub mod rtp_observer;
         pub mod sdp_observer;
         pub mod stats_observer;
     }

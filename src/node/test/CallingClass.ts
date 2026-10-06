@@ -3,34 +3,31 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-/* eslint-disable no-console, @typescript-eslint/require-await, @typescript-eslint/no-unused-vars */
+/* oxlint-disable eslint/no-console typescript/no-unused-vars */
 
-import {
-  DataMode,
+import type {
   Call,
-  CallEndedReason,
+  CallRejectReason,
   CallId,
   CallingMessage,
-  CallLogLevel,
   CallMessageUrgency,
   CallSettings,
-  CallState,
   HttpMethod,
   RingUpdate,
   UserId,
 } from '../ringrtc/Service';
+import { DataMode, CallLogLevel, CallState } from '../ringrtc/Service';
 import { RingRTC } from '../index';
-import Long from 'long';
 import { log, sleep, uuidToBytes } from './Utils';
 
 // This class mimics the Desktop Client CallingClass in ts/services/calling.ts to facilitate testing
 export class CallingClass {
-  private _name: string;
-  private _id: string;
-  private _localDeviceId: number;
+  private readonly _name: string;
+  private readonly _id: string;
+  private readonly _localDeviceId: number;
   private _call: Call | undefined;
   private _delayIncomingCallSettingsRequest: number;
-  private _delayOutgoingCallSettingsRequest: number;
+  private readonly _delayOutgoingCallSettingsRequest: number;
 
   set delayIncomingCallSettingsRequest(value: number) {
     this._delayIncomingCallSettingsRequest = value;
@@ -50,7 +47,7 @@ export class CallingClass {
   }
 
   private setupCallCallbacks(call: Call) {
-    // eslint-disable-next-line no-param-reassign
+    // oxlint-disable-next-line eslint/no-param-reassign
     call.handleStateChanged = () => {
       log('handleCallStateChanged');
       log(`call.state === ${call.state}`);
@@ -60,17 +57,17 @@ export class CallingClass {
       }
     };
 
-    // eslint-disable-next-line no-param-reassign
+    // oxlint-disable-next-line eslint/no-param-reassign
     call.handleRemoteAudioEnabled = () => {
       log('handleRemoteAudioEnabled');
     };
 
-    // eslint-disable-next-line no-param-reassign
+    // oxlint-disable-next-line eslint/no-param-reassign
     call.handleRemoteVideoEnabled = () => {
       log('handleRemoteVideoEnabled');
     };
 
-    // eslint-disable-next-line no-param-reassign
+    // oxlint-disable-next-line eslint/no-param-reassign
     call.handleRemoteSharingScreen = () => {
       log('handleRemoteSharingScreen');
     };
@@ -107,15 +104,16 @@ export class CallingClass {
     return true;
   }
 
-  private handleAutoEndedIncomingCallRequest(
+  private handleRejectedIncomingCallRequest(
     callId: CallId,
     remoteUserId: UserId,
-    reason: CallEndedReason,
+    reason: CallRejectReason,
     ageInSeconds: number,
     wasVideoCall: boolean,
-    receivedAtCounter: number | undefined
+    receivedAtCounter: number | undefined,
+    receivedAtDate: number | undefined
   ) {
-    log('handleAutoEndedIncomingCallRequest');
+    log('handleRejectedIncomingCallRequest');
   }
 
   static handleLogMessage(
@@ -147,14 +145,14 @@ export class CallingClass {
     url: string,
     method: HttpMethod,
     headers: { [name: string]: string },
-    body: Uint8Array | undefined
+    body: Uint8Array<ArrayBuffer> | undefined
   ) {
     log('handleSendHttpRequest');
   }
 
   private handleSendCallMessage(
-    recipient: Uint8Array,
-    data: Uint8Array,
+    recipient: Uint8Array<ArrayBuffer>,
+    data: Uint8Array<ArrayBuffer>,
     urgency: CallMessageUrgency
   ): boolean {
     log('handleSendCallMessage');
@@ -163,17 +161,17 @@ export class CallingClass {
   }
 
   private handleSendCallMessageToGroup(
-    groupIdBytes: Buffer,
-    data: Buffer,
+    groupIdBytes: Uint8Array<ArrayBuffer>,
+    data: Uint8Array<ArrayBuffer>,
     urgency: CallMessageUrgency
   ): void {
     log('handleSendCallMessageToGroup');
   }
 
   private handleGroupCallRingUpdate(
-    groupIdBytes: Buffer,
+    groupIdBytes: Uint8Array<ArrayBuffer>,
     ringId: bigint,
-    ringerBytes: Buffer,
+    ringerBytes: Uint8Array<ArrayBuffer>,
     update: RingUpdate
   ): void {
     log('handleGroupCallRingUpdate');
@@ -235,8 +233,8 @@ export class CallingClass {
     RingRTC.handleOutgoingSignaling = this.handleOutgoingSignaling.bind(this);
     RingRTC.handleIncomingCall = this.handleIncomingCall.bind(this);
     RingRTC.handleStartCall = this.handleStartCall.bind(this);
-    RingRTC.handleAutoEndedIncomingCallRequest =
-      this.handleAutoEndedIncomingCallRequest.bind(this);
+    RingRTC.handleRejectedIncomingCallRequest =
+      this.handleRejectedIncomingCallRequest.bind(this);
     RingRTC.handleLogMessage = CallingClass.handleLogMessage;
     RingRTC.handleSendHttpRequest = this.handleSendHttpRequest.bind(this);
     RingRTC.handleSendCallMessage = this.handleSendCallMessage.bind(this);
@@ -245,7 +243,7 @@ export class CallingClass {
     RingRTC.handleGroupCallRingUpdate =
       this.handleGroupCallRingUpdate.bind(this);
     RingRTC.handleRtcStatsReport = this.handleRtcStatsReport.bind(this);
-    RingRTC.setSelfUuid(Buffer.from(uuidToBytes(this._id)));
+    RingRTC.setSelfUuid(uuidToBytes(this._id));
   }
 
   static initializeLoggingOnly(): void {
@@ -266,9 +264,9 @@ export class CallingClass {
       this._localDeviceId
     );
 
-    log(`Outgoing callId ${Long.fromValue(call.callId)}`);
+    log(`Outgoing callId ${call.callId}`);
 
-    RingRTC.setOutgoingAudio(call.callId, true);
+    call.setOutgoingAudioMuted(false);
 
     this._call = call;
 

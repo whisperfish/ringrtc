@@ -12,7 +12,6 @@ use std::{
 };
 
 use crate::webrtc;
-
 #[cfg(not(feature = "sim"))]
 use crate::webrtc::ffi::ref_count;
 #[cfg(feature = "sim")]
@@ -47,7 +46,7 @@ impl<T: webrtc::RefCounted> Arc<T> {
     /// # Safety
     /// The pointee must be alive.
     pub unsafe fn from_borrowed(borrowed: webrtc::ptr::BorrowedRc<T>) -> Self {
-        Self::from_owned(ref_count::inc(borrowed))
+        unsafe { Self::from_owned(ref_count::inc(borrowed)) }
     }
 
     pub fn as_borrowed(&self) -> webrtc::ptr::BorrowedRc<T> {
@@ -90,4 +89,4 @@ impl<T: webrtc::RefCounted> Drop for Arc<T> {
 }
 
 unsafe impl<T: webrtc::RefCounted + Send + Sync> Send for Arc<T> {}
-unsafe impl<T: webrtc::RefCounted + Sync> Sync for Arc<T> {}
+unsafe impl<T: webrtc::RefCounted + Send + Sync> Sync for Arc<T> {}

@@ -3,29 +3,40 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::{path::Path, process::Stdio, time::Duration};
+
 use anyhow::Result;
 use bollard::{
-    container::{MemoryStatsStats, Stats, StatsOptions},
     Docker,
+    models::ContainerMemoryStats,
+    query_parameters,
+    secret::{ContainerCpuStats, ContainerCpuUsage},
 };
 use chrono::DateTime;
-use futures_util::stream::TryStreamExt;
-use std::process::Stdio;
-use tokio::fs::OpenOptions;
-use tokio::io::{stdout, AsyncWriteExt};
-use tokio::process::Command;
+use futures_util::stream::StreamExt;
+use itertools::Itertools;
+use log::{error, info};
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncWriteExt, stdout},
+    process::Command,
+};
 
-use crate::common::{
-    CallConfig, CallProfile, DelayVariationStrategy, GeLossModel, Loss, MarkovLossModel,
-    NetworkConfig,
+use crate::{
+    common::{
+        CallConfig, CallProfile, ClientProfile, DelayVariationStrategy, GeLossModel, Loss,
+        MarkovLossModel, NetworkConfig,
+    },
+    test::{CallTypeConfig, MediaFileIo},
 };
 
 /// This function builds all docker images that we need.
-pub async fn build_images() -> Result<()> {
-    println!("\nBuilding images:");
+pub async fn build_images(build_visqol_mos: bool, build_local_sfu: bool) -> Result<()> {
+    info!("Building images:");
 
-    println!("cli:");
+    info!("cli:");
     stdout().flush().await?;
+    let mut now = std::time::Instant::now();
     let _ = Command::new("docker")
         .args([
             "build",
@@ -40,8 +51,11 @@ pub async fn build_images() -> Result<()> {
         .wait()
         .await?;
 
-    println!("signaling-server:");
+    info!("... took {:.2?}", now.elapsed());
+
+    info!("signaling-server:");
     stdout().flush().await?;
+    now = std::time::Instant::now();
     let _ = Command::new("docker")
         .args([
             "build",
@@ -56,58 +70,148 @@ pub async fn build_images() -> Result<()> {
         .wait()
         .await?;
 
-    println!("visqol_mos:");
-    stdout().flush().await?;
-    let _ = Command::new("docker")
-        .current_dir("call_sim/docker/visqol_mos")
-        .args(["build", "-t", "visqol_mos", "-q", "."])
-        .spawn()?
-        .wait()
-        .await?;
+    info!("... took {:.2?}", now.elapsed());
 
-    println!("pesq_mos:");
+    if build_visqol_mos {
+        info!("visqol_mos:");
+        stdout().flush().await?;
+        now = std::time::Instant::now();
+        let _ = Command::new("docker")
+            .current_dir("call_sim/docker/visqol_mos")
+            .args(["build", "-t", "visqol_mos", "-q", "."])
+            .spawn()?
+            .wait()
+            .await?;
+        info!("... took {:.2?}", now.elapsed());
+    } else {
+        info!("skip visqol_mos");
+    }
+
+    info!("pesq_mos:");
     stdout().flush().await?;
+    now = std::time::Instant::now();
     let _ = Command::new("docker")
         .current_dir("call_sim/docker/pesq_mos")
         .args(["build", "-t", "pesq_mos", "-q", "."])
         .spawn()?
         .wait()
         .await?;
+    info!("... took {:.2?}", now.elapsed());
 
-    println!("plc_mos:");
+    info!("plc_mos:");
     stdout().flush().await?;
+    now = std::time::Instant::now();
     let _ = Command::new("docker")
         .current_dir("call_sim/docker/plc_mos")
         .args(["build", "-t", "plc_mos", "-q", "."])
         .spawn()?
         .wait()
         .await?;
+    info!("... took {:.2?}", now.elapsed());
+
+    if build_local_sfu {
+        info!("local_sfu (cloning):");
+        stdout().flush().await?;
+        now = std::time::Instant::now();
+        pull_or_clone_sfu_repo().await?;
+        info!("... took {:.2?}", now.elapsed());
+
+        info!("local_sfu (building):");
+        stdout().flush().await?;
+        now = std::time::Instant::now();
+        let _ = Command::new("docker")
+            .args([
+                "build",
+                ".",
+                "-f",
+                "backend/Dockerfile",
+                "-t",
+                "calling-backend",
+            ])
+            .current_dir("call_sim/docker/local_sfu")
+            .spawn()?
+            .wait()
+            .await?;
+        info!("... took {:.2?}", now.elapsed());
+    }
+
+    Ok(())
+}
+
+async fn pull_or_clone_sfu_repo() -> Result<()> {
+    let path = Path::new("call_sim/docker/local_sfu");
+
+    // assume is directory and the matching repo
+    if path.exists() {
+        println!("Repo exists, pulling origin main");
+        let _ = Command::new("git")
+            .args(["pull", "origin", "main"])
+            .current_dir("call_sim/docker/local_sfu")
+            .spawn()?
+            .wait()
+            .await?;
+    } else {
+        println!("The directory does not exist.");
+        let _ = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "main",
+                "git@github.com:signalapp/Signal-Calling-Service.git",
+                "local_sfu",
+            ])
+            .current_dir("call_sim/docker")
+            .spawn()?
+            .wait()
+            .await?;
+    }
 
     Ok(())
 }
 
 /// This function cleans all docker containers that were used.
-pub async fn clean_up(container_names: Vec<&str>) -> Result<()> {
-    println!("\nCleaning up containers:");
+pub async fn clean_up(container_names: Vec<&str>, container_prefixes: Vec<&str>) -> Result<()> {
+    info!("Cleaning up containers:");
+    let mut args = vec!["docker", "ps", "-aq"];
+    let name_filter: String;
+    if !container_names.is_empty() {
+        name_filter = format!("name=\"^({})$\"", container_names.join("|"));
+        args.push("--filter");
+        args.push(name_filter.as_str());
+    }
 
-    // Ignore errors and try to move on.
-    for container in container_names.iter() {
-        let result = Command::new("docker")
-            .args(["rm", "--force", "--volumes", container])
-            .stderr(Stdio::null())
-            .spawn()?
-            .wait()
-            .await;
-        if result.is_err() {
-            println!("  Couldn't remove {}", container);
-        }
+    let prefix_filter: String;
+    if !container_prefixes.is_empty() {
+        prefix_filter = format!("name=\"^({})\"", container_prefixes.join("|"));
+        args.push("--filter");
+        args.push(prefix_filter.as_str());
+    }
+
+    let rm_args = vec!["xargs", "docker", "rm", "--force", "--volumes"];
+    args.push("|");
+    args.extend(rm_args);
+    info!("Running {}", args.join(" "));
+
+    // Use sh and pipe which has portable syntax vs command subtitution
+    if let Err(e) = Command::new("sh")
+        .arg("-c")
+        .arg(args.join(" "))
+        .stderr(Stdio::inherit())
+        .spawn()?
+        .wait()
+        .await
+    {
+        // Ignore errors and try to move on.
+        error!("Failed to completely cleanup with error: {e}");
     }
 
     Ok(())
 }
 
 pub async fn create_network() -> Result<()> {
-    println!("\nCreating networks:");
+    info!("Creating networks:");
 
     let _ = Command::new("docker")
         .args([
@@ -125,7 +229,7 @@ pub async fn create_network() -> Result<()> {
 }
 
 pub async fn clean_network() -> Result<()> {
-    println!("\nCleaning networks:");
+    info!("Cleaning networks:");
 
     let _ = Command::new("docker")
         .args(["network", "rm", "ringrtc_default"])
@@ -137,7 +241,7 @@ pub async fn clean_network() -> Result<()> {
 }
 
 pub async fn start_signaling_server() -> Result<()> {
-    println!("\nStarting Signaling Server:");
+    info!("Starting Signaling Server:");
 
     let _ = Command::new("docker")
         .args([
@@ -170,7 +274,7 @@ pub async fn start_signaling_server() -> Result<()> {
 ///
 /// Note: We'll typically use one server, turn, to serve both clients.
 pub async fn start_turn_server() -> Result<()> {
-    println!("\nStarting TURN/relay server");
+    info!("Starting TURN/relay server");
 
     let _ = Command::new("docker")
         .args([
@@ -221,19 +325,81 @@ pub async fn start_turn_server() -> Result<()> {
     Ok(())
 }
 
-pub async fn start_tcp_dump(report_path: &str) -> Result<()> {
-    println!("\nStarting tcpdump");
+/// Start an SFU at 172.28.0.252, but might be available at `calling-backend`. Exposes:
+/// - STUN at the standard port (3478) via UDP
+/// - Group call API at 8080 over HTTP
+/// - Ice candidate port over 9900 for TCP
+/// - Group calling at 10000 for UDP, port 80 for TCP.
+pub async fn start_sfu_server() -> Result<()> {
+    info!("Starting SFU server");
 
     let _ = Command::new("docker")
         .args([
             "run",
             "--name",
-            "tcpdump",
+            "calling-backend",
             "-d",
-            "--net=host",
+            "--privileged",
+            "--network",
+            "ringrtc_default",
+            "--ip",
+            "172.28.0.252",
+            "-p",
+            "80:80",
+            "-p",
+            "3478:3478/udp",
+            "-p",
+            "8080:8080",
+            "-p",
+            "9900:9900",
+            "-p",
+            "10000:10000",
+            "--entrypoint",
+            "calling_backend",
+            "calling-backend",
+            "--ice-candidate-ip",
+            "172.28.0.252",
+            "--signaling-port",
+            "8080",
+            "--ice-candidate-port-tcp",
+            "9900",
+            "--inactivity-timeout-secs",
+            "30",
+            "--diagnostics-interval-secs",
+            "1",
+        ])
+        .spawn()?
+        .wait()
+        .await?;
+
+    Ok(())
+}
+
+pub async fn start_tcpdump(name: &str, report_path: &str) -> Result<()> {
+    info!("Starting tcpdump for `{}`", name);
+
+    let _ = Command::new("docker")
+        .args([
+            "run",
+            "--name",
+            &format!("tcpdump_{}", name),
+            "-d",
+            &format!("--network=container:{}", name),
             "-v",
             &format!("{}:/tcpdump", report_path),
             "kaazing/tcpdump",
+            "-i",
+            "any",
+            "-w",
+            &format!("/tcpdump/{}.pcap", name),
+            "tcp",
+            "or",
+            "udp",
+            "and",
+            "not",
+            "udp",
+            "port",
+            "5353",
         ])
         .spawn()?
         .wait()
@@ -244,8 +410,13 @@ pub async fn start_tcp_dump(report_path: &str) -> Result<()> {
 
 /// Starts a client in a bash shell, waiting for future exec commands to actually do
 /// something useful.
-pub async fn start_client(name: &str, report_path: &str, media_path: &str) -> Result<()> {
-    println!("\nStarting Client `{}`:", name);
+pub async fn start_client(
+    name: &str,
+    report_path: &str,
+    media_path: &str,
+    data_path: &str,
+) -> Result<()> {
+    info!("Starting Client `{}`:", name);
 
     let _ = Command::new("docker")
         .args([
@@ -260,6 +431,8 @@ pub async fn start_client(name: &str, report_path: &str, media_path: &str) -> Re
             &format!("{}:/report", report_path),
             "-v",
             &format!("{}:/media", media_path),
+            "-v",
+            &format!("{}:/data", data_path),
             "--cap-add",
             "NET_ADMIN",
             "ringrtc-cli",
@@ -423,7 +596,7 @@ pub async fn emulate_network_start(name: &str, network_config: &NetworkConfig) -
         .await?;
 
     // Add a class to the qdisc. This is used for traffic that isn't emulated. We will leave
-    // the bitrate wide-open for that (10Gbps).
+    // the bitrate wide-open for that (1Gbps).
     //
     // Use class id `1a1a:1` for traffic that isn't emulated.
     let _ = Command::new("docker")
@@ -441,7 +614,9 @@ pub async fn emulate_network_start(name: &str, network_config: &NetworkConfig) -
             "1a1a:1",
             "htb",
             "rate",
-            "10000000.0kbit",
+            "1000000.0kbit",
+            "quantum",
+            "60000",
         ])
         .spawn()?
         .wait()
@@ -449,9 +624,7 @@ pub async fn emulate_network_start(name: &str, network_config: &NetworkConfig) -
 
     // We will use the htb to specify the rate that we want to emulate. If we haven't set
     // any value (i.e. it is zero), then we will still set it, but to be wide-open.
-    // Note: We also could specify `burst` and `cburst` bytes, but let's see if the default
-    // values are good enough for now.
-    let mut rate = 10_000_000u64;
+    let mut rate = 1_000_000u64;
     if network_config.rate > 0 {
         rate = network_config.rate as u64;
     }
@@ -477,6 +650,12 @@ pub async fn emulate_network_start(name: &str, network_config: &NetworkConfig) -
             &format!("{}.0kbit", rate),
             "ceil",
             &format!("{}.0kbit", rate),
+            "quantum",
+            "1500",
+            "burst",
+            "3000",
+            "cburst",
+            "3000",
         ])
         .spawn()?
         .wait()
@@ -525,16 +704,6 @@ pub async fn emulate_network_start(name: &str, network_config: &NetworkConfig) -
         .spawn()?
         .wait()
         .await?;
-
-    // ARP (This does not work "Error: Filter with specified priority/protocol not found.")
-    // let _ = Command::new("docker")
-    //     .args(&[
-    //         "exec", name, "tc", "filter", "add", "dev", "eth0", "protocol", "arp", "parent",
-    //         "1a1a:", "prio", "1", "u32", "match", "u32", "0", "0", "flowid", "1a1a:1",
-    //     ])
-    //     .spawn()?
-    //     .wait()
-    //     .await?;
 
     // ICMP
     let _ = Command::new("docker")
@@ -614,7 +783,7 @@ pub async fn emulate_network_start(name: &str, network_config: &NetworkConfig) -
 
 /// Change the existing emulation to avoid reloading the qdisc.
 pub async fn emulate_network_change(name: &str, network_config: &NetworkConfig) -> Result<()> {
-    let mut rate = 10_000_000u64;
+    let mut rate = 1_000_000u64;
     if network_config.rate > 0 {
         rate = network_config.rate as u64;
     }
@@ -637,6 +806,10 @@ pub async fn emulate_network_change(name: &str, network_config: &NetworkConfig) 
             &format!("{}.0kbit", rate),
             "ceil",
             &format!("{}.0kbit", rate),
+            "burst",
+            "3000",
+            "cburst",
+            "3000",
         ])
         .spawn()?
         .wait()
@@ -667,37 +840,281 @@ pub async fn emulate_network_clear(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn start_cli(
+pub async fn tear_down_virtual_audio(clients: &Vec<&str>) -> Result<()> {
+    for client in clients {
+        // Tear down the modules.
+        let _ = Command::new("docker")
+            .args(["exec", client, "pactl", "unload-module", "module-pipe-sink"])
+            .spawn()?
+            .wait()
+            .await;
+        let _ = Command::new("docker")
+            .args(["exec", client, "pactl", "unload-module", "module-null-sink"])
+            .spawn()?
+            .wait()
+            .await;
+    }
+    Ok(())
+}
+
+pub async fn start_playout(
     name: &str,
     input_file: &str,
-    output_file: &str,
-    input_video_file: Option<&str>,
-    output_video_file: Option<&str>,
-    call_config: &CallConfig,
-    remote_call_config: &CallConfig,
+    file_duration: f64,
+    desired_duration: u16,
 ) -> Result<()> {
-    println!("Starting cli for `{}`", name);
+    info!("start playing");
+
+    // Give a bit of slack by rounding the duration up, in case the file is within a small fraction
+    // of a second of the desired time (for instance, normal_phrasing is 29.9997 seconds long),
+    // since the desired duration will always be a whole number of seconds.
+    // Also use a minimum duration of 1 second in case file_duration is 0.
+    let loops_float = desired_duration as f64 / file_duration.ceil().max(1.0);
+    let loops = if loops_float < 1.0 {
+        1
+    } else {
+        loops_float.ceil() as u64
+    };
+
+    // Start playing in to the mic.
+    let _ = Command::new("docker")
+        .args([
+            "exec",
+            "--detach",
+            name,
+            "sh",
+            "-c",
+            &format!(
+                "for i in $(seq 0 {}); do pw-cat --raw --playback --format=s16 --rate=48000 --channels=2 --target=input_sink - < /media/{} > /report/pwplay_{}.log 2>&1; done",
+                loops,
+                input_file,
+                name
+            ),
+        ])
+        .spawn()?
+        .wait()
+        .await?;
+    Ok(())
+}
+
+/// Maximum number of times to poll for PipeWire/PulseAudio services.
+const SERVICE_READY_MAX_ATTEMPTS: u32 = 100;
+
+/// Maximum number of times to retry `pactl set-default-*`.
+const SET_DEFAULT_MAX_ATTEMPTS: u32 = 30;
+
+/// Delay between poll attempts.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Poll a named docker container until the given shell command (probe) exits
+/// successfully or max_attempts are reached.
+async fn wait_ready(name: &str, max_attempts: u32, probe: &[&str]) -> Result<bool> {
+    for attempt in 1..=max_attempts {
+        let succeeded = Command::new("docker")
+            .args(["exec", name])
+            .args(probe)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?
+            .success();
+        if succeeded {
+            info!(
+                "{name} `{}` ready after {attempt} attempt(s)",
+                probe.join(" ")
+            );
+            return Ok(true);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    info!(
+        "{name} `{}` not ready after {max_attempts} attempts",
+        probe.join(" ")
+    );
+    Ok(false)
+}
+
+pub async fn start_virtual_audio(name: &str, output_file: &Option<String>) -> Result<()> {
+    info!("start virtual audio and its dependencies");
+
+    // Start the session bus. `nohup` keeps it alive after `docker exec` returns.
+    let _ = Command::new("docker")
+        .args([
+            "exec",
+            "--detach",
+            name,
+            "sh",
+            "-c",
+            "mkdir -p /run/dbus ; nohup dbus-daemon --session --address=$DBUS_SESSION_BUS_ADDRESS --fork",
+        ])
+        .spawn()?
+        .wait()
+        .await?;
+
+    // Start PipeWire. `nohup` keeps it alive after `docker exec` returns.
+    let _ = Command::new("docker")
+        .args([
+            "exec",
+            "--detach",
+            name,
+            "sh",
+            "-c",
+            &format!("nohup pipewire >/report/{name}.pipewire.log 2>&1 &"),
+        ])
+        .spawn()?
+        .wait()
+        .await?;
+    // Wait for the PipeWire object to be alive before proceeding.
+    wait_ready(name, SERVICE_READY_MAX_ATTEMPTS, &["pw-cli", "info", "0"]).await?;
+
+    // Start the session manager and the PulseAudio-compat server. `nohup` keeps them
+    // alive after `docker exec` returns.
+    let _ = Command::new("docker")
+        .args([
+            "exec",
+            "--detach",
+            name,
+            "sh",
+            "-c",
+            &format!(
+                "nohup wireplumber >/report/{name}.wireplumber.log 2>&1 & \
+                 nohup pipewire-pulse >/report/{name}.pipewire-pulse.log 2>&1 &"
+            ),
+        ])
+        .spawn()?
+        .wait()
+        .await?;
+    // Wait for the PulseAudio object to be alive before proceeding.
+    wait_ready(name, SERVICE_READY_MAX_ATTEMPTS, &["pactl", "info"]).await?;
+
+    // Create a virtual mic
+    let _ = Command::new("docker")
+        .args([
+            "exec",
+            name,
+            "pactl",
+            "load-module",
+            "module-null-sink",
+            "sink_name=input_sink",
+            "format=s16",
+            "rate=48000",
+            "channels=2",
+        ])
+        .spawn()?
+        .wait()
+        .await?;
+
+    // Keep retrying setting the default source while wireplumber finishes registering.
+    wait_ready(
+        name,
+        SET_DEFAULT_MAX_ATTEMPTS,
+        &["pactl", "set-default-source", "input_sink.monitor"],
+    )
+    .await?;
+
+    if let Some(output) = output_file {
+        // Create a virtual speaker
+        let _ = Command::new("docker")
+            .args([
+                "exec",
+                name,
+                "pactl",
+                "load-module",
+                "module-pipe-sink",
+                "sink_name=file_speaker",
+                "file=/tmp/file_speaker",
+                "format=s16",
+                "rate=48000",
+                "channels=2",
+            ])
+            .spawn()?
+            .wait()
+            .await;
+
+        // Read from virtual speaker
+        let _ = Command::new("docker")
+            .args([
+                "exec",
+                "--detach",
+                name,
+                "sh",
+                "-c",
+                &format!("cat /tmp/file_speaker > /report/{}", output,),
+            ])
+            .spawn()?
+            .wait()
+            .await?;
+    } else {
+        let _ = Command::new("docker")
+            .args([
+                "exec",
+                name,
+                "pactl",
+                "load-module",
+                "module-null-sink",
+                "sink_name=file_speaker",
+                "format=s16",
+                "rate=48000",
+                "channels=2",
+            ])
+            .spawn()?
+            .wait()
+            .await;
+    }
+
+    // Keep retrying setting the default sink while wireplumber finishes registering.
+    wait_ready(
+        name,
+        SET_DEFAULT_MAX_ATTEMPTS,
+        &["pactl", "set-default-sink", "file_speaker"],
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_cli(
+    name: &str,
+    media_io: MediaFileIo,
+    call_config: &CallConfig,
+    remote_call_config: Option<&CallConfig>,
+    client_profile: &ClientProfile,
+    call_type: &CallTypeConfig,
+    ip: String,
+    profile: bool,
+) -> Result<()> {
+    info!("Starting cli for `{}`", name);
+
+    start_virtual_audio(name, &media_io.audio_output_file).await?;
 
     let log_file_arg = format!("/report/{}.log", name);
-    let input_file_arg = format!("/media/{}", input_file);
-    let output_file_arg = format!("/report/{}", output_file);
 
-    let mut args = [
-        "exec",
-        "-d",
-        name,
-        "call_sim-cli",
-        "--name",
-        name,
-        "--log-file",
-        &log_file_arg,
-        "--input-file",
-        &input_file_arg,
-        "--output-file",
-        &output_file_arg,
-    ]
-    .map(String::from)
-    .to_vec();
+    let mut args = ["exec", "-d", name].map(String::from).to_vec();
+
+    if profile {
+        let perf_arg = format!("--output=/report/{}.perf", name);
+
+        args.extend_from_slice(
+            &[
+                "perf",
+                "record",
+                "-e",
+                "cycles",
+                "--call-graph=dwarf",
+                "-F",
+                "1499",
+                "--user-callchains",
+                "--sample-cpu",
+                &perf_arg,
+            ]
+            .map(String::from),
+        );
+    }
+
+    args.extend_from_slice(
+        &["call_sim-cli", "--name", name, "--log-file", &log_file_arg].map(String::from),
+    );
 
     args.push("--stats-interval-secs".to_string());
     args.push(format!("{}", call_config.stats_interval_secs));
@@ -741,9 +1158,27 @@ pub async fn start_cli(
     args.push(format!("--cbr={}", call_config.audio.enable_cbr));
     args.push(format!("--dtx={}", call_config.audio.enable_dtx));
     args.push(format!("--fec={}", call_config.audio.enable_fec));
+    args.push(format!(
+        "--dred-duration={}",
+        call_config.audio.dred_duration
+    ));
+    args.push(format!(
+        "--min-packet-loss-percent={}",
+        call_config.audio.min_packet_loss_percent
+    ));
+
+    if let Some(complexity) = call_config.audio.decoder_complexity {
+        args.push(format!("--decoder-complexity={}", complexity));
+    }
+
+    if !call_config.audio.dnn_weights_name.is_empty() {
+        args.push(format!(
+            "--dnn-weights-path=/data/{}",
+            call_config.audio.dnn_weights_name
+        ));
+    }
 
     args.push(format!("--tcc={}", call_config.audio.enable_tcc));
-    args.push(format!("--red={}", call_config.audio.enable_red));
 
     args.push(format!("--vp9={}", call_config.video.enable_vp9));
 
@@ -762,12 +1197,24 @@ pub async fn start_cli(
 
     args.push(format!("--field-trials={}", field_trials));
 
-    for relay_server in &call_config.relay_servers {
-        args.push(format!("--relay-servers={}", relay_server));
+    args.push(format!(
+        "--relay-username={}",
+        call_config.relay_servers.username
+    ));
+    args.push(format!(
+        "--relay-password={}",
+        call_config.relay_servers.password
+    ));
+    for relay_server in &call_config.relay_servers.urls {
+        args.push(format!("--relay-urls={}", relay_server));
+    }
+    for relay_server in &call_config.relay_servers.urls_with_ips {
+        args.push(format!("--relay-ips={}", relay_server));
+    }
+    if let Some(hostname) = &call_config.relay_servers.hostname {
+        args.push(format!("--relay-hostname={}", hostname));
     }
 
-    args.push(format!("--relay-username={}", call_config.relay_username));
-    args.push(format!("--relay-password={}", call_config.relay_password));
     args.push(format!("--force-relay={}", call_config.force_relay));
 
     args.push(format!(
@@ -795,23 +1242,19 @@ pub async fn start_cli(
         call_config.audio.rtcp_report_interval_ms
     ));
 
-    if let Some(input_video_file) = input_video_file {
+    if let Some(input_video_file) = media_io.video_input_file {
         args.push(format!("--input-video-file=/media/{}", input_video_file));
     }
-    if let Some(output_video_file) = output_video_file {
+    if let Some(output_video_file) = media_io.video_output_file {
         args.push(format!("--output-video-file=/report/{}", output_video_file));
     }
 
-    if let Some((width, height)) = remote_call_config.video.dimensions() {
+    if let Some((width, height)) = remote_call_config.and_then(|rcc| rcc.video.dimensions()) {
         args.push(format!("--output-video-width={}", width));
         args.push(format!("--output-video-height={}", height));
     }
 
-    if name == "client_a" {
-        args.push("--ip=172.28.0.2".to_string());
-    } else {
-        args.push("--ip=172.28.0.3".to_string());
-    }
+    args.push(format!("--ip={ip}"));
 
     if let CallProfile::DeterministicLoss(loss_rate) = call_config.profile {
         args.push(format!("--deterministic-loss={}", loss_rate));
@@ -819,8 +1262,116 @@ pub async fn start_cli(
 
     args.extend(call_config.extra_cli_args.iter().cloned());
 
+    args.push(format!("--user-id={}", client_profile.user_id));
+    args.push(format!("--device-id={}", client_profile.device_id));
+    if let CallTypeConfig::Group {
+        sfu_connection_params,
+        group_name,
+    } = call_type
+    {
+        args.push(format!("--sfu-url={}", sfu_connection_params.url()));
+        args.push("--is-group-call".to_string());
+
+        let group = if let Some(group_name) = group_name {
+            client_profile
+                .groups
+                .iter()
+                .filter(|&g| group_name == &g.metadata.name)
+                .exactly_one()
+                .map_err(|_| {
+                    anyhow::anyhow!("Did't find exactly one group named: {:?}", group_name)
+                })?
+        } else {
+            client_profile
+                .groups
+                .first()
+                .expect("at least one group info detailed")
+        };
+        args.push(format!("--group-id={}", group.metadata.id_base64));
+        args.push(format!("--membership-proof={}", group.membership_proof));
+
+        let member_info = group
+            .metadata
+            .members
+            .iter()
+            .map(|member| format!("{}:{}", member.user_id, member.member_id))
+            .join(",");
+        args.push(format!("--group-member-info={}", member_info));
+    }
+
+    info!("Final Client args: {}", args.join(" "));
     let _ = Command::new("docker").args(&args).spawn()?.wait().await?;
 
+    Ok(())
+}
+
+pub async fn finish_perf(client: &str) -> Result<()> {
+    let mut exited = false;
+    for _ in 0..60 {
+        let status = Command::new("docker")
+            .args(["exec", client, "pgrep", "perf"])
+            .stdout(Stdio::null())
+            .spawn()?
+            .wait()
+            .await?;
+        if !status.success() {
+            // if we couldn't find it, it exited; otherwise keep waiting.
+            exited = true;
+
+            let collapse_cmd = format!(
+                "PATH=/root/.cargo/bin:$PATH perf script -i /report/{}.perf | /root/.cargo/bin/inferno-collapse-perf > /report/{}.stacks.folded",
+                client, client
+            );
+            let _ = Command::new("docker")
+                .args(["exec", client, "sh", "-c", &collapse_cmd])
+                .spawn()?
+                .wait()
+                .await?;
+
+            let svg_command = format!(
+                "cat /report/{}.stacks.folded | /root/.cargo/bin/inferno-flamegraph > /report/{}.profile.svg",
+                client, client
+            );
+            let _ = Command::new("docker")
+                .args(["exec", client, "sh", "-c", &svg_command])
+                .spawn()?
+                .wait()
+                .await?;
+
+            let perf_command = format!(
+                "perf report -s symbol --percent-limit=5 --call-graph=2 -i /report/{}.perf \
+                --addr2line=/root/.cargo/bin/addr2line > /report/{}.perf.txt 2>&1",
+                client, client
+            );
+            let _ = Command::new("docker")
+                .args(["exec", client, "sh", "-c", &perf_command])
+                .spawn()?
+                .wait()
+                .await?;
+
+            let _ = Command::new("docker")
+                .args(["exec", client, "chmod", "-R", "o+r", "/report/"])
+                .spawn()?
+                .wait()
+                .await?;
+
+            let _ = Command::new("docker")
+                .args([
+                    "exec",
+                    client,
+                    "perf",
+                    "archive",
+                    &format!("/report/{}.perf", client),
+                ])
+                .spawn()?
+                .wait()
+                .await?;
+
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    info!("{} perf exited? {}", client, exited);
     Ok(())
 }
 
@@ -829,8 +1380,8 @@ pub async fn convert_raw_to_wav(
     raw_file: &str,
     wav_file: &str,
     length: Option<u16>,
-) -> Result<()> {
-    println!("\nConverting raw file `{}` to wav:", raw_file);
+) -> Result<f64> {
+    info!("Converting raw file `{}` to wav:", raw_file);
 
     let mut args = [
         "run",
@@ -869,7 +1420,23 @@ pub async fn convert_raw_to_wav(
 
     let _ = Command::new("docker").args(&args).spawn()?.wait().await?;
 
-    Ok(())
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/work", location),
+            "bigpapoo/sox",
+            "soxi",
+            "-D",
+            &format!("/work/{}", wav_file),
+        ])
+        .output()
+        .await?;
+
+    Ok(std::str::from_utf8(output.stdout.as_slice())?
+        .trim()
+        .parse::<f64>()?)
 }
 
 pub async fn convert_wav_to_16khz_mono(
@@ -877,7 +1444,7 @@ pub async fn convert_wav_to_16khz_mono(
     input_file: &str,
     output_file: &str,
 ) -> Result<()> {
-    println!("\nConverting file `{}` to 16kHz/mono wav:", input_file);
+    info!("Converting file `{}` to 16kHz/mono wav:", input_file);
 
     let args = [
         "run",
@@ -903,7 +1470,7 @@ pub async fn convert_wav_to_16khz_mono(
 }
 
 pub async fn convert_mp4_to_yuv(location: &str, mp4_file: &str, yuv_file: &str) -> Result<()> {
-    println!("\nConverting `{mp4_file}` to YUV:");
+    info!("Converting `{mp4_file}` to YUV:");
 
     let args = [
         "run",
@@ -930,7 +1497,7 @@ pub async fn convert_yuv_to_mp4(
     mp4_file: &str,
     dimensions: (u16, u16),
 ) -> Result<()> {
-    println!("\nConverting `{yuv_file}` to MP4:");
+    info!("Converting `{yuv_file}` to MP4:");
 
     let args = [
         "run",
@@ -956,7 +1523,7 @@ pub async fn convert_yuv_to_mp4(
 }
 
 pub async fn generate_spectrogram(location: &str, wav_file: &str, extension: &str) -> Result<()> {
-    println!("\nGenerating spectrogram for `{}`:", wav_file);
+    info!("Generating spectrogram for `{}`:", wav_file);
 
     let _ = Command::new("docker")
         .args([
@@ -993,12 +1560,11 @@ pub async fn analyze_visqol_mos(
     extension: &str,
     speech: bool,
 ) -> Result<()> {
-    println!("\nAnalyzing visqol mos for `{}`:", degraded_file);
+    info!("Analyzing visqol mos for `{}`:", degraded_file);
 
     let mut args = [
         "run",
-        "--name",
-        "visqol_mos",
+        "--rm",
         "-v",
         &format!("{}:/degraded", degraded_path),
         "-v",
@@ -1016,20 +1582,7 @@ pub async fn analyze_visqol_mos(
         args.push("--use_speech_mode".to_string());
     }
 
-    let _ = Command::new("docker").args(&args).spawn()?.wait().await?;
-
-    // Get the logs.
-    let output = Command::new("docker")
-        .args(["logs", "visqol_mos"])
-        .output()
-        .await?;
-
-    // Remove the container.
-    let _ = Command::new("docker")
-        .args(["rm", "visqol_mos"])
-        .spawn()?
-        .wait()
-        .await?;
+    let output = Command::new("docker").args(&args).output().await?;
 
     // Save the logs.
     let mut file = OpenOptions::new()
@@ -1051,12 +1604,11 @@ pub async fn analyze_pesq_mos(
     ref_file: &str,
     extension: &str,
 ) -> Result<()> {
-    println!("\nAnalyzing pesq mos for `{}`:", degraded_file);
+    info!("Analyzing pesq mos for `{}`:", degraded_file);
 
     let args = [
         "run",
-        "--name",
-        "pesq_mos",
+        "--rm",
         "-v",
         &format!("{}:/degraded", degraded_path),
         "-v",
@@ -1068,20 +1620,7 @@ pub async fn analyze_pesq_mos(
     .map(String::from)
     .to_vec();
 
-    let _ = Command::new("docker").args(&args).spawn()?.wait().await?;
-
-    // Get the logs.
-    let output = Command::new("docker")
-        .args(["logs", "pesq_mos"])
-        .output()
-        .await?;
-
-    // Remove the container.
-    let _ = Command::new("docker")
-        .args(["rm", "pesq_mos"])
-        .spawn()?
-        .wait()
-        .await?;
+    let output = Command::new("docker").args(&args).output().await?;
 
     // Save the logs.
     let mut file = OpenOptions::new()
@@ -1101,12 +1640,11 @@ pub async fn analyze_plc_mos(
     degraded_file: &str,
     extension: &str,
 ) -> Result<()> {
-    println!("\nAnalyzing plc mos for `{}`:", degraded_file);
+    info!("Analyzing plc mos for `{}`:", degraded_file);
 
     let args = [
         "run",
-        "--name",
-        "plc_mos",
+        "--rm",
         "-v",
         &format!("{}:/degraded", degraded_path),
         "plc_mos",
@@ -1116,20 +1654,7 @@ pub async fn analyze_plc_mos(
     .map(String::from)
     .to_vec();
 
-    let _ = Command::new("docker").args(&args).spawn()?.wait().await?;
-
-    // Get the logs.
-    let output = Command::new("docker")
-        .args(["logs", "plc_mos"])
-        .output()
-        .await?;
-
-    // Remove the container.
-    let _ = Command::new("docker")
-        .args(["rm", "plc_mos"])
-        .spawn()?
-        .wait()
-        .await?;
+    let output = Command::new("docker").args(&args).output().await?;
 
     // Save the logs.
     let mut file = OpenOptions::new()
@@ -1151,45 +1676,36 @@ pub async fn analyze_video(
     ref_file: &str,
     dimensions: (u16, u16),
 ) -> Result<()> {
-    println!("\nAnalyzing video for `{}`:", degraded_file);
+    info!("Analyzing video for `{}`:", degraded_file);
 
-    let output = Command::new("docker")
+    let _ = Command::new("docker")
         .args([
             "run",
-            "--name",
-            "vmaf",
+            "--rm",
             "-v",
             &format!("{}:/degraded", degraded_path),
             "-v",
             &format!("{}:/ref", ref_path),
             "vmaf",
-            "yuv420p",
-            &dimensions.0.to_string(),
-            &dimensions.1.to_string(),
+            "--reference",
             &format!("/ref/{}", ref_file),
+            "--distorted",
             &format!("/degraded/{}", degraded_file),
-            "--phone-model",
-            "--out-fmt",
-            "json",
+            "--width",
+            &dimensions.0.to_string(),
+            "--height",
+            &dimensions.1.to_string(),
+            "--pixel_format",
+            "420",
+            "--bitdepth",
+            "8",
+            "--json",
+            "--output",
+            &format!("/degraded/{}.json", degraded_file),
         ])
-        .output()
-        .await?;
-
-    // Remove the container.
-    let _ = Command::new("docker")
-        .args(["rm", "vmaf"])
         .spawn()?
         .wait()
         .await?;
-
-    // Save the output.
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/{}.json", degraded_path, degraded_file))
-        .await?;
-    file.write_all(&output.stdout).await?;
 
     Ok(())
 }
@@ -1234,6 +1750,25 @@ pub async fn get_turn_server_logs(path: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn get_sfu_server_logs(path: &str) -> Result<()> {
+    let output = Command::new("docker")
+        .args(["logs", "calling-backend"])
+        .output()
+        .await?;
+
+    // Save the logs.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(format!("{}/sfu.log", path))
+        .await?;
+    file.write_all(&output.stdout).await?;
+    file.write_all(&output.stderr).await?;
+
+    Ok(())
+}
+
 pub struct DockerStats {
     docker: Docker,
 }
@@ -1244,110 +1779,120 @@ impl DockerStats {
         Ok(DockerStats { docker })
     }
 
-    pub fn start(&self, name: &str, path: &str) -> Result<()> {
+    pub fn start(&self, name: &str, path: &str) {
         let docker = self.docker.clone();
         let name = name.to_string();
         let path = path.to_string();
 
         tokio::spawn(async move {
-            let stream = &mut docker.stats(
-                &name,
-                Some(StatsOptions {
-                    stream: true,
-                    ..Default::default()
-                }),
-            );
+            // Setup to stream statistics from Docker (default: every 1 second).
+            let query_parameters = query_parameters::StatsOptionsBuilder::new()
+                .stream(true)
+                .build();
+            let mut stream = docker.stats(&name, Some(query_parameters));
 
-            // Collect the stats. This will await until the container is stopped then dump
-            // all the stats to a log.
-            match stream.try_collect::<Vec<Stats>>().await {
-                Ok(stats) => {
-                    match OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(format!("{}/{}_stats.log", path, name))
-                        .await
-                    {
-                        Ok(mut file) => {
-                            let _ = file
-                                .write_all(b"Timestamp\tCPU\tMEM\tTX_Bitrate\tRX_Bitrate\n")
-                                .await;
+            // Collect the stats. Open a file and write the values as they arrive.
+            match OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(format!("{}/{}_stats.log", path, name))
+                .await
+            {
+                Ok(mut file) => {
+                    let _ = file
+                        .write_all(b"Timestamp\tCPU\tMEM\tTX_Bitrate\tRX_Bitrate\n")
+                        .await;
 
-                            let mut prev_timestamp = 0i64;
+                    let mut prev_timestamp = 0i64;
 
-                            let mut prev_tx_bytes = 0u64;
-                            let mut prev_rx_bytes = 0u64;
+                    let mut prev_tx_bytes = 0u64;
+                    let mut prev_rx_bytes = 0u64;
 
-                            let mut prev_total_cpu_usage = 0u64;
-                            let mut prev_system_cpu_usage = 0u64;
+                    let mut prev_total_cpu_usage = 0u64;
+                    let mut prev_system_cpu_usage = 0u64;
 
-                            for stat in stats {
-                                match (
-                                    stat.cpu_stats.system_cpu_usage,
-                                    stat.cpu_stats.online_cpus,
-                                    stat.memory_stats.usage,
-                                    stat.memory_stats.stats,
-                                    stat.networks,
-                                ) {
+                    // Process stats as they arrive.
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok(response) => {
+                                match (response.cpu_stats, response.memory_stats, response.networks)
+                                {
                                     (
-                                        Some(system_cpu_usage),
-                                        Some(online_cpus),
-                                        Some(memory_usage),
-                                        Some(memory_stats),
+                                        Some(ContainerCpuStats {
+                                            system_cpu_usage: Some(system_cpu_usage),
+                                            online_cpus: Some(online_cpus),
+                                            cpu_usage:
+                                                Some(ContainerCpuUsage {
+                                                    total_usage: Some(cpu_total_usage),
+                                                    ..
+                                                }),
+                                            ..
+                                        }),
+                                        Some(ContainerMemoryStats {
+                                            usage: Some(memory_usage),
+                                            stats: Some(memory_stats),
+                                            ..
+                                        }),
                                         Some(networks),
                                     ) => {
-                                        let timestamp = DateTime::parse_from_rfc3339(&stat.read)
-                                            .expect("stats timestamp is valid")
-                                            .timestamp_millis();
+                                        let timestamp = DateTime::parse_from_rfc3339(
+                                            response.read.unwrap().as_str(),
+                                        )
+                                        .expect("stats timestamp is valid")
+                                        .timestamp_millis();
 
                                         let (tx_bitrate, rx_bitrate) = match networks.get("eth0") {
                                             Some(network) => {
-                                                let time_delta =
-                                                    (timestamp - prev_timestamp) as f32 / 1000.0;
-                                                let tx_bitrate =
-                                                    (network.tx_bytes - prev_tx_bytes) as f32 * 8.0
-                                                        / time_delta;
-                                                let rx_bitrate =
-                                                    (network.rx_bytes - prev_rx_bytes) as f32 * 8.0
-                                                        / time_delta;
+                                                let tx_bytes = network.tx_bytes.unwrap();
+                                                let rx_bytes = network.rx_bytes.unwrap();
+
+                                                let (tx_bitrate, rx_bitrate) =
+                                                    if prev_timestamp == 0 {
+                                                        // Ignore the first data point since there was no reference.
+                                                        (0.0, 0.0)
+                                                    } else {
+                                                        let time_delta =
+                                                            (timestamp - prev_timestamp) as f32
+                                                                / 1000.0;
+                                                        let tx_bitrate =
+                                                            (tx_bytes - prev_tx_bytes) as f32 * 8.0
+                                                                / time_delta;
+                                                        let rx_bitrate =
+                                                            (rx_bytes - prev_rx_bytes) as f32 * 8.0
+                                                                / time_delta;
+                                                        (tx_bitrate, rx_bitrate)
+                                                    };
 
                                                 prev_timestamp = timestamp;
-                                                prev_tx_bytes = network.tx_bytes;
-                                                prev_rx_bytes = network.rx_bytes;
+                                                prev_tx_bytes = tx_bytes;
+                                                prev_rx_bytes = rx_bytes;
 
-                                                if prev_timestamp == 0 {
-                                                    // Ignore the first data point since there was no reference.
-                                                    (0.0, 0.0)
-                                                } else {
-                                                    (tx_bitrate, rx_bitrate)
-                                                }
+                                                (tx_bitrate, rx_bitrate)
                                             }
                                             None => {
-                                                println!("Error: stat missing eth0!");
+                                                error!("Error: stat missing eth0!");
                                                 break;
                                             }
                                         };
 
                                         // cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
-                                        let cpu_percent = ((stat.cpu_stats.cpu_usage.total_usage
-                                            - prev_total_cpu_usage)
+                                        let cpu_percent = ((cpu_total_usage - prev_total_cpu_usage)
                                             as f32
                                             / (system_cpu_usage - prev_system_cpu_usage) as f32)
                                             * online_cpus as f32
                                             * 100.0;
 
-                                        let memory = memory_usage
-                                            - match memory_stats {
-                                                // Exclude file cache usage since it causes the stats to
-                                                // grow over time and doesn't directly reflect RingRTC's
-                                                // memory usage.
-                                                // https://docs.docker.com/engine/reference/commandline/stats/#description
-                                                MemoryStatsStats::V1(stats) => {
-                                                    stats.total_inactive_file
-                                                }
-                                                MemoryStatsStats::V2(stats) => stats.inactive_file,
-                                            };
+                                        // Exclude file cache usage since it causes the stats to
+                                        // grow over time and doesn't directly reflect RingRTC's
+                                        // memory usage.
+                                        // https://docs.docker.com/engine/reference/commandline/stats/#description
+                                        let cache_usage = *memory_stats
+                                            .get("total_inactive_file")
+                                            .or_else(|| memory_stats.get("inactive_file"))
+                                            .unwrap_or(&0);
+
+                                        let memory = memory_usage.saturating_sub(cache_usage);
                                         let _ = file
                                             .write_all(
                                                 format!(
@@ -1362,27 +1907,26 @@ impl DockerStats {
                                             )
                                             .await;
 
-                                        prev_total_cpu_usage = stat.cpu_stats.cpu_usage.total_usage;
+                                        prev_total_cpu_usage = cpu_total_usage;
                                         prev_system_cpu_usage = system_cpu_usage;
                                     }
                                     _ => {
-                                        println!("Error: stat missing required data!");
+                                        error!("Error: stat missing required data!");
                                         break;
                                     }
                                 }
                             }
-                        }
-                        Err(err) => {
-                            println!("Error creating stats file: {:?}", err);
+                            Err(err) => {
+                                error!("Error collecting stats for {}: {:?}", name, err);
+                                break;
+                            }
                         }
                     }
                 }
                 Err(err) => {
-                    println!("Error collecting stats for {}: {:?}", name, err);
+                    error!("Error creating stats file: {:?}", err);
                 }
             }
         });
-
-        Ok(())
     }
 }
